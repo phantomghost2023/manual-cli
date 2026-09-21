@@ -9,11 +9,12 @@ import { c } from './color.js';
 export function doctor(root, state) {
   const { claims, errors } = loadManual(root);
   const rows = [];
+  const digestCache = new Map();
 
   for (const cl of claims) {
     const id = cl.fm.id;
     const stamp = state.stamp(id);
-    const d = evidenceDigest(root, cl.fm.evidence || {}, state.salt);
+    const d = evidenceDigest(root, cl.fm.evidence || {}, state.salt, digestCache);
     const row = { id, state: 'unverified', tier: stamp?.tier || null, issues: [] };
 
     if (!stamp) {

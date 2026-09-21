@@ -1,12 +1,27 @@
 {
   "name": "manual-cli",
-  "version": "0.1.0",
-  "description": "Self-verifying repository operating manual: claims with evidence inputs, provenance, trust tiers, dependency edges, traps, and token-budgeted briefs.",
+  "version": "0.2.0",
+  "description": "Self-verifying repository operating manual: claims with evidence inputs, provenance, trust tiers, dependency edges, traps, token-budgeted briefs, policy gates, an agent flywheel, and an MCP server.",
   "type": "module",
-  "bin": { "manual": "bin/manual.js" },
+  "bin": {
+    "manual": "bin/manual.js",
+    "manual-mcp": "bin/manual-mcp.js"
+  },
   "engines": { "node": ">=20" },
   "scripts": {
-    "test": "node --test \"test/*.test.js\""
+    "test": "node --test \"test/*.test.js\"",
+    "bench": "node test/bench.js"
   },
+  "keywords": [
+    "documentation",
+    "verification",
+    "agents",
+    "mcp",
+    "repository",
+    "onboarding",
+    "ci",
+    "trust"
+  ],
+  "files": ["bin", "src", "docs", "README.md", "LICENSE", "CHANGELOG.md"],
   "license": "MIT"
 }

@@ -47,6 +47,7 @@ node bin/manual.js verify --root /path/to/repo --force
 | `hooks install\|uninstall\|status` | Manage the `.git/hooks/pre-commit` gate that runs `manual enforce` (marked block, preserves user hooks). |
 | `mcp [--root dir]` | Speak MCP over stdio: `manual_brief`, `manual_verify`, `manual_doctor`, `manual_inbox` tools. Point your coding agent at `bin/manual.js mcp`. |
 | `eject [--dry-run]` | Vendor the CLI into `tools/manual-cli/` so CI workflows and hooks run fully self-contained. |
+| `watch [--debounce N]` | Editor-loop mode: re-verify claims affected by file changes (evidence globs + bidirectional dependency closure). `affectedClaims()` is exported for editor integrations. |
 | `brief --at <ref>` | Historical brief: the manual as of a past commit, for debugging old releases. |
 
 ## Claim file format (manual/v1)
@@ -126,7 +127,10 @@ The demo ships a genuine trap discovered while building it: `node --test --test-
 ## Test
 
 ```bash
-npm test        # 50 tests across 12 suites (includes seeded fuzzing of the parser/loader)
+npm test        # 56 tests across 14 suites (includes seeded fuzzing of the parser/loader)
+npm run bench   # 500-claim scale benchmark (see numbers below)
 ```
+
+Scale (500 claims, Windows, cold process): verify --force 0.8s · warm verify 0.3s · doctor 0.1s · brief 0.1s — evidence digests are deduped per spec and parsed claims are stat-cached per process.
 
 Docs: [docs/TUTORIAL.md](docs/TUTORIAL.md) (5-minute walkthrough) · [docs/manual.1.md](docs/manual.1.md) (reference) · [completions.bash](completions.bash)

@@ -44,9 +44,10 @@ export async function verify(root, opts = {}) {
   const state = opts.state; // provided by CLI (owns save)
   const force = opts.force || false;
 
-  // Digest claims up front (cheap: hashing only).
+  // Digest claims up front (cheap: hashing only; deduped per evidence spec).
+  const digestCache = new Map();
   for (const cl of claims) {
-    const d = evidenceDigest(root, cl.fm.evidence || {}, state.salt);
+    const d = evidenceDigest(root, cl.fm.evidence || {}, state.salt, digestCache);
     cl.digest = d.digest;
     cl.fileCount = d.files;
   }

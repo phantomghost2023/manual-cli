@@ -6,7 +6,7 @@ _manual_cli() {
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="verify brief enforce observe doctor init inbox hooks eject mcp help"
+  commands="verify brief enforce observe doctor init inbox hooks eject watch mcp help"
   flags="--root --force --diff --json --budget --at --stage --dry-run -h --help"
 
   if [ "$COMP_CWORD" -eq 1 ]; then
@@ -44,6 +44,9 @@ _manual_cli() {
       ;;
     init|eject)
       COMPREPLY=( $(compgen -W "--dry-run --root --json" -- "$cur") )
+      ;;
+    watch)
+      COMPREPLY=( $(compgen -W "--debounce --root" -- "$cur") )
       ;;
     *)
       COMPREPLY=( $(compgen -W "$flags" -- "$cur") )

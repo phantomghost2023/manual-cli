@@ -51,6 +51,11 @@ mcp [--root <dir>]
     Model Context Protocol server over stdio: manual_brief, manual_verify,
     manual_doctor, manual_inbox tools for coding agents.
 
+watch [--debounce N]
+    Watch the repo; on file change, re-verify claims whose evidence globs
+    match the changed file, plus bidirectional dependency closure. Stop with
+    Ctrl+C. Runs until signaled; writes stamps to state.json.
+
 help
     Show usage.
 ```
@@ -70,3 +75,9 @@ Kinds: `fact`, `command`, `trap` (broken = gotcha fixed → retire), `policy`, `
 ## EXIT CODES
 
 0 all fresh/passed · 1 something broken or doctor suspects · 2 usage/load errors
+
+## PERFORMANCE
+
+Evidence digests are deduplicated per evidence spec (repos commonly share globs
+across claims), and parsed claims are cached per process, validated by stat.
+`npm run bench` synthesizes 500 claims and measures every hot path.

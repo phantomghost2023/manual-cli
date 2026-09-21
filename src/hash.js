@@ -54,11 +54,19 @@ export function combine(...parts) {
 }
 
 // Full evidence digest for one claim.
-export function evidenceDigest(root, evidence = {}, salt) {
+// `cache` (optional Map) dedupes identical evidence specs — repos commonly
+// have many claims sharing the same globs, and each miss walks + hashes files.
+export function evidenceDigest(root, evidence = {}, salt, cache = null) {
+  const key = cache
+    ? JSON.stringify([evidence.files || [], evidence.env || [], evidence.runtime || []])
+    : null;
+  if (cache && cache.has(key)) return cache.get(key);
   const f = filesDigest(root, evidence.files);
-  return {
+  const result = {
     digest: combine(f.digest, envDigest(evidence.env, salt), runtimeDigest(evidence.runtime)),
     files: f.count,
     bytes: f.bytes,
   };
+  if (cache) cache.set(key, result);
+  return result;
 }

@@ -65,6 +65,30 @@ export function parseClaim(text, file) {
   };
 }
 
+// Process-level parse cache keyed by absolute path and validated by
+// statSync(mtimeMs, size). Repeated loadManual calls in one process (watch
+// mode, brief+verify flows, benchmarks) skip re-reading unchanged files —
+// on some systems (AV-per-open overhead) the read dominates cold load time.
+const parseCache = new Map();
+
+function parseClaimCached(file) {
+  let st;
+  try { st = fs.statSync(file); } catch { parseCache.delete(file); return parseClaim(fs.readFileSync(file, 'utf8'), file); }
+  const hit = parseCache.get(file);
+  if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) {
+    if (hit.err) throw hit.err;
+    return hit.parsed;
+  }
+  try {
+    const parsed = parseClaim(fs.readFileSync(file, 'utf8'), file);
+    parseCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, parsed });
+    return parsed;
+  } catch (e) {
+    parseCache.set(file, { mtimeMs: st.mtimeMs, size: st.size, err: e });
+    throw e;
+  }
+}
+
 export function loadManual(root) {
   const dir = path.join(root, '.manual', 'claims');
   if (!fs.existsSync(dir)) {
@@ -77,8 +101,9 @@ export function loadManual(root) {
   const errors = [];
   const seen = new Set();
   for (const f of files) {
+    const full = path.join(dir, f);
     try {
-      const c = parseClaim(fs.readFileSync(path.join(dir, f), 'utf8'), path.join(dir, f));
+      const c = parseClaimCached(full);
       if (seen.has(c.fm.id)) errors.push(`${f}: duplicate id ${c.fm.id}`);
       seen.add(c.fm.id);
       claims.push(c);

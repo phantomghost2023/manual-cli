@@ -11,6 +11,7 @@ import { init } from './init.js';
 import { writeProposals } from './observe.js';
 import { installHook, uninstallHook, hookStatus } from './hooks.js';
 import { eject } from './eject.js';
+import { startWatch } from './watch.js';
 import { c } from './color.js';
 
 function usage() {
@@ -26,6 +27,7 @@ Usage:
   manual inbox  [--root <dir>] [accept <file>]
   manual hooks  [--root <dir>] [install|uninstall|status]
   manual eject  [--root <dir>] [--dry-run]   # vendor the CLI into tools/manual-cli
+  manual watch  [--root <dir>] [--debounce N]  # re-verify affected claims on change
   manual brief  --at <ref> [files...]     # manual as it was at a past ref
 
 Verify runs each claim's check in a sandbox (git worktree when possible),
@@ -159,6 +161,24 @@ export async function main(argv = []) {
         for (const f of res.created) console.log(`  + ${f}`);
         console.log(c.yellow('\nCandidates are in .manual/inbox/ — review, then `manual inbox accept <file>`.'));
       }
+      return 0;
+    }
+
+    if (cmd === 'watch') {
+      const state = new State(root);
+      const debounceMs = Number(flag(rest, '--debounce') || 400);
+      const session = startWatch(root, { debounceMs });
+      console.log(c.bold(`manual watch — ${path.basename(root)} (debounce ${debounceMs}ms)`));
+      console.log(c.grey('  watching for changes; claims whose evidence matches are re-verified'));
+      console.log(c.grey('  Ctrl+C to stop\n'));
+      const stop = () => {
+        session.stop();
+        console.log(c.grey('\nwatch stopped'));
+        process.exit(0);
+      };
+      process.on('SIGINT', stop);
+      process.on('SIGTERM', stop);
+      await new Promise(() => {}); // run until signaled
       return 0;
     }
 
