@@ -1,6 +1,7 @@
 import { loadManual } from './claims.js';
 import { evidenceDigest } from './hash.js';
 import { parseTtl } from './util.js';
+import { staleProposals } from './observe.js';
 import { c } from './color.js';
 
 // Doctor: a health report for the manual itself. Recomputes digests, checks
@@ -35,7 +36,10 @@ export function doctor(root, state) {
 
   const suspect = rows.filter((r) => r.issues.length > 0);
   const healthy = rows.length - suspect.length;
-  return { rows, suspect, healthy, errors };
+  // state is optional here: stale-candidate analysis needs history and stamps,
+  // and a caller without one simply has no proposals to compare against.
+  const stale = state ? staleProposals(root, state) : [];
+  return { rows, suspect, healthy, errors, staleCandidates: stale };
 }
 
 export function printDoctor(res) {
@@ -48,9 +52,13 @@ export function printDoctor(res) {
     }
   }
   for (const e of res.errors) console.log(c.red(`✖ load error: ${e}`));
-  const code = res.suspect.length || res.errors.length ? 1 : 0;
+  for (const s of res.staleCandidates || []) {
+    console.log(c.amber(`▲ ${s.file} proposes max_ms ${s.proposes_in_file}, but the evidence now supports ${s.proposes_now}`));
+  }
+  const staleCount = (res.staleCandidates || []).length;
+  const code = res.suspect.length || res.errors.length || staleCount ? 1 : 0;
   console.log(
-    c.bold(`\n${res.healthy} healthy, ${res.suspect.length} need attention, ${res.errors.length} load errors`),
+    c.bold(`\n${res.healthy} healthy, ${res.suspect.length} need attention, ${staleCount} stale candidate(s), ${res.errors.length} load errors`),
   );
   return code;
 }

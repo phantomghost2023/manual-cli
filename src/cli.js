@@ -4,7 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { State } from './state.js';
 import { verify, printVerifyReport } from './verify.js';
 import { brief } from './brief.js';
-import { listInbox, acceptInbox } from './inbox.js';
+import { listInbox, previewInbox } from './inbox.js';
+import { acceptAndVerify, undoAndVerify } from './flywheel.js';
 import { enforce } from './enforce.js';
 import { doctor, printDoctor } from './doctor.js';
 import { init } from './init.js';
@@ -23,13 +24,13 @@ function usage() {
   console.log(`manual — self-verifying repository operating manual (manual/v1)
 
 Usage:
-  manual verify [--root <dir>] [--force] [--diff [base]] [--json]
+  manual verify [--root <dir>] [--force] [--diff [base]] [--only <ids>] [--json]
   manual brief  [--root <dir>] [--budget N] [--json] [files...]
   manual enforce [--root <dir>] [--stage pre-commit|pr]
   manual observe [--root <dir>]          # flywheel: measurements -> inbox candidates
   manual doctor [--root <dir>]           # manual health report
   manual init   [--root <dir>] [--dry-run]   # discover + scaffold .manual/
-  manual inbox  [--root <dir>] [accept <file>]
+  manual inbox  [--root <dir>] [accept <file> | preview <file> | undo <token>]
   manual hooks  [--root <dir>] [install|uninstall|status]
   manual eject  [--root <dir>] [--dry-run]   # vendor the CLI into tools/manual-cli
   manual watch  [--root <dir>] [--debounce N]  # re-verify affected claims on change
@@ -79,7 +80,11 @@ export async function main(argv = []) {
       const diffArg = rest.includes('--diff')
         ? (flag(rest, '--diff') || true)
         : undefined;
-      const res = await verify(root, { state, force, diff: diffArg });
+      const only = rest.reduce((acc, a, i) => {
+        if (a === '--only') acc.push(...String(rest[i + 1] || '').split(',').filter(Boolean));
+        return acc;
+      }, []);
+      const res = await verify(root, { state, force, diff: diffArg, only });
       if (json) {
         console.log(JSON.stringify({
           errors: res.errors,
@@ -322,7 +327,32 @@ export async function main(argv = []) {
       if (sub === 'accept') {
         const file = rest[rest.indexOf('accept') + 1];
         if (!file) { console.error('usage: manual inbox accept <file>'); return 2; }
-        acceptInbox(root, file);
+        const state = new State(root);
+        const res = await acceptAndVerify(root, file, { state });
+        state.save();
+        if (res.verified && res.ok === false) {
+          console.error(c.red(`the accepted proposal is false: ${res.verified.id} is now broken (${res.verified.note})`));
+          console.error(c.grey(`  undo: manual inbox undo ${res.token}`));
+          return 1;
+        }
+        if (res.verified) console.log(c.green(`verified: ${res.verified.id} is ${res.verified.state}`));
+        return 0;
+      }
+      if (sub === 'undo') {
+        const token = rest[rest.indexOf('undo') + 1];
+        if (!token) { console.error('usage: manual inbox undo <token>'); return 2; }
+        const state = new State(root);
+        const res = await undoAndVerify(root, token, { state });
+        state.save();
+        if (res.verified) console.log(c.green(`restored: ${res.verified.id} is ${res.verified.state}`));
+        return 0;
+      }
+      if (sub === 'preview') {
+        const file = rest[rest.indexOf('preview') + 1];
+        if (!file) { console.error('usage: manual inbox preview <file>'); return 2; }
+        const p = previewInbox(root, file);
+        console.log(c.bold(`${p.file} — ${p.summary}`));
+        console.log(p.diff);
         return 0;
       }
       listInbox(root);

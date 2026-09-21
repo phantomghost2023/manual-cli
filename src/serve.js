@@ -5,7 +5,8 @@ import { State } from './state.js';
 import { verify } from './verify.js';
 import { buildReportData, renderReport } from './report.js';
 import { graphToJson } from './graph.js';
-import { previewInbox, acceptInbox, readInbox } from './inbox.js';
+import { previewInbox, readInbox } from './inbox.js';
+import { acceptAndVerify, undoAndVerify } from './flywheel.js';
 import { c } from './color.js';
 
 // `manual serve` — a local dashboard over the same artifact `manual report`
@@ -114,8 +115,34 @@ export function createHandler(root, opts = {}) {
         try { file = JSON.parse(body).file; } catch { /* fall through to the error below */ }
       }
       try {
-        const dest = acceptInbox(root, file);
-        return json(res, 200, { accepted: true, file, dest });
+        // Accepting is not the end of the story: the claim this proposal edits
+        // is re-verified immediately, and the verdict comes back with an undo
+        // token so a false proposal can be reverted without the CLI.
+        const state = new State(root);
+        const out = await acceptAndVerify(root, file, { state, quiet: true });
+        state.save();
+        return json(res, out.ok === false ? 409 : 200, out);
+      } catch (e) {
+        return json(res, 400, { error: e.message });
+      }
+    }
+
+    if (route === '/api/inbox/undo') {
+      if (req.method !== 'POST') return json(res, 405, { error: 'POST required' });
+      let body = '';
+      for await (const chunk of req) {
+        body += chunk;
+        if (body.length > 64 * 1024) return json(res, 413, { error: 'body too large' });
+      }
+      let token = url.searchParams.get('token');
+      if (!token && body) {
+        try { token = JSON.parse(body).token; } catch { /* handled below */ }
+      }
+      try {
+        const state = new State(root);
+        const out = await undoAndVerify(root, token, { state, quiet: true });
+        state.save();
+        return json(res, 200, out);
       } catch (e) {
         return json(res, 400, { error: e.message });
       }

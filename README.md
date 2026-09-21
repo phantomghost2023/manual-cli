@@ -41,13 +41,13 @@ node bin/manual.js verify --root /path/to/repo --force
 
 | Command | What it does |
 |---|---|
-| `verify [--force] [--diff [base]]` | Run checks (skipping claims whose evidence digests are unchanged and within TTL), stamp `state.json`, exit 1 if anything is broken. `--diff` verifies only claims relevant to changed files, plus all policies and dependency closure. |
+| `verify [--force] [--diff [base]] [--only <ids>]` | Run checks (skipping claims whose evidence digests are unchanged and within TTL), stamp `state.json`, exit 1 if anything is broken. `--diff` verifies only claims relevant to changed files, plus all policies and dependency closure. `--only` restricts the run to named claims plus their transitive dependencies — a claim whose deps are unstamped would otherwise report `blocked`, which says nothing about the claim. |
 | `brief [--budget N] [files...]` | Token-budgeted briefing: claims relevant to the files in play, weighted by priority × glob specificity × trust tier; traps score double; `when: true` claims always included. |
 | `enforce [--stage pre-commit\|pr]` | Runs every policy claim's check as a gate. The claim's check IS the gate — enforcement and documentation are the same object and cannot drift. |
-| `observe` | Reads verify history in `state.json`, writes inbox candidates when measurements diverge from claim bounds: *tighten* (p50 far under `max_ms`) or *relax* (the bound itself broke the claim). |
+| `observe` | Reads verify history in `state.json`, writes inbox candidates when measurements diverge from claim bounds: *tighten* (the bound sits far above what runs cost) or *relax* (the bound itself broke the claim). Proposed bounds respect the tail — at least 3× the median, 1.5× p90, and 1.1× the worst run seen — and it refuses to propose a tightening the observed tail would violate. It also reports candidates that have gone *stale* (evidence moved since they were written). |
 | `doctor` | Health report for the manual: never-verified claims, evidence changed since last verify, expired TTLs, broken claims. |
 | `init [--dry-run]` | Inspects package.json, lockfiles, test scripts, migrations, CODEOWNERS; scaffolds `.manual/`, a GitHub Actions workflow, and inbox candidates marked `origin: observed`. |
-| `inbox [accept <file>]` | List candidates; accept merges `proposes.patch` into the target claim's frontmatter (no clobbering) or moves a whole-claim candidate into `claims/`. |
+| `inbox [accept \| preview \| undo]` | List candidates. `preview <file>` shows the exact frontmatter change without touching anything. `accept <file>` merges `proposes.patch` into the target claim's frontmatter (no clobbering) or moves a whole-claim candidate into `claims/` — and then **re-verifies the affected claim**, exiting 1 with an undo token if the proposal turns out to be false. `undo <token>` restores the claim file byte-for-byte and puts the candidate back. |
 | `hooks install\|uninstall\|status` | Manage the `.git/hooks/pre-commit` gate that runs `manual enforce` (marked block, preserves user hooks). |
 | `mcp [--root dir]` | Speak MCP over stdio: `manual_brief`, `manual_verify`, `manual_doctor`, `manual_inbox` tools. Point your coding agent at `bin/manual.js mcp`. |
 | `eject [--dry-run]` | Vendor the CLI into `tools/manual-cli/` so CI workflows and hooks run fully self-contained. |
@@ -80,13 +80,17 @@ requests — it renders offline, in email, and in an artifact bucket.
 (`POST /api/verify`) re-runs the real checks in a sandbox and reloads with fresh
 stamps, and each inbox candidate gets a **preview & accept** button that shows
 the exact frontmatter diff before a human applies it. Accepting a proposal is
-the one step in this system that is deliberately never automatic.
+the one step in this system that is deliberately never automatic — and when a
+proposal is accepted, the affected claim is re-verified in place and the verdict
+is rendered before you go anywhere: fresh, or *"proposal turned out false"* with
+an **undo this change** button (`POST /api/inbox/undo`).
 
 ```
 GET  /                the report           POST /api/verify          run the checks
-GET  /api/graph       graph JSON           POST /api/inbox/accept    apply a proposal
-GET  /api/claims      claim JSON           GET  /api/inbox/preview   show a proposal's diff
-GET  /health          liveness             GET  /api/inbox           list candidates
+GET  /api/graph       graph JSON           POST /api/inbox/accept    apply + verify a proposal
+GET  /api/claims      claim JSON           POST /api/inbox/undo      revert an accepted one
+GET  /health          liveness             GET  /api/inbox/preview   show a proposal's diff
+GET  /api/inbox       list candidates
 ```
 
 ## Claim file format (manual/v1)
@@ -144,9 +148,18 @@ Checks run in a throwaway `git worktree` (HEAD + overlay of your uncommitted dif
 
 ### The flywheel
 
-1. Sessions (or `manual observe`) write *observation records* to `.manual/inbox/` — "p50 was 210ms over 5 runs; the claim allows 30s — tighten to 1s."
-2. A human reviews and runs `manual inbox accept <file>`, which patches the claim's frontmatter in place.
-3. Every session that passes through the repo leaves the manual slightly truer than it found it.
+1. Sessions (or `manual observe`) write *observation records* to `.manual/inbox/` — "p90 was 45s and the worst run 47s; the claim allows 120s — tighten to 69s."
+2. A human reviews (`manual inbox preview <file>`, or the dashboard's diff) and accepts it.
+3. Accepting is **not** the end: the affected claim is re-verified immediately, with force. A proposal that turns out to be false exits 1 and hands back an undo token.
+4. `manual inbox undo <token>` restores the claim byte-for-byte and returns the candidate to the inbox.
+5. Every session that passes through the repo leaves the manual slightly truer than it found it.
+
+This matters because a proposal is an *observation*, and observations can be wrong. The
+first real proposal this tool ever generated asked to tighten `tests.suite` from 120s to
+11s based on a stale 3×-p50 heuristic; a `history` of the same claim showed a p90 of 25s
+and a worst run of 47s. Accepting it would have made the claim flap forever. The tool
+therefore both refuses to *propose* bounds the tail would violate and refuses to silently
+*keep* a proposal that fails its own check.
 
 ## Layout
 
@@ -166,7 +179,7 @@ The demo ships a genuine trap discovered while building it: `node --test --test-
 ## Test
 
 ```bash
-npm test        # 96 tests across 26 suites (seeded fuzzing, real-git integration, HTTP end-to-end)
+npm test        # 105 tests across 26 suites (seeded fuzzing, real-git integration, HTTP end-to-end)
 npm run bench   # 500-claim scale benchmark (see numbers below)
 ```
 

@@ -52,10 +52,26 @@ export async function verify(root, opts = {}) {
     cl.fileCount = d.files;
   }
 
+  // `only` narrows the run to named claims (used after a proposal is accepted,
+  // so the check the proposal changed is the one that has to prove itself) plus
+  // their transitive dependencies: a claim whose dependencies are unstamped or
+  // stale would report `blocked`, which says nothing about the claim itself.
+  let pool = claims;
+  if (opts.only?.length) {
+    const byId = new Map(claims.map((cl) => [cl.fm.id, cl]));
+    const want = new Set();
+    const walk = (id) => {
+      if (want.has(id) || !byId.has(id)) return;
+      want.add(id);
+      for (const d of byId.get(id).fm.depends_on ?? []) walk(d.id);
+    };
+    for (const id of opts.only) walk(id);
+    pool = claims.filter((cl) => want.has(cl.fm.id));
+  }
   const ordered = topoOrder(
     opts.diff
-      ? selectForDiff(claims, changedFiles(root, opts.diff === true ? findBase(root) : opts.diff))
-      : claims,
+      ? selectForDiff(pool, changedFiles(root, opts.diff === true ? findBase(root) : opts.diff))
+      : pool,
   );
   const results = [];
   let sharedSandbox = null;

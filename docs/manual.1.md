@@ -13,10 +13,13 @@ Every claim about a repository is a markdown file in `.manual/claims/` backed by
 ## COMMANDS
 
 ```
-verify [--force] [--diff [base]] [--json]
+verify [--force] [--diff [base]] [--only <ids>] [--json]
     Run each claim's check (skipping unchanged evidence digests within TTL),
     stamp state.json, exit 1 if anything is broken. --diff selects only claims
     relevant to changed files, plus all policies, plus dependency closure.
+    --only takes a comma-separated list of claim ids and runs just those plus
+    their transitive dependencies (a claim whose dependencies are unstamped
+    reports `blocked`, which says nothing about the claim itself).
 
 brief [--budget N] [--at <ref>] [--json] [files...]
     Token-budgeted briefing for the files in play. Weighted by priority x
@@ -28,7 +31,11 @@ enforce [--stage pre-commit|pr]
 
 observe
     Flywheel: compare recent measurements in state.json against claim bounds;
-    write tighten/relax candidates to .manual/inbox/.
+    write tighten/relax candidates to .manual/inbox/. Proposed bounds keep
+    headroom over the tail (>= 3x p50, 1.5x p90, 1.1x worst observed) and a
+    tightening is refused when the observed tail would violate it. Candidates
+    whose evidence has since moved are reported as stale (also by doctor) —
+    observe never rewrites a proposal a human may be reviewing.
 
 doctor
     Manual health: never-verified claims, evidence drift, expired TTLs.
@@ -37,9 +44,14 @@ init [--dry-run]
     Discover claims by inspection (package manager, module type, test runner,
     migrations, CODEOWNERS); scaffold .manual/, CI workflow, .gitignore.
 
-inbox [accept <file>]
-    List candidates; accept merges proposes.patch into the target claim or
-    moves a whole-claim candidate into claims/.
+inbox [accept|preview|undo <arg>]
+    List candidates. preview <file> prints the exact frontmatter change a
+    candidate would make (no writes). accept <file> applies it — merging
+    proposes.patch into the target claim or moving a whole-claim candidate into
+    claims/ — and then re-verifies the affected claim with force. A proposal
+    whose check fails exits 1 and writes an undo snapshot to .manual/undo/.
+    undo <token> restores the claim file byte-for-byte and returns the
+    candidate to the inbox. Snapshots are pruned to the 20 most recent.
 
 hooks install|uninstall|status
     Manage the pre-commit gate (marked, idempotent block in .git/hooks/pre-commit).
@@ -80,8 +92,9 @@ serve [--port N] [--open] [--pidfile <file>]
     Serve the same page as a loopback dashboard, regenerated per request:
     GET / (report), GET /api/graph, GET /api/claims, GET /api/inbox,
     GET /api/inbox/preview?file=, GET /health, POST /api/verify (re-runs the
-    real checks and rewrites state.json), and POST /api/inbox/accept
-    ({"file":"..."}) which applies a proposal. Candidate names are validated
+    real checks and rewrites state.json), POST /api/inbox/accept
+    ({"file":"..."}) which applies a proposal and returns the verify verdict,
+    and POST /api/inbox/undo ({"token":"..."}) which reverts it. Candidate names are validated
     to stay inside .manual/inbox/. Binds 127.0.0.1 only; if the port is taken
     it tries N+1 ... N+19. --pidfile lets scripts and editors find (and stop)
     the server.
@@ -106,6 +119,15 @@ Kinds: `fact`, `command`, `trap` (broken = gotcha fixed → retire), `policy`, `
 
 0 all fresh/passed · 1 something broken, a blocked gate, a graph cycle, or a
 suspect doctor report · 2 usage errors, load errors, or an unrunnable command.
+
+## PROPOSALS MUST PROVE THEMSELVES
+
+A candidate is an observation, and observations can be wrong. Accepting one is
+therefore not a file edit: the affected claim is re-verified immediately, with
+force (a proposal that only edits the claim's own frontmatter may not move its
+evidence digest, so an unforced verify would happily re-report the old stamp).
+Exit 0 means the proposal is now true; exit 1 means it is false, and the claim
+is left exactly as the proposal made it — visible as broken, with an undo token.
 
 ## TIMELINE
 

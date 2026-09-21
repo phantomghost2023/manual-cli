@@ -2,6 +2,21 @@
 
 All notable changes to manual-cli are documented here. Format: Keep a Changelog; versioning: SemVer.
 
+## [0.5.0] - 2026-09-21
+
+### Added
+- Accepting a proposal now **re-verifies the affected claim** (forced, and scoped with `verify --only`). The verdict is returned to the CLI and rendered in the dashboard: fresh, or *"proposal turned out false"* with an undo button.
+- `manual inbox undo <token>` and `POST /api/inbox/undo` restore the claim file byte-for-byte and put the candidate back in the inbox. Snapshots persist under `.manual/undo/` (gitignored, pruned to the last 20) so an undo works from a later process, not just the one that accepted.
+- `manual inbox preview <file>` prints a candidate's exact frontmatter change without writing anything.
+- `verify --only <ids>` runs named claims plus their transitive dependencies — verifying one claim without its dependencies just reports `blocked`.
+- `observe` proposes bounds that respect the tail (≥3× p50, 1.5× p90, 1.1× worst observed) and **refuses** a tightening the observed tail would violate.
+- `staleProposals` (surfaced by `observe` and `doctor`) flags inbox candidates whose evidence has moved since they were written — previously a stale candidate silently blocked the corrected one forever.
+
+### Fixed
+- `observe`'s tighten heuristic used 3× p50 alone. On a spiky series (p50 9s, p90 25s, worst 47s) it proposed an 11s bound — guaranteed flapping. This was caught by accepting a real proposal in the dashboard and watching it break the claim.
+- The accept handler shadowed the HTTP `res` with its result object (`res.writeHead is not a function`).
+- `acceptAndVerify` printed `acceptInbox`'s "review the diff, then commit" line, which contradicts the verify that just ran.
+
 ## [0.4.0] - 2026-09-21
 
 ### Added

@@ -236,6 +236,9 @@ export function renderReport(data) {
   for (const row of doctorRes?.suspect || []) {
     for (const i of row.issues) issues.push(`${row.id}: ${i}`);
   }
+  for (const s of doctorRes?.staleCandidates || []) {
+    issues.push(`stale candidate ${s.file}: proposes max_ms ${s.proposes_in_file}, but the evidence now supports ${s.proposes_now}`);
+  }
   const issueHtml = issues.length
     ? `<ul class="issues">${issues.map((i) => `<li>${esc(i)}</li>`).join('')}</ul>`
     : '<p class="ok">No issues — every claim is verified, fresh, and its evidence is unchanged.</p>';
@@ -341,6 +344,9 @@ export function renderReport(data) {
   button.accept:hover { background:#223a22; }
   .patch pre { white-space:pre-wrap; background:#12151b; border:1px solid var(--line); border-radius:8px; padding:10px; font-size:11.5px; margin:6px 0 0; max-height:280px; overflow:auto; }
   .patch .confirm { background:#1e3a8a; border:1px solid #3b5bdb; color:#fff; border-radius:6px; padding:4px 10px; cursor:pointer; font-size:11.5px; margin-top:6px; }
+  .verdict { margin-top:8px; padding:7px 10px; border-radius:8px; background:#12151b; border:1px solid var(--line); font-size:12px; }
+  .verdict .ok { color:var(--fresh); } .verdict .bad { color:var(--broken); }
+  button.undo { margin-left:8px; background:#3a1b1b; border:1px solid #6b2b2b; color:#ff8a80; border-radius:6px; padding:3px 9px; cursor:pointer; font-size:11px; }
   .candidate { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 13px; margin-bottom:8px; display:flex; flex-direction:column; gap:4px; }
   footer { padding:18px 26px 40px; color:var(--muted); font-size:12px; border-top:1px solid var(--line); margin-top:14px; }
   .path { color:var(--muted); }
@@ -471,13 +477,42 @@ ${cards}
               '<pre>' + j.diff.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</pre>' +
               '<button class="confirm">accept this proposal</button>';
             box.querySelector('.confirm').addEventListener('click', function () {
-              this.disabled = true;
-              this.textContent = 'accepting\u2026';
+              var self = this;
+              self.disabled = true;
+              self.textContent = 'accepting and verifying\u2026';
               fetch('/api/inbox/accept', {
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },
                 body: JSON.stringify({ file: file })
-              }).then(function (r) { return r.json(); }).then(function () { location.reload(); });
+              }).then(function (r) { return r.json(); }).then(function (j) {
+                if (j.error) { self.textContent = j.error; return; }
+                var v = j.verified;
+                var verdict = document.createElement('div');
+                verdict.className = 'verdict';
+                if (!v) {
+                  verdict.innerHTML = '<b>accepted</b> <span class="muted">(no claim to verify)</span> ' +
+                    '<button class="confirm" onclick="location.reload()">reload</button>';
+                } else if (v.state === 'fresh') {
+                  verdict.innerHTML = '<b class="ok">proposal verified</b> <span class="muted">' +
+                    v.id + ' is ' + v.state + (v.measured_ms != null ? ' (' + v.measured_ms + 'ms)' : '') + '</span>';
+                  setTimeout(function () { location.reload(); }, 1200);
+                } else {
+                  verdict.innerHTML = '<b class="bad">proposal turned out false</b> <span class="muted">' +
+                    v.id + ' is now ' + v.state + ': ' + (v.note || '') + '</span>' +
+                    '<button class="undo">undo this change</button>';
+                  verdict.querySelector('.undo').addEventListener('click', function () {
+                    this.disabled = true;
+                    this.textContent = 'undoing\u2026';
+                    fetch('/api/inbox/undo', {
+                      method: 'POST',
+                      headers: { 'content-type': 'application/json' },
+                      body: JSON.stringify({ token: j.token })
+                    }).then(function (r) { return r.json(); }).then(function () { location.reload(); });
+                  });
+                }
+                box.appendChild(verdict);
+                self.remove();
+              }).catch(function (e) { self.textContent = 'accept failed'; self.disabled = false; });
             });
           })
           .catch(function () { btn.textContent = 'preview failed'; btn.disabled = false; });

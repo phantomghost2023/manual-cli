@@ -155,7 +155,7 @@ export function previewInbox(root, file) {
   };
 }
 
-export function acceptInbox(root, file) {
+export function acceptInbox(root, file, { quiet = false } = {}) {
   safeInboxName(file);
   const dir = path.join(root, '.manual', 'inbox');
   const src = path.join(dir, file);
@@ -180,8 +180,10 @@ export function acceptInbox(root, file) {
     const merged = `---\n${stringifyFm(claimFm)}---${cm[2]}`;
     fs.writeFileSync(dest, merged);
     fs.rmSync(src);
-    console.log(`patched claims/${targetId}.md: ${Object.keys(patch).join(', ')} (from inbox/${file})`);
-    console.log(c.yellow('Review the diff, then commit. The patch came from a session observation.'));
+    if (!quiet) {
+      console.log(`patched claims/${targetId}.md: ${Object.keys(patch).join(', ')} (from inbox/${file})`);
+      console.log(c.yellow('Review the diff, then commit. The patch came from a session observation.'));
+    }
     return dest;
   }
 
@@ -192,7 +194,9 @@ export function acceptInbox(root, file) {
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   fs.copyFileSync(src, dest);
   fs.rmSync(src);
-  console.log(`moved inbox/${file} → claims/${id}.md`);
-  console.log(c.yellow('Next: convert it to a full claim (kind, statement, check) and review the diff.'));
+  if (!quiet) {
+    console.log(`moved inbox/${file} → claims/${id}.md`);
+    console.log(c.yellow('Next: convert it to a full claim (kind, statement, check) and review the diff.'));
+  }
   return dest;
 }

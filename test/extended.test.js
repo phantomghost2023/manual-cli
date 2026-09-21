@@ -7,8 +7,8 @@ import { fileURLToPath } from 'node:url';
 
 import { selectForDiff } from '../src/diff.js';
 import { enforce } from '../src/enforce.js';
-import { planProposals, writeProposals } from '../src/observe.js';
-import { doctor } from '../src/doctor.js';
+import { planProposals, writeProposals, seriesStats, staleProposals } from '../src/observe.js';
+import { doctor, printDoctor } from '../src/doctor.js';
 import { listInbox, acceptInbox } from '../src/inbox.js';
 import { init } from '../src/init.js';
 import { verify } from '../src/verify.js';
@@ -101,6 +101,77 @@ describe('observe (flywheel)', () => {
     const written = writeProposals(dir, state, { quiet: true });
     assert.equal(written.length, 1);
     assert.ok(fs.existsSync(path.join(dir, '.manual', 'inbox', written[0].file)));
+    cleanup(dir);
+  });
+
+  // The bug this pins: `observe` proposed 3x the median. On a spiky series that
+  // lands *below* the p90, i.e. a bound the claim is guaranteed to violate.
+  const spike = [6000, 9000, 9000, 9000, 9000, 9000, 9000, 9000, 12000, 25000, 47000];
+
+  const setBound = (dir, ms) => {
+    const p = path.join(dir, '.manual', 'claims', 'tests.demo.md');
+    fs.writeFileSync(p, fs.readFileSync(p, 'utf8').replace(/max_ms: \d+/, `max_ms: ${ms}`));
+  };
+
+  test('a tighten proposal clears the observed tail, not just the median', () => {
+    const dir = tmp('manual-obs-tail-');
+    setBound(dir, 120000);
+    const state = new State(dir);
+    state.set('tests.demo', { state: 'fresh', note: 'ok' });
+    for (const ms of spike) state.pushHistory({ id: 'tests.demo', state: 'fresh', at: nowIso(), ms });
+    const st = seriesStats(state, 'tests.demo');
+    const tighten = planProposals(dir, state).find((p) => p.id === 'tests.demo' && p.kind === 'tighten');
+    assert.ok(tighten, 'expected a tighten proposal against a loose bound');
+    assert.equal(st.p50, 9000);
+    assert.equal(tighten.proposed, 52000, 'clears the 47s worst run with 10% headroom');
+    assert.ok(tighten.proposed > st.p90, `bound ${tighten.proposed} must clear the p90 ${st.p90}`);
+    assert.ok(tighten.proposed < tighten.bound, 'and still be a tightening');
+    const written = writeProposals(dir, state, { quiet: true });
+    const text = fs.readFileSync(path.join(dir, '.manual', 'inbox', written[0].file), 'utf8');
+    assert.match(text, /p50 9000ms, p90 25000ms, worst 47000ms/, 'the candidate states the tail it respected');
+    cleanup(dir);
+  });
+
+  test('no tighten proposal when the tail does not fit under the bound', () => {
+    const dir = tmp('manual-obs-refuse-');
+    setBound(dir, 30000);
+    const state = new State(dir);
+    state.set('tests.demo', { state: 'fresh', note: 'ok' });
+    for (const ms of spike) state.pushHistory({ id: 'tests.demo', state: 'fresh', at: nowIso(), ms });
+    // Median is 9s, well under half of 30s — the old heuristic would "tighten"
+    // to 27s, which the 47s run already violates. Refusing is the correct answer.
+    const proposals = planProposals(dir, state).filter((p) => p.kind === 'tighten');
+    assert.deepEqual(proposals, []);
+    cleanup(dir);
+  });
+
+  test('a pending candidate whose evidence moved is reported stale, not silently kept', () => {
+    const dir = tmp('manual-obs-stale-');
+    setBound(dir, 120000);
+    const state = new State(dir);
+    state.set('tests.demo', { state: 'fresh', note: 'ok' });
+    for (const ms of spike) state.pushHistory({ id: 'tests.demo', state: 'fresh', at: nowIso(), ms });
+    // writeProposals refuses to overwrite a candidate a human may be reviewing…
+    assert.equal(writeProposals(dir, state, { quiet: true }).length, 1);
+    // …but a candidate whose numbers no longer match must not block a corrected
+    // one invisibly. The scenario: an old candidate proposing a bound that the
+    // newer, spikier evidence says is too tight.
+    const staleFile = path.join(dir, '.manual', 'inbox', '2020-01-01-tighten-tests.demo.md');
+    fs.writeFileSync(staleFile, '---\nid: candidate.tighten.tests.demo\nkind: candidate\nproposes:\n  update: tests.demo\n  patch:\n    check.expect.max_ms: 11000\n---\ntoo tight\n');
+    const stale = staleProposals(dir, state);
+    const mine = stale.find((s) => s.file === '2020-01-01-tighten-tests.demo.md');
+    assert.ok(mine, 'the hand-named candidate is found too, not just canonical filenames');
+    assert.equal(mine.proposes_in_file, 11000);
+    assert.equal(mine.proposes_now, 52000);
+    assert.equal(mine.p90, 25000);
+    // the demo's own shipped candidate proposes 10s for this claim, which this
+    // synthetic evidence also disagrees with — both are reported
+    assert.ok(stale.some((s) => s.file === '2026-09-21-tighten-demo-tests.md'));
+
+    // and doctor surfaces them as something needing attention
+    const report = doctor(dir, state);
+    assert.equal(report.staleCandidates.length, stale.length);
+    assert.equal(printDoctor(report), 1);
     cleanup(dir);
   });
 

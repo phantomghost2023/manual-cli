@@ -72,7 +72,26 @@ After a few days of work:
 manual observe
 ```
 
-If runs consistently take 2s while a claim allows 30s, observe writes a *tighten* candidate. If a bound itself broke a claim, it proposes a *relax*. You review, accept or delete — the manual drifts toward truth as a side effect of work, not because anyone maintains it.
+If runs consistently take 2s while a claim allows 30s, observe writes a *tighten* candidate. If a bound itself broke a claim, it proposes a *relax*. Proposed bounds keep headroom over the tail (p90 and the worst run seen), not just the median, and observe refuses to propose a tightening the tail would violate.
+
+Then review and accept it:
+
+```bash
+manual inbox                          # list candidates
+manual inbox preview 2026-09-21-tighten-tests.suite.md   # the exact diff
+manual inbox accept  2026-09-21-tighten-tests.suite.md   # apply AND verify
+```
+
+Accepting is not blind and not the end: the affected claim is re-verified immediately.
+If the proposal was wrong, the claim is left broken, the command exits 1, and you get an
+undo token:
+
+```bash
+manual inbox undo <token>             # restore the claim byte-for-byte
+```
+
+The manual drifts toward truth as a side effect of work — but only proposals that can
+survive their own check get to stay.
 
 ## 5b. See it
 
