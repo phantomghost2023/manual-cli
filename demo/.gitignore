@@ -1,0 +1,2 @@
+# Verify stamps are local-only by convention: they are machine state, not truth.
+.manual/state.json

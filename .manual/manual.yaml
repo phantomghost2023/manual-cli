@@ -1,0 +1,9 @@
+schema: manual/v1
+brief:
+  budget_tokens: 2000
+verify:
+  default_timeout_s: 120
+  ci:
+    required:
+      - policy.*
+    diff_base: origin/main

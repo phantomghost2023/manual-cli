@@ -1,0 +1,12 @@
+{
+  "name": "manual-cli",
+  "version": "0.1.0",
+  "description": "Self-verifying repository operating manual: claims with evidence inputs, provenance, trust tiers, dependency edges, traps, and token-budgeted briefs.",
+  "type": "module",
+  "bin": { "manual": "bin/manual.js" },
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  },
+  "license": "MIT"
+}
