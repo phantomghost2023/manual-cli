@@ -1,3 +1,6 @@
 node_modules/
 *.log
 .DS_Store
+
+# manual verify stamps are machine state, not truth
+.manual/state.json
