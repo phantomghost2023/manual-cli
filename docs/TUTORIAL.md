@@ -35,6 +35,20 @@ Or accept a patch-style candidate directly (it merges into the target claim's fr
 manual inbox accept 2026-09-21-tighten-tests.demo.md
 ```
 
+Accepting is not a file edit followed by a promise: the affected claim is
+re-verified on the spot. And the accept is written to `.manual/journal/` — a
+committed entry carrying the reason, the diff, the previous content and the
+verdict — so it can be traced and undone later, from any checkout, by anyone:
+
+```bash
+manual journal                                   # what changed, why, and did it hold
+manual journal 20260921T194044Z-tests.demo       # one entry in full
+manual journal revert 20260921T194044Z-tests.demo  # restore it and re-verify
+```
+
+A revert also puts the candidate back in the inbox, so a rejected proposal is
+still reviewable rather than gone.
+
 ## 3. Verify (30 seconds)
 
 ```bash
@@ -146,3 +160,8 @@ Vendors the CLI into `tools/manual-cli/` inside the repo, so CI workflows and ho
 - `trap` broken → **celebrate**: the gotcha is fixed; retire the claim.
 - `blocked` → a dependency isn't fresh; fix upstream first.
 - Trust demotes on broken and is re-earned by execution — that's the point.
+- `manual history <id>` says *why* it went red when the numbers explain it:
+cold start, trend, outlier, two clusters, memory or load correlation, cold
+cache after an evidence change, or one test dominating the suite.
+- `manual journal` and `manual ledger` answer who changed it, whether it held,
+and how many machines have independently re-verified it.

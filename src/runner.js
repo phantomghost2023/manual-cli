@@ -1,8 +1,9 @@
-import { hostname } from 'node:os';
+import { freemem, loadavg } from 'node:os';
 import { evidenceDigest } from './hash.js';
 import { evaluateExpr } from './expr.js';
 import { Sandbox } from './sandbox.js';
 import { nowIso } from './util.js';
+import { ledgerStats, mergeTrust, machineName } from './ledger.js';
 
 // Executes a claim's check and interprets the result by kind.
 // States: fresh | stale | broken | blocked | unknown.
@@ -44,12 +45,46 @@ export async function runCheck(claim, root, { sandbox, timeoutMs }) {
       exit: r.exit,
       ms,
       stdout: out.slice(0, 4000),
+      // Parsed from the *untruncated* output: the slowest test is exactly the
+      // line most likely to be past the 4000-char cut.
+      timings: parseTestTimings(out),
       expect,
       sandboxMode: sb.mode,
     };
   } finally {
     if (own) await sb.exit();
   }
+}
+
+// Per-test timings out of a check's output, when the runner emits them.
+// Without this, a command claim's runtime is a single opaque number: you can
+// see that the suite got slower but not that one test is 90% of it. Parses the
+// two shapes that actually show up — node's TAP reporter ("# Subtest: name"
+// followed by an indented "duration_ms: N") and the spec reporters used by
+// mocha / jest / node's default (`✔ name (123ms)`).
+export function parseTestTimings(out) {
+  if (!out) return null;
+  const found = [];
+  let pending = null;
+  for (const line of out.split('\n')) {
+    const sub = /^\s*# Subtest:\s*(.+?)\s*$/.exec(line);
+    if (sub) {
+      pending = sub[1];
+      continue;
+    }
+    const tap = /^\s+duration_ms:\s*(\d+(?:\.\d+)?)\s*$/.exec(line);
+    if (tap && pending) {
+      found.push({ name: pending, ms: Number(tap[1]) });
+      pending = null;
+      continue;
+    }
+    const spec = /^\s*[✔✓√]\s+(.+?)\s+\((\d+(?:\.\d+)?)\s*ms\)\s*$/.exec(line);
+    if (spec) found.push({ name: spec[1], ms: Number(spec[2]) });
+  }
+  if (found.length === 0) return null;
+  const total = found.reduce((n, t) => n + t.ms, 0);
+  const slowest = found.reduce((a, b) => (b.ms > a.ms ? b : a));
+  return { slowest, total: Math.round(total), count: found.length };
 }
 
 // Pure promotion/demotion rule, exported for tests.
@@ -80,11 +115,21 @@ export async function verifyOne(claim, root, state, { sandbox, timeoutMs } = {})
   }
   const { state: st, note } = interpret(claim, result);
 
+  // Environment at the moment of measurement. Without it, a spiky series can
+  // only be respected (widen the bound) — it cannot be explained ("the slow
+  // runs were the ones with 200MB free instead of 3GB").
+  const env = {
+    freemem_mb: Math.round(freemem() / 1048576),
+    loadavg1: Number(loadavg()[0]?.toFixed?.(2) ?? 0),
+  };
   const prev = state.stamp(claim.fm.id);
   let tier = prev?.tier || 'bronze';
-  const host = hostname();
-  const machines = { ...(prev?.machines || {}) };
-  let passes = prev?.passes || 0;
+  const host = machineName();
+  // Trust earned on other machines lives in the git-tracked ledger; merge it so
+  // a pass count is the repository's history, not this checkout's.
+  const merged = mergeTrust({ passes: prev?.passes || 0, machines: prev?.machines || {} }, ledgerStats(root, claim.fm.id));
+  const machines = merged.machines;
+  let passes = merged.passes;
   if (st === 'fresh') {
     passes += 1;
     machines[host] = (machines[host] || 0) + 1;
@@ -105,6 +150,7 @@ export async function verifyOne(claim, root, state, { sandbox, timeoutMs } = {})
     files: claim.fileCount,
     measured_ms: result.ms ?? null,
     note,
+    env,
     origin: claim.fm.provenance?.origin || 'authored',
     author: claim.fm.provenance?.author || null,
   });
@@ -113,6 +159,21 @@ export async function verifyOne(claim, root, state, { sandbox, timeoutMs } = {})
     state: st,
     at: nowIso(),
     ms: result.ms ?? null,
+    ...env,
+    // Whether this run followed a change to the claim's evidence. Caches and
+    // compiled artifacts are invalidated by exactly that, so it is the cheapest
+    // available explanation for a spike.
+    digest_changed: prev && prev.digest !== claim.digest ? 1 : 0,
+    // Only when the runner actually reported per-test timings; absent keys
+    // keep old history entries and non-test commands honest.
+    ...(result.timings
+      ? {
+          slowest_test: result.timings.slowest.name,
+          slowest_ms: Math.round(result.timings.slowest.ms),
+          test_count: result.timings.count,
+          test_total_ms: result.timings.total,
+        }
+      : {}),
   });
-  return { claim, result, stamp, elapsed: Date.now() - t0 };
+  return { claim, result, stamp, prevStamp: prev, elapsed: Date.now() - t0 };
 }

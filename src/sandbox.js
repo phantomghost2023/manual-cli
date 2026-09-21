@@ -70,6 +70,30 @@ export class Sandbox {
         try { fs.copyFileSync(src, dst); } catch { /* vanished mid-copy: skip */ }
       }
     }
+    // Link dependency trees that git ignores.
+    //
+    // Found on a real repo: `node_modules/` is gitignored, so it is neither in
+    // the worktree nor in the untracked overlay, and every check that needs an
+    // installed dependency failed in the sandbox while passing in the working
+    // tree. A verifier that cannot run the repo's own tests is not verifying
+    // anything, so these directories are linked from the source checkout.
+    // They are shared, not copied: a check that mutates one mutates the
+    // developer's, exactly as running the command by hand would.
+    this.linked = [];
+    for (const rel of ['node_modules', '.venv', 'venv', 'vendor/bundle']) {
+      const src = path.join(toplevel, rel);
+      const dst = path.join(tmp, rel);
+      if (!fs.existsSync(src) || fs.existsSync(dst)) continue;
+      try {
+        fs.mkdirSync(path.dirname(dst), { recursive: true });
+        fs.symlinkSync(src, dst, process.platform === 'win32' ? 'junction' : 'dir');
+        this.linked.push(rel);
+      } catch {
+        // Linking can fail (permissions, filesystems); the check simply runs
+        // without it, exactly as before this existed.
+      }
+    }
+
     this.mode = 'worktree';
     this.wt = tmp;
     this.cwdBase = this.rel ? path.join(tmp, this.rel) : tmp;

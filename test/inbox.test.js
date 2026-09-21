@@ -19,7 +19,11 @@ const tmpCopy = () => {
 
 test('candidate names cannot escape the inbox directory', () => {
   assert.equal(safeInboxName('2026-09-21-x.md'), '2026-09-21-x.md');
-  for (const bad of ['../claims/x.md', '..\\claims\\x.md', 'sub/x.md', '', 'a/../b', null, 42]) {
+  // The path people actually paste — the one `manual inbox list` and `init`
+  // print — resolves to the same plain filename instead of erroring out.
+  assert.equal(safeInboxName('.manual/inbox/2026-09-21-x.md'), '2026-09-21-x.md');
+  assert.equal(safeInboxName('inbox/2026-09-21-x.md'), '2026-09-21-x.md');
+  for (const bad of ['../claims/x.md', '..\\claims\\x.md', 'sub/x.md', '', 'a/../b', '/etc/passwd', 'C:/tmp/.manual/inbox-other/x.md', null, 42]) {
     assert.throws(() => safeInboxName(bad), /unsafe candidate name|missing candidate filename/);
   }
 });

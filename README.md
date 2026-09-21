@@ -14,6 +14,8 @@ manual init     # discover claims by inspection, scaffold .manual/
 manual inbox    # list/accept candidate claims (humans accept, agents propose)
 manual hooks    # install/uninstall the pre-commit enforce gate
 manual history  # what happened to each claim over time
+manual journal  # why the manual changed, and revert any change later
+manual ledger   # trust earned across machines (gold tier, recovery)
 manual graph    # the evidence graph: dependencies, cycles, depth
 manual report   # one self-contained HTML page: graph + cards + inbox
 manual serve    # the same page as a live local dashboard
@@ -44,7 +46,7 @@ node bin/manual.js verify --root /path/to/repo --force
 | `verify [--force] [--diff [base]] [--only <ids>]` | Run checks (skipping claims whose evidence digests are unchanged and within TTL), stamp `state.json`, exit 1 if anything is broken. `--diff` verifies only claims relevant to changed files, plus all policies and dependency closure. `--only` restricts the run to named claims plus their transitive dependencies — a claim whose deps are unstamped would otherwise report `blocked`, which says nothing about the claim. |
 | `brief [--budget N] [files...]` | Token-budgeted briefing: claims relevant to the files in play, weighted by priority × glob specificity × trust tier; traps score double; `when: true` claims always included. |
 | `enforce [--stage pre-commit\|pr]` | Runs every policy claim's check as a gate. The claim's check IS the gate — enforcement and documentation are the same object and cannot drift. |
-| `observe` | Reads verify history in `state.json`, writes inbox candidates when measurements diverge from claim bounds: *tighten* (the bound sits far above what runs cost) or *relax* (the bound itself broke the claim). Proposed bounds respect the tail — at least 3× the median, 1.5× p90, and 1.1× the worst run seen — and it refuses to propose a tightening the observed tail would violate. It also reports candidates that have gone *stale* (evidence moved since they were written). |
+| `observe` | Reads verify history in `state.json`, writes inbox candidates when measurements diverge from claim bounds: *tighten* (the bound sits far above what runs cost) or *relax* (the bound itself broke the claim). Proposed bounds respect the tail — at least 3× the median, 1.5× p90, and 1.1× the worst run seen — and it refuses to propose a tightening the observed tail would violate. Every proposal carries a *diagnosis* of why the series is spiky (cold start, trend, outlier, two clusters, correlated with free memory or machine load, cold-cache after an evidence change, or a single test dominating the suite), because naming the cause changes the right action. It also reports candidates that have gone *stale* (evidence moved since they were written). |
 | `doctor` | Health report for the manual: never-verified claims, evidence changed since last verify, expired TTLs, broken claims. |
 | `init [--dry-run]` | Inspects package.json, lockfiles, test scripts, migrations, CODEOWNERS; scaffolds `.manual/`, a GitHub Actions workflow, and inbox candidates marked `origin: observed`. |
 | `inbox [accept \| preview \| undo]` | List candidates. `preview <file>` shows the exact frontmatter change without touching anything. `accept <file>` merges `proposes.patch` into the target claim's frontmatter (no clobbering) or moves a whole-claim candidate into `claims/` — and then **re-verifies the affected claim**, exiting 1 with an undo token if the proposal turns out to be false. `undo <token>` restores the claim file byte-for-byte and puts the candidate back. |
@@ -52,7 +54,9 @@ node bin/manual.js verify --root /path/to/repo --force
 | `mcp [--root dir]` | Speak MCP over stdio: `manual_brief`, `manual_verify`, `manual_doctor`, `manual_inbox` tools. Point your coding agent at `bin/manual.js mcp`. |
 | `eject [--dry-run]` | Vendor the CLI into `tools/manual-cli/` so CI workflows and hooks run fully self-contained. |
 | `watch [--debounce N]` | Editor-loop mode: re-verify claims affected by file changes (evidence globs + bidirectional dependency closure). `affectedClaims()` is exported for editor integrations. |
-| `history [<claim-id>] [--json]` | Claim archaeology: state transitions, per-claim runtime trend (p50/p90/max over recorded runs), break count, mean time to recovery, and the git provenance of the claim file. Joins two records — `state.json` verify history (machine-local) and the commit history of the claim itself. |
+| `history [<claim-id>] [--json]` | Claim archaeology: state transitions, per-claim runtime trend (p50/p90/max over recorded runs), break count, mean time to recovery, the diagnosis of why the series is spiky, and the git provenance of the claim file. Joins three records — `state.json` verify history (machine-local), the committed trust ledger (cross-machine), and the commit history of the claim itself. |
+| `journal [<id>] [--json]` | The audit trail for changes to the manual: one committed markdown file per accepted proposal, recording who accepted it, on which machine, the reason it was proposed, the exact diff, and the verify verdict that followed. `journal <id>` prints one entry; `journal revert <id>` restores the claim from any checkout and returns the candidate to the inbox — no local undo snapshot required. |
+| `ledger [--json]` | The committed record of trust earned across machines (`.manual/ledger.jsonl`). Merged into every verify, so pass counts are the repository's history rather than one checkout's, gold tier finally needs a second machine to *exist* rather than merely to be simulated, and recovery timelines span machines. |
 | `graph [--dot\|--mermaid\|--json]` | The evidence graph: nodes are claims, edges are `depends_on` (solid = required, dashed = optional). Reports cycles, dangling edges, isolated claims, and layer depth. Exits 1 on cycles or dangling edges. |
 | `report [--out <file>] [--open]` | Writes `.manual/report.html` — a single self-contained page (no CDN, no build): inline SVG graph, one card per claim, tier/state badges, doctor issues, the flywheel inbox, and live filter controls. |
 | `serve [--port N] [--open] [--pidfile <f>]` | The same page as a live loopback dashboard, regenerated per request, plus `/api/graph`, `/api/claims`, `/api/verify` (POST) and `/health`. Port failover: if N is taken it tries N+1 … N+19. Writes a pidfile so scripts can find and stop it. |
@@ -75,6 +79,25 @@ Nodes are colored by state, edges follow `depends_on`, and clicking a node jumps
 to the claim's card. Each card carries a runtime sparkline, its break count, and
 where the claim came from in git. The report is one file with zero external
 requests — it renders offline, in email, and in an artifact bucket.
+
+### Undo that survives your laptop, and reasons that survive the author
+
+`.manual/undo/` is fast and byte-exact, but it is local, pruned to 20 entries,
+and dies with the dashboard process. `.manual/journal/` is the durable half:
+one committed markdown file per accepted change, carrying the reason it was
+proposed, the exact diff, the verifying verdict, the machine it happened on,
+and the previous file content.
+
+```bash
+manual journal                                  # every accepted change, newest first
+manual journal 20260921T194044Z-tests.suite     # one entry: why, diff, verdict
+manual journal revert <id>                      # works from any checkout, or after a push
+```
+
+Reverting restores the claim byte-for-byte, journals the revert itself as a new
+entry pointing back at the original, and puts the candidate back in the inbox so
+the proposal stays reviewable. What it cannot do is un-push: the journal makes a
+change *traceable and revertible*, not *secret*.
 
 `serve` adds the two things a static file cannot do: **re-verify now**
 (`POST /api/verify`) re-runs the real checks in a sandbox and reloads with fresh
@@ -152,7 +175,8 @@ Checks run in a throwaway `git worktree` (HEAD + overlay of your uncommitted dif
 2. A human reviews (`manual inbox preview <file>`, or the dashboard's diff) and accepts it.
 3. Accepting is **not** the end: the affected claim is re-verified immediately, with force. A proposal that turns out to be false exits 1 and hands back an undo token.
 4. `manual inbox undo <token>` restores the claim byte-for-byte and returns the candidate to the inbox.
-5. Every session that passes through the repo leaves the manual slightly truer than it found it.
+5. The accept is written to `.manual/journal/` — committed, portable, and carrying the reason — so the change can be traced and reverted from any checkout later (`manual journal revert <id>`).
+6. Every session that passes through the repo leaves the manual slightly truer than it found it.
 
 This matters because a proposal is an *observation*, and observations can be wrong. The
 first real proposal this tool ever generated asked to tighten `tests.suite` from 120s to
@@ -161,6 +185,14 @@ and a worst run of 47s. Accepting it would have made the claim flap forever. The
 therefore both refuses to *propose* bounds the tail would violate and refuses to silently
 *keep* a proposal that fails its own check.
 
+A proposal now says *why* the numbers look the way they do, because the cause
+decides the fix: a cold first run wants a warm-up, a cold-cache spike after an
+evidence change is artifact rebuilding, a memory or load correlation is the
+machine rather than the code, and a single test dominating the suite means the
+bound is a proxy for that test — which is worth naming before anyone tightens
+it. The diagnosis is recorded in the candidate, in the journal entry, and in
+`manual history`.
+
 ## Layout
 
 ```
@@ -168,7 +200,10 @@ therefore both refuses to *propose* bounds the tail would violate and refuses to
   manual.yaml        # brief budget, verify timeouts, CI-required claim globs
   claims/*.md        # accepted claims
   inbox/*.md         # candidates proposed by sessions / init / observe
+  journal/*.md       # committed audit trail: each accepted change + its reason
+  ledger.jsonl       # committed trust ledger: passes per claim per machine
   state.json         # gitignored: stamps, digests, trust history, env salt
+  undo/*.json        # gitignored: local byte-exact undo snapshots (pruned to 20)
 .github/workflows/manual.yml   # written by init when .github exists
 ```
 
@@ -179,13 +214,18 @@ The demo ships a genuine trap discovered while building it: `node --test --test-
 ## Test
 
 ```bash
-npm test        # 105 tests across 26 suites (seeded fuzzing, real-git integration, HTTP end-to-end)
+npm test        # 145 tests across 27 suites (seeded fuzzing, real-git integration, HTTP end-to-end)
 npm run bench   # 500-claim scale benchmark (see numbers below)
 ```
 
-Scale (500 claims, Windows, cold process): verify --force 0.8s · warm verify 0.3s · doctor 0.1s · brief 0.1s — evidence digests are deduped per spec and parsed claims are stat-cached per process.
+Scale (500 synthetic claims, Windows, cold process, median of 3 runs on a busy
+machine): warm verify 0.17s · verify --force 0.7s (500 expr checks) · doctor
+0.2s · brief 0.17s · parsing all 500 claims 0.8–2.2s, which is the dominant cost
+and swings with machine load. Evidence digests are deduped per evidence spec and
+parsed claims are stat-cached per process, so the tool's own limit is check cost,
+not claim count — see [docs/FIELD-NOTES.md](docs/FIELD-NOTES.md).
 
-Docs: [docs/TUTORIAL.md](docs/TUTORIAL.md) (5-minute walkthrough) · [docs/manual.1.md](docs/manual.1.md) (reference) · [completions.bash](completions.bash)
+Docs: [docs/TUTORIAL.md](docs/TUTORIAL.md) (5-minute walkthrough) · [docs/manual.1.md](docs/manual.1.md) (reference) · [docs/FIELD-NOTES.md](docs/FIELD-NOTES.md) (what happened on a real repo it didn't grow up with) · [completions.bash](completions.bash)
 
 ## This repo's own manual
 

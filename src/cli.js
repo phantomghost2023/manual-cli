@@ -4,11 +4,13 @@ import { fileURLToPath } from 'node:url';
 import { State } from './state.js';
 import { verify, printVerifyReport } from './verify.js';
 import { brief } from './brief.js';
-import { listInbox, previewInbox } from './inbox.js';
-import { acceptAndVerify, undoAndVerify } from './flywheel.js';
+import { listInbox, previewInbox, readInbox } from './inbox.js';
+import { acceptAndVerify, undoAndVerify, revertFromJournal } from './flywheel.js';
+import { readJournal } from './journal.js';
+import { readLedger, allLedgerStats, machineName, GOLD_PASSES, GOLD_MACHINES } from './ledger.js';
 import { enforce } from './enforce.js';
 import { doctor, printDoctor } from './doctor.js';
-import { init } from './init.js';
+import { init, probeCandidates } from './init.js';
 import { writeProposals } from './observe.js';
 import { installHook, uninstallHook, hookStatus } from './hooks.js';
 import { eject } from './eject.js';
@@ -17,8 +19,29 @@ import { buildGraph, graphToJson, toDot, toMermaid, printGraphSummary } from './
 import { writeReport } from './report.js';
 import { serveCommand } from './serve.js';
 import { loadManual } from './claims.js';
+import { short } from './util.js';
 import { buildTimeline, describeTimeline, fmtDuration, fmtWhen, sparkline } from './timeline.js';
+import { diagnoseSeries, seriesEvents } from './observe.js';
 import { c } from './color.js';
+
+// A manual with no claims yet is the normal state right after `init`, and after
+// reverting the last accepted claim. Say what is actually going on instead of
+// printing a bare "0 claims".
+function printEmptyManualHint(root) {
+  let candidates = [];
+  try {
+    candidates = readInbox(root);
+  } catch {
+    candidates = [];
+  }
+  console.log(c.grey('\nno claims in .manual/claims/ yet'));
+  if (candidates.length) {
+    console.log(c.grey(`  ${candidates.length} candidate(s) waiting in the inbox — ` +
+      `review with \`manual inbox list\`, accept with \`manual inbox accept <file>\``));
+  } else {
+    console.log(c.grey('  run `manual init` to discover your first candidates, or write one by hand'));
+  }
+}
 
 function usage() {
   console.log(`manual — self-verifying repository operating manual (manual/v1)
@@ -29,8 +52,11 @@ Usage:
   manual enforce [--root <dir>] [--stage pre-commit|pr]
   manual observe [--root <dir>]          # flywheel: measurements -> inbox candidates
   manual doctor [--root <dir>]           # manual health report
-  manual init   [--root <dir>] [--dry-run]   # discover + scaffold .manual/
+  manual init   [--root <dir>] [--dry-run] [--no-probe]   # discover + scaffold .manual/
   manual inbox  [--root <dir>] [accept <file> | preview <file> | undo <token>]
+  manual ledger [--root <dir>] [--json]                    # trust earned across machines
+  manual journal [--root <dir>] [<id>] [--json]            # why the manual says what it says
+  manual journal revert <id>                               # restore from a journal entry
   manual hooks  [--root <dir>] [install|uninstall|status]
   manual eject  [--root <dir>] [--dry-run]   # vendor the CLI into tools/manual-cli
   manual watch  [--root <dir>] [--debounce N]  # re-verify affected claims on change
@@ -85,6 +111,11 @@ export async function main(argv = []) {
         return acc;
       }, []);
       const res = await verify(root, { state, force, diff: diffArg, only });
+      // Persist before reporting, not after: the JSON branch used to return
+      // early, so `verify --json` — the mode CI and agents actually use —
+      // printed fresh states and then threw them away, leaving stamps, trust
+      // history and the flywheel's evidence behind on disk.
+      state.save();
       if (json) {
         console.log(JSON.stringify({
           errors: res.errors,
@@ -100,7 +131,7 @@ export async function main(argv = []) {
         return code;
       }
       const code = printVerifyReport(res);
-      state.save();
+      if (res.results.length === 0) printEmptyManualHint(root);
       return code;
     }
 
@@ -165,6 +196,14 @@ export async function main(argv = []) {
 
     if (cmd === 'init') {
       const res = init(root, { dryRun });
+      if (!dryRun && !rest.includes('--no-probe')) {
+        console.log(c.grey('\nprobing discovered candidates before proposing them…'));
+        const probes = await probeCandidates(root, {});
+        const bad = probes.filter((p) => p.state !== 'fresh');
+        if (bad.length) {
+          console.log(c.amber(`\n${bad.length} candidate(s) do not pass here — they are marked in the file; fix the command or install dependencies before accepting`));
+        }
+      }
       if (json) {
         console.log(JSON.stringify(res, null, 2));
       } else {
@@ -255,6 +294,11 @@ export async function main(argv = []) {
         console.log(c.bold(`${t.id}  [${kinds.get(t.id) || 'unknown'}] ${t.lastState || 'unknown'}`));
         for (const line of describeTimeline(t)) console.log(`  ${line}`);
         if (t.series.length) console.log(`  trend (newest last): ${sparkline(t.series.map((s) => s.ms), limit)}`);
+        const diagnosis = diagnoseSeries(seriesEvents(state, t.id, limit));
+        if (diagnosis.length > 1 || diagnosis[0]?.kind !== 'stable') {
+          console.log('  why the spread:');
+          for (const d of diagnosis) console.log(`    ${d.kind}: ${d.text}`);
+        }
         return t.lastState === 'broken' ? 1 : 0;
       }
 
@@ -278,6 +322,84 @@ export async function main(argv = []) {
         console.log(c.grey(`\nslowest by p50: ${tl.summary.slowest.map((s) => `${s.id} ${fmtDuration(s.p50)} (n=${s.n})`).join(', ')}`));
       }
       console.log(c.grey('verification history is machine-local (state.json, capped at 500 events); git columns come from commit history'));
+      return 0;
+    }
+
+    if (cmd === 'ledger') {
+      const stats = allLedgerStats(root);
+      const entries = readLedger(root);
+      if (json) {
+        console.log(JSON.stringify({ machine: machineName(), entries, trust: Object.fromEntries(stats) }, null, 2));
+        return 0;
+      }
+      console.log(c.bold(`manual ledger — ${path.basename(root)}`));
+      console.log(c.grey(`this machine: ${machineName()} · ${entries.length} recorded outcome(s)`));
+      if (entries.length === 0) {
+        console.log(c.grey('\nnothing recorded yet — trust is earned by verifying, and the ledger is written when a claim changes state, is first verified, or earns a new machine'));
+        return 0;
+      }
+      console.log('');
+      console.log(c.grey(`  ${'claim'.padEnd(28)} ${'passes'.padEnd(7)} ${'machines'.padEnd(9)} tier`));
+      for (const [id, s] of [...stats.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+        // Gold needs passes across distinct machines — the rule the ledger exists
+        // to make satisfiable outside one checkout.
+        const gold = s.passes >= GOLD_PASSES && s.machines.length >= GOLD_MACHINES;
+        const tier = gold ? c.amber('gold') : s.passes >= 1 ? 'silver' : 'bronze';
+        console.log(`  ${id.padEnd(28)} ${String(s.passes).padEnd(7)} ${String(s.machines.length).padEnd(9)} ${tier}`);
+      }
+      console.log(c.grey('\n  recent outcomes:'));
+      for (const e of entries.slice(-8).reverse()) {
+        const color = { fresh: c.green, broken: c.red, stale: c.amber, blocked: c.grey }[e.state] || c.grey;
+        console.log(`  ${String(e.at).slice(0, 19)} ${String(e.machine).padEnd(16)} ${color(String(e.state).padEnd(8))} ${e.id} ${c.grey(`(${e.reason})`)}`);
+      }
+      console.log(c.grey('\nledger.jsonl is committed to git: it is how trust (and recovery history) travels between machines'));
+      return 0;
+    }
+
+    if (cmd === 'journal') {
+      const sub = rest.find((a) => !a.startsWith('--'));
+      if (sub === 'revert') {
+        const id = rest[rest.indexOf('revert') + 1];
+        if (!id) { console.error('usage: manual journal revert <id>'); return 2; }
+        const state = new State(root);
+        const res = await revertFromJournal(root, id, { state });
+        state.save();
+        if (!res.changed) console.log(c.grey('claim already matches the recorded content — nothing to do'));
+        return 0;
+      }
+      const entries = readJournal(root);
+      const filter = rest.find((a) => !a.startsWith('--'));
+      const shown = filter
+        ? entries.filter((e) => String(e.id).includes(filter) || String(e.file_name).includes(filter))
+        : entries;
+      if (json) { console.log(JSON.stringify(shown, null, 2)); return 0; }
+      if (shown.length === 0) {
+        console.log(c.grey(filter ? `no journal entries matching "${filter}"` : 'journal is empty — nothing has been accepted yet'));
+        return filter ? 1 : 0;
+      }
+      if (filter && shown.length === 1) {
+        const e = shown[0];
+        console.log(c.bold(`${e.id}  [${e.entry}]`));
+        console.log(`  at       ${e.at}  (${e.machine})`);
+        console.log(`  claim    ${e.claim || '—'}`);
+        console.log(`  candidate ${e.file || '—'}  mode ${e.mode || '—'}`);
+        if (e.reverts) console.log(`  reverts  ${e.reverts}`);
+        if (e.reason) console.log(`  reason   ${e.reason}`);
+        if (e.verdict) console.log(`  verdict  ${e.verdict.state}${e.verdict.note ? ` (${e.verdict.note})` : ''}`);
+        console.log(`  before   ${e.before_hash || '—'}`);
+        console.log(`  after    ${e.after_hash || '—'}`);
+        console.log('');
+        console.log(e.body);
+        return 0;
+      }
+      console.log(c.bold(`manual journal — ${path.basename(root)} (${shown.length} entries)`));
+      console.log('');
+      for (const e of shown) {
+        const mark = { accept: '✔', undo: '↩', revert: '⟲' }[e.entry] || '•';
+        const verdict = e.verdict ? `${e.verdict.state}` : '—';
+        console.log(`  ${mark} ${String(e.id).padEnd(34)} ${String(e.entry).padEnd(7)} ${String(e.claim || '—').padEnd(22)} ${verdict.padEnd(7)} ${short(e.reason || '', 60)}`);
+      }
+      console.log(c.grey('\neach entry records the exact previous file content, so `manual journal revert <id>` works from any checkout'));
       return 0;
     }
 

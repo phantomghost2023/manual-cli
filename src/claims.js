@@ -95,7 +95,11 @@ export function loadManual(root) {
     throw new Error(`no .manual/claims/ directory under ${root} — nothing to verify`);
   }
   const files = fs.readdirSync(dir).filter((f) => f.endsWith('.md')).sort();
-  if (files.length === 0) throw new Error('.manual/claims/ contains no claim files');
+  // An empty claims directory is a *state*, not an error: a repo that has just
+  // run `init` and not yet accepted anything is in exactly that state, and
+  // every read-only command used to die on it (found on a real repo, right
+  // after reverting the only claim). Callers decide what to say about it.
+  if (files.length === 0) return { claims: [], errors: [], empty: true };
 
   const claims = [];
   const errors = [];

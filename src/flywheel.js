@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { previewInbox, acceptInbox, safeInboxName } from './inbox.js';
+import { previewInbox, acceptInbox, safeInboxName, readInbox } from './inbox.js';
 import { verify } from './verify.js';
+import { appendEntry, findEntry, restoreFromEntry } from './journal.js';
 
 // The flywheel's missing half.
 //
@@ -98,28 +99,36 @@ export function listUndos(root) {
 // verdict and the undo token; nothing is rolled back automatically — a human
 // decides, with the evidence in front of them.
 export async function acceptAndVerify(root, file, { state, quiet = false } = {}) {
-  safeInboxName(file);
-  const preview = previewInbox(root, file);
-  const candidateText = readOrNull(path.join(root, '.manual', 'inbox', file));
+  // Everything below joins paths with this name; using the raw argument meant
+  // an accepted path form (`.manual/inbox/x.md`) produced an inbox path inside
+  // the inbox, so the candidate text was silently not recorded.
+  const name = safeInboxName(file);
+  const preview = previewInbox(root, name);
+  const candidateText = readOrNull(path.join(root, '.manual', 'inbox', name));
   const targetRel = preview.target;
   const claimId = targetRel ? targetRel.replace(/^claims\//, '').replace(/\.md$/, '') : null;
   const targetPath = targetRel ? path.join(root, '.manual', targetRel.split('/').join(path.sep)) : null;
   const targetBefore = targetPath ? readOrNull(targetPath) : null;
+  // Read the candidate before accepting it — accepting consumes the file, and
+  // its stated evidence is the reason the journal needs to record.
+  const cand = readInbox(root).find((c) => c.file === name);
 
   // acceptInbox's own chatter ("review the diff, then commit") is stale here:
   // this path reports the accept and its verdict together, after verifying.
-  const dest = acceptInbox(root, file, { quiet: true });
+  const dest = acceptInbox(root, name, { quiet: true });
 
+  const at = new Date().toISOString();
   const token = randomUUID();
+  // Saved before the (slow) verify so a crash mid-verify still leaves an undo.
   saveSnapshot(root, {
     token,
-    file,
+    file: name,
     mode: preview.mode,
     claimId,
     targetRel,
     targetBefore,
     candidateText,
-    at: new Date().toISOString(),
+    at,
   });
 
   let verified = null;
@@ -139,13 +148,38 @@ export async function acceptAndVerify(root, file, { state, quiet = false } = {})
     }
   }
 
+  // The journal is the durable half of undo: committed to git, portable to any
+  // checkout, and carrying the reason the change was made.
+  const reason = cand?.observation?.evidence
+    ? String(cand.observation.evidence).replace(/\s+/g, ' ').trim()
+    : preview.summary;
+  const afterText = targetPath ? readOrNull(targetPath) : null;
+  const { id: journalId } = appendEntry(root, {
+    entry: 'accept',
+    at,
+    claim: claimId,
+    file: name,
+    mode: preview.mode,
+    reason,
+    diff: preview.diff,
+    candidateBody: preview.body,
+    candidateText,
+    beforeText: targetBefore,
+    afterText,
+    verdict: verified,
+  });
+  // Re-save with the journal id so an undo can point at the entry it reverses.
+  const snap = loadSnapshot(root, token);
+  if (snap) saveSnapshot(root, { ...snap, journalId });
+
   const ok = verified ? verified.state === 'fresh' : null;
   if (!quiet) {
     const verdict = ok === null ? 'accepted (no claim to verify)' : ok ? 'verified: fresh' : `broke it: ${verified.note}`;
-    console.log(`proposal ${file}: ${verdict}`);
+    console.log(`proposal ${name}: ${verdict}`);
+    console.log(`  journaled:  .manual/journal/${journalId}.md`);
     if (ok === false) console.log(`  undo with:  manual inbox undo ${token}`);
   }
-  return { accepted: true, file, dest, preview, verified, ok, token };
+  return { accepted: true, file: name, dest, preview, verified, ok, token, journalId };
 }
 
 // Restore the claim file and put the candidate back in the inbox. Undo is a
@@ -163,19 +197,102 @@ export function undoAccept(root, token) {
     else fs.writeFileSync(targetPath, snap.targetBefore);
   }
   fs.rmSync(snapshotPath(root, token), { force: true });
-  return { undone: true, file: snap.file, claimId: snap.claimId, mode: snap.mode };
+  return {
+    undone: true,
+    file: snap.file,
+    claimId: snap.claimId,
+    mode: snap.mode,
+    journalId: snap.journalId || null,
+    beforeText: snap.targetBefore,
+    afterText: snap.targetRel ? readOrNull(path.join(root, '.manual', snap.targetRel.split('/').join(path.sep))) : null,
+  };
 }
 
 export async function undoAndVerify(root, token, { state, quiet = false } = {}) {
   const res = undoAccept(root, token);
-  let verified = null;
-  if (res.claimId) {
-    const out = await verify(root, { state, force: true, only: [res.claimId] });
-    const r = out.results.find((x) => x.claim.fm.id === res.claimId);
-    if (r) verified = { id: res.claimId, state: r.stamp.state, tier: r.stamp.tier, note: r.stamp.note || null };
-  }
+  const verified = res.claimId ? await safeVerifyOnly(root, res.claimId, state) : null;
+  // An undone proposal is still part of the record: the journal should show
+  // that someone tried this and it did not survive.
+  const { id: journalId } = appendEntry(root, {
+    entry: 'undo',
+    claim: res.claimId,
+    file: res.file,
+    mode: res.mode,
+    reason: 'the accepted proposal failed its own check',
+    reverts: res.journalId || null,
+    diff: diffLines(res.afterText, res.beforeText),
+    beforeText: res.afterText,
+    afterText: res.beforeText,
+    verdict: verified,
+  });
   if (!quiet) {
     console.log(`undo ${res.file}: claim ${res.claimId || '(none)'} restored${verified ? ` → ${verified.state}` : ''}`);
+    console.log(`  journaled:  .manual/journal/${journalId}.md`);
   }
-  return { ...res, verified };
+  return { ...res, verified, journalId };
+}
+
+// Revert an accepted change from its journal entry — the portable path, for
+// when the local undo snapshot is gone, pruned, or on another machine.
+export async function revertFromJournal(root, idOrFile, { state, quiet = false } = {}) {
+  const entry = findEntry(root, idOrFile);
+  if (!entry) throw new Error(`no journal entry matching "${idOrFile}"`);
+  const restored = restoreFromEntry(root, entry);
+  let verified = null;
+  if (restored.claim) {
+    verified = await safeVerifyOnly(root, restored.claim, state);
+  }
+  const { id: journalId } = appendEntry(root, {
+    entry: 'revert',
+    claim: restored.claim,
+    file: entry.file,
+    mode: entry.mode,
+    reason: `restored the content recorded before ${entry.id}`,
+    reverts: entry.id,
+    diff: diffLines(restored.beforeText, entry.before_text),
+    beforeText: restored.beforeText,
+    afterText: entry.before_text,
+    verdict: verified,
+  });
+  if (!quiet) {
+    console.log(`reverted ${entry.id}: ${restored.claim} restored${verified ? ` → ${verified.state}` : ''}`);
+    if (restored.inboxRestored) console.log(`  candidate back in the inbox: inbox/${restored.inboxRestored}`);
+    console.log(`  journaled:  .manual/journal/${journalId}.md`);
+  }
+  return {
+    reverted: true,
+    entry: entry.id,
+    claim: restored.claim,
+    changed: restored.changed,
+    inboxRestored: restored.inboxRestored ?? null,
+    verified,
+    journalId,
+  };
+}
+
+// A revert that removes the last claim leaves nothing to verify, and a verify
+// that cannot run must not make a successful file restore look like a failure.
+// (Found by reverting the only claim in a real repository.)
+async function safeVerifyOnly(root, claimId, state) {
+  try {
+    const out = await verify(root, { state, force: true, only: [claimId] });
+    const r = out.results.find((x) => x.claim.fm.id === claimId);
+    if (r) return { id: claimId, state: r.stamp.state, tier: r.stamp.tier, note: r.stamp.note || null };
+    return { id: claimId, state: 'unknown', tier: null, note: 'the claim no longer exists, so there is nothing to verify' };
+  } catch (e) {
+    return { id: claimId, state: 'unknown', tier: null, note: `could not verify: ${e.message}` };
+  }
+}
+
+// Crude line diff for journal bodies: enough to read the shape of a change at
+// a glance next to a git history that holds the exact bytes.
+function diffLines(before, after) {
+  const b = before == null ? [] : String(before).split('\n');
+  const a = after == null ? [] : String(after).split('\n');
+  const bSet = new Set(b);
+  const aSet = new Set(a);
+  const out = [];
+  for (const line of b) if (!aSet.has(line)) out.push(`- ${line}`);
+  for (const line of a) if (!bSet.has(line)) out.push(`+ ${line}`);
+  return out.slice(0, 60).join('\n');
 }

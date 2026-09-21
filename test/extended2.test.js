@@ -13,6 +13,10 @@ import { promoteTier } from '../src/runner.js';
 import { claimsAtRef, listManualCommits } from '../src/history.js';
 import { brief } from '../src/brief.js';
 import { serveMcp } from '../src/mcp.js';
+import { verify } from '../src/verify.js';
+import { doctor } from '../src/doctor.js';
+import { buildGraph } from '../src/graph.js';
+import { writeReport } from '../src/report.js';
 import { State } from '../src/state.js';
 import { PassThrough } from 'node:stream';
 
@@ -152,6 +156,40 @@ describe('time travel', () => {
     // at that commit the other four claims are still accepted
     assert.deepEqual(claims.map((c) => c.fm.id).sort(), ['ownership.src-db', 'policy.tests-registered', 'tests.demo', 'traps.reporter-pipe']);
     assert.ok(retired.includes('tooling.node-esm'));
+    cleanup(dir);
+  });
+});
+
+// The state a repo is in right after `init` — and after reverting its only
+// accepted claim. Every read-only command used to die on it with "contains no
+// claim files", which on a real repo is the worst possible first impression.
+describe('an empty manual', () => {
+  test('loads as empty rather than throwing, and keeps the inbox reachable', () => {
+    const dir = tmp('manual-empty-');
+    fs.rmSync(path.join(dir, '.manual', 'claims'), { recursive: true, force: true });
+    fs.mkdirSync(path.join(dir, '.manual', 'claims'), { recursive: true });
+    const { claims, errors, empty } = loadManual(dir);
+    assert.deepEqual(claims, []);
+    assert.deepEqual(errors, []);
+    assert.equal(empty, true);
+    cleanup(dir);
+  });
+
+  test('verify, doctor, graph, brief and report all survive zero claims', async () => {
+    const dir = tmp('manual-empty2-');
+    fs.rmSync(path.join(dir, '.manual', 'claims'), { recursive: true, force: true });
+    fs.mkdirSync(path.join(dir, '.manual', 'claims'), { recursive: true });
+    const state = new State(dir);
+    const res = await verify(dir, { state });
+    assert.deepEqual(res.results, []);
+    const doc = doctor(dir, state);
+    assert.deepEqual(doc.rows, []);
+    assert.equal(doc.healthy, 0);
+    assert.equal(buildGraph(loadManual(dir).claims).nodes.size, 0);
+    assert.deepEqual(brief(dir, ['src/a.js'], { state }).lines, []);
+    const out = path.join(dir, '.manual', 'empty-report.html');
+    writeReport(dir, { state, out });
+    assert.match(fs.readFileSync(out, 'utf8'), /no claims/);
     cleanup(dir);
   });
 });

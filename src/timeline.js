@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
+import { readLedger, machineName, allLedgerStats } from './ledger.js';
 
 // Claim archaeology: what actually happened to each claim over time.
 //
@@ -77,6 +78,8 @@ export function recoveries(events) {
 export function buildTimeline(root, state, opts = {}) {
   const history = state?.data?.history || [];
   const gitIndex = opts.gitLog === false ? null : gitLogForClaims(root);
+  const ledger = opts.ledger === false ? [] : readLedger(root);
+  const localMachine = machineName();
 
   const claims = new Map();
   const ensure = (id) => {
@@ -131,12 +134,26 @@ export function buildTimeline(root, state, opts = {}) {
       // git log is newest-first; the last entry is the introduction.
       t.files = { commits: commits.length, introduced: commits[commits.length - 1], last: commits[0] };
     }
+    // Events reported by *other* machines, from the committed ledger. Kept
+    // apart from the local series: this machine's history already contains its
+    // own runs, and merging them would double-count every transition.
+    t.remote = ledger
+      .filter((e) => e.id === t.id && e.machine && e.machine !== localMachine)
+      .map((e) => ({ at: e.at, state: e.state, ms: e.ms ?? null, machine: e.machine, reason: e.reason }))
+      .sort(byAt);
+    const seenMachines = new Set(t.remote.map((e) => e.machine));
+    if (t.events.length) seenMachines.add(localMachine);
+    t.machines = [...seenMachines].sort();
   }
 
+  const localLedgerStats = allLedgerStats(root);
   const allRecoveries = [...claims.values()].flatMap((t) => t.recoveries);
   const summary = {
     claims: claims.size,
     events: history.length,
+    machines: [...new Set(ledger.map((e) => e.machine).filter(Boolean))].sort(),
+    remoteEvents: [...claims.values()].reduce((n, t) => n + (t.remote?.length || 0), 0),
+    trust: Object.fromEntries([...localLedgerStats.entries()].map(([id, s]) => [id, { passes: s.passes, machines: s.machines }])),
     transitions: [...claims.values()].reduce((n, t) => n + t.transitions.length, 0),
     broken: [...claims.values()].filter((t) => t.lastState === 'broken').length,
     meanTimeToRecoveryMs: allRecoveries.length
@@ -198,5 +215,9 @@ export function describeTimeline(t) {
     if (t.stats) lines.push(`runtime p50 ${fmtDuration(t.stats.p50)} · p90 ${fmtDuration(t.stats.p90)} · max ${fmtDuration(t.stats.max)} (n=${t.stats.n})`);
   }
   for (const tr of t.transitions) lines.push(`  ${fmtWhen(tr.at).padEnd(12)} ${tr.from} → ${tr.to}`);
+  if (t.machines?.length > 1) lines.push(`  verified on ${t.machines.length} machines: ${t.machines.join(', ')}`);
+  for (const r of t.remote || []) {
+    lines.push(`  ${fmtWhen(r.at).padEnd(12)} ${r.state} reported by ${r.machine}${r.reason ? ` (${r.reason})` : ''}`);
+  }
   return lines;
 }

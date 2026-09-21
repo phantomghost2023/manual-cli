@@ -1,6 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { nowIso } from './util.js';
+import { parseYaml, stringifyYaml } from './yaml.js';
+import { splitFrontmatter } from './md.js';
+import { runCheck } from './runner.js';
+import { Sandbox } from './sandbox.js';
 import { VENDORED_CLI } from './eject.js';
 
 // Init: discover facts about a repo by inspection and scaffold a .manual/
@@ -67,13 +71,17 @@ export function detect(root) {
     fs.existsSync(path.join(root, d)),
   );
   if (testScript && hasTests) {
-    const runner = /vitest/.test(testScript)
+    // The statement must describe the command that actually runs. Falling back
+    // to "npm test" for an unrecognized runner produced a claim whose prose and
+    // whose check disagreed (found on a real repo: mocha!).
+    const known = /vitest/.test(testScript)
       ? 'vitest run'
       : /jest/.test(testScript)
         ? 'npx jest'
         : /--test/.test(testScript)
           ? 'node --test'
-          : 'npm test';
+          : null;
+    const runner = known || testScript.trim().split(/\s+/)[0];
     findings.push({
       kind: 'command',
       id: 'tests.suite',
@@ -144,6 +152,56 @@ ${f.statement}
 ${f.note || 'Discovered automatically. Review, adjust, and accept.'}
 `;
   return fm;
+}
+
+// Run each discovered candidate's check before a human is asked to accept it.
+//
+// Found on a real repository: `init` proposed "the test suite runs with npm
+// test" for a repo whose dependencies were not installed, so the first
+// accepted claim in that repo was false on arrival (exit 127). Discovery is
+// cheap; claiming is not. Probing turns "observed" into "observed and tried".
+export async function probeCandidates(root, { timeoutMs = 20000, quiet = false } = {}) {
+  const inboxDir = path.join(root, '.manual', 'inbox');
+  let files = [];
+  try {
+    files = fs.readdirSync(inboxDir).filter((f) => f.startsWith('init-') && f.endsWith('.md'));
+  } catch {
+    return [];
+  }
+  if (files.length === 0) return [];
+  const results = [];
+  let sandbox = null;
+  try {
+    sandbox = await new Sandbox(root).enter();
+    for (const f of files) {
+      const full = path.join(inboxDir, f);
+      const text = fs.readFileSync(full, 'utf8');
+      const { fm: fmRaw, body } = splitFrontmatter(text);
+      const fm = fmRaw ? parseYaml(fmRaw) : {};
+      if (!fm.check) continue;
+      const claim = { fm, check: fm.check };
+      let probe;
+      try {
+        const r = await runCheck(claim, root, { sandbox, timeoutMs });
+        probe = { state: r.ok ? 'fresh' : 'broken', note: r.ok ? `${r.ms ?? '?'}ms` : (r.error || `exit ${r.exit}`), ms: r.ms ?? null };
+      } catch (e) {
+        probe = { state: 'untested', note: e.message, ms: null };
+      }
+      const next = { ...fm, observation: { ...(fm.observation || {}), ...{ at: nowIso(), by: 'agent:manual-cli', probe_state: probe.state, probe_note: probe.note } } };
+      const noteLine = probe.state === 'fresh'
+        ? `Probed before proposing: the check passes on this checkout (${probe.note}).`
+        : `Probed before proposing: **the check does not pass here** (${probe.note}). It may need dependencies installed, a build step, or a different command. Do not accept it as-is.`;
+      fs.writeFileSync(full, `---\n${stringifyYaml(next)}---\n${body.trim()}\n\n${noteLine}\n`);
+      results.push({ file: f, ...probe });
+      if (!quiet) {
+        const icon = probe.state === 'fresh' ? '✔' : '✖';
+        console.log(`${icon} probed ${f}: ${probe.state} (${probe.note})`);
+      }
+    }
+  } finally {
+    if (sandbox) await sandbox.exit();
+  }
+  return results;
 }
 
 export function init(root, { dryRun = false } = {}) {

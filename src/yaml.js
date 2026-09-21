@@ -1,3 +1,29 @@
+// Serialize a plain object back to this YAML subset. Round-trips through
+// parseYaml: nested maps, arrays, quoted scalars for anything risky.
+export function stringifyYaml(obj, indent = 0) {
+  const pad = '  '.repeat(indent);
+  let out = '';
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === null || v === undefined) continue;
+    if (Array.isArray(v)) {
+      if (v.length === 0) { out += `${pad}${k}: []\n`; continue; }
+      out += `${pad}${k}:\n`;
+      for (const item of v) {
+        out += /^\d+$/.test(String(item)) || /[:{}\[\]]/.test(String(item))
+          ? `${pad}  - ${JSON.stringify(item)}\n`
+          : `${pad}  - ${item}\n`;
+      }
+    } else if (typeof v === 'object') {
+      out += `${pad}${k}:\n${stringifyYaml(v, indent + 1)}`;
+    } else if (typeof v === 'string' && (v.includes(':') || v.includes('\n') || v.length > 90)) {
+      out += `${pad}${k}: ${JSON.stringify(v)}\n`;
+    } else {
+      out += `${pad}${k}: ${v}\n`;
+    }
+  }
+  return out;
+}
+
 // Minimal YAML subset parser for claim frontmatter.
 // Recursive descent over indented lines. Supports:
 //   maps, block arrays (of scalars, flow maps, or inline maps spanning lines),

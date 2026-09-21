@@ -36,6 +36,14 @@ observe
     tightening is refused when the observed tail would violate it. Candidates
     whose evidence has since moved are reported as stale (also by doctor) —
     observe never rewrites a proposal a human may be reviewing.
+    Each proposal explains the spread rather than just respecting it: cold
+    start, upward/downward trend, single outlier, two clusters (bimodal),
+    correlation with free memory or with 1-minute load average, spikes that
+    followed a change to the claim's evidence (cold cache / artifact rebuild),
+    and the case where one test dominates the suite's runtime. Load, memory and
+    per-test data are recorded with each measurement; the diagnosis is written
+    into the candidate frontmatter and body, into the journal entry, and is
+    printed by `history`.
 
 doctor
     Manual health: never-verified claims, evidence drift, expired TTLs.
@@ -69,12 +77,29 @@ watch [--debounce N]
     Ctrl+C. Runs until signaled; writes stamps to state.json.
 
 history [<claim-id>] [--limit N] [--json]
+journal [<id>] [--json]
+ledger [--json]
     Claim archaeology. Without an id: a table of every claim with its last
     state, observed break count, p50 runtime, and a unicode trend of recent
     runs. With an id: every state transition, runtime p50/p90/max, mean time
     to recovery, and the git provenance of the claim file. Joins state.json
-    history (machine-local, capped at 500 events) with the commit history of
-    the claim itself. Exits 1 when the named claim is currently broken.
+    history (machine-local, capped at 500 events) with the committed trust
+    ledger and with the commit history of the claim itself. Exits 1 when the
+    named claim is currently broken.
+
+journal [<id>] [--json]
+    The durable audit trail for changes to the manual: one committed markdown
+    file per accepted proposal recording the machine, the reason it was
+    proposed, the exact diff, the previous file content and the verify verdict
+    that followed. `journal revert <id>` restores the claim byte-for-byte from
+    any checkout (no local undo snapshot needed), writes a revert entry
+    pointing at the original, and puts the candidate back in the inbox.
+
+ledger [--json]
+    The committed record of trust earned across machines (.manual/ledger.jsonl).
+    Merged into every verify, so pass counts describe the repository rather than
+    one checkout: gold tier requires passes on two machines that actually exist,
+    and break/recovery history spans machines instead of one laptop's story.
 
 graph [--dot|--mermaid|--json]
     The evidence graph as data: nodes are claims, edges are depends_on
@@ -131,12 +156,25 @@ is left exactly as the proposal made it — visible as broken, with an undo toke
 
 ## TIMELINE
 
-`state.json` history records one event per executed check ({id, state, at, ms}),
-so `history` can answer questions the current stamp cannot: which claims flip
-most, whether a claim's runtime is creeping toward its bound, and how long a
-claim stayed wrong after it broke. It is an operational record on one machine,
-not an audit log; the git columns (`introduced`, `commits`, `last`) come from
-the claim file's own commit history and are shared by everyone.
+`state.json` history records one event per executed check ({id, state, at, ms,
+freemem_mb, loadavg1, digest_changed, and — when the runner reports them —
+slowest_test, slowest_ms, test_count, test_total_ms}), so `history` can answer
+questions the current stamp cannot: which claims flip most, whether a claim's
+runtime is creeping toward its bound, and how long a claim stayed wrong after it
+broke. It is an operational record on one machine, not an audit log; the trust
+columns come from the committed ledger (.manual/ledger.jsonl) and the git
+columns (`introduced`, `commits`, `last`) from the claim file's own commit
+history, so both are shared by everyone.
+
+## RESPONSIBILITY
+
+Only `verify`, `watch` and the dashboard's re-verify write stamps; only `inbox
+accept`, `journal revert` and `inbox undo` write claims; only `observe`, `init`
+and `eject` write new files. An empty `.manual/claims/` is treated as a state,
+not an error: read-only commands report it, count what is waiting in the inbox,
+and exit 0, so a repo between `init` and its first accepted claim is usable.
+`verify --json` persists stamps and history before printing, because CI reads
+that output and a report that is not written down is not a verification.
 
 ## PERFORMANCE
 

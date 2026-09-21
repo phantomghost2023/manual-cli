@@ -25,26 +25,158 @@ function quantile(sorted, q) {
   return sorted[idx];
 }
 
-// Exported for tests and for `history`, which wants the same numbers.
-export function seriesStats(state, id, n = SAMPLES) {
-  const ms = state
+// Exported for tests and for `history`, which wants the same numbers. Events
+// (not just millisecond values) are kept so the spread can be explained.
+export function seriesEvents(state, id, n = SAMPLES) {
+  return state
     .history(500)
     .filter((h) => h.id === id && typeof h.ms === 'number' && h.ms > 0)
-    .slice(-n)
-    .map((h) => h.ms);
-  if (ms.length === 0) return { samples: 0, ms: [], p50: null, p90: null, max: null };
+    .slice(-n);
+}
+
+export function seriesStats(state, id, n = SAMPLES) {
+  const events = seriesEvents(state, id, n);
+  const ms = events.map((h) => h.ms);
+  if (ms.length === 0) return { samples: 0, ms: [], events: [], p50: null, p90: null, max: null };
   const sorted = [...ms].sort((a, b) => a - b);
   return {
     samples: ms.length,
     ms,
+    events,
     p50: quantile(sorted, 0.5),
     p90: quantile(sorted, 0.9),
     max: sorted[sorted.length - 1],
   };
 }
 
+const median = (xs) => quantile([...xs].sort((a, b) => a - b), 0.5);
+
+// Explain a series instead of merely summarizing it. A wide bound is a
+// symptom; these are the usual causes, and naming one changes what the right
+// action is (a cold-start spike wants a warm-up run, a trend wants an
+// investigation, an outlier wants more samples, a low-memory correlation is a
+// property of the machine rather than of the code).
+export function diagnoseSeries(events) {
+  const out = [];
+  if (!events || events.length < 3) return out;
+  const ms = events.map((e) => e.ms);
+  const sorted = [...ms].sort((a, b) => a - b);
+  const p90 = quantile(sorted, 0.9);
+  const max = sorted[sorted.length - 1];
+  const p50 = quantile(sorted, 0.5);
+
+  // Cold start: the earliest sample dwarfs everything after it.
+  const rest = ms.slice(1);
+  if (rest.length >= 2 && ms[0] > median(rest) * 1.5) {
+    out.push({
+      kind: 'cold-start',
+      text: `the first run was ${Math.round(ms[0] / median(rest))}x the median of the rest (${ms[0]}ms vs ${median(rest)}ms) — a warm-up or cache effect, not a code change`,
+    });
+  }
+
+  // Trend: the second half is meaningfully slower than the first.
+  const half = Math.floor(ms.length / 2);
+  if (half >= 2) {
+    const early = median(ms.slice(0, half));
+    const late = median(ms.slice(-half));
+    if (late > early * 1.3) {
+      out.push({ kind: 'trend-up', text: `runs are trending slower: ${early}ms early vs ${late}ms recent (+${Math.round((late / early - 1) * 100)}%)` });
+    } else if (early > late * 1.3) {
+      out.push({ kind: 'trend-down', text: `runs are getting faster: ${early}ms early vs ${late}ms recent` });
+    }
+  }
+
+  // A single outlier dragging the maximum far above the p90.
+  if (max > p90 * 2) {
+    out.push({ kind: 'outlier', text: `one run took ${max}ms while the 90th percentile is ${p90}ms — a single outlier is inflating the worst case` });
+  }
+
+  // One test dominates the run: the useful action is to look at *that* test,
+  // and a bound derived from the suite total is really a bound on it.
+  const withTiming = events.filter((e) => typeof e.slowest_ms === 'number' && typeof e.test_total_ms === 'number' && e.test_total_ms > 0);
+  if (withTiming.length >= 2) {
+    const dom = withTiming.map((e) => e.slowest_ms / e.test_total_ms);
+    const share = median(dom);
+    const latest = withTiming[withTiming.length - 1];
+    const same = withTiming.filter((e) => e.slowest_test === latest.slowest_test).length;
+    if (share >= 0.5 && same === withTiming.length) {
+      out.push({
+        kind: 'dominant-test',
+        text: `one test dominates the run: "${latest.slowest_test}" is ${Math.round(share * 100)}% of the ${latest.test_total_ms}ms spent across ${latest.test_count} tests — cost lives there, not in the suite`,
+      });
+    }
+  }
+
+  // Cold cache: the slow runs are the ones that followed a change to the
+  // claim's evidence, so the work being measured is artifact rebuilding.
+  const changed = events.filter((e) => e.digest_changed === 1);
+  const unchanged = events.filter((e) => e.digest_changed === 0 && typeof e.ms === 'number');
+  if (changed.length >= 2 && unchanged.length >= 2) {
+    const cold = median(changed.map((e) => e.ms));
+    const warm = median(unchanged.map((e) => e.ms));
+    if (cold > warm * 1.4) {
+      out.push({
+        kind: 'cold-cache',
+        text: `runs right after the evidence changed are ${(cold / warm).toFixed(1)}x slower (${cold}ms vs ${warm}ms) — cache or artifact rebuild, not a regression`,
+      });
+    }
+  }
+
+  // Bimodal: a wide internal gap splitting the samples into two clusters.
+  let gapAt = -1;
+  let gapSize = 0;
+  for (let i = 1; i < sorted.length; i++) {
+    const gap = sorted[i] - sorted[i - 1];
+    if (gap > gapSize) { gapSize = gap; gapAt = i; }
+  }
+  const span = sorted[sorted.length - 1] - sorted[0];
+  if (span > 0 && gapSize > span * 0.35 && gapAt >= 2 && sorted.length - gapAt >= 2) {
+    out.push({
+      kind: 'bimodal',
+      text: `two clusters: ${sorted[gapAt - 1]}ms or below (${gapAt} runs) versus ${sorted[gapAt]}ms or above (${sorted.length - gapAt} runs) — the check probably takes two different paths`,
+    });
+  }
+
+  // Machine correlation: compare the environment of the slow third with the
+  // fast third. Only claimed when the numbers actually separate.
+  const withEnv = events.filter((e) => typeof e.freemem_mb === 'number' && e.freemem_mb > 0);
+  if (withEnv.length >= 4) {
+    const bySpeed = [...withEnv].sort((a, b) => a.ms - b.ms);
+    const third = Math.max(1, Math.floor(bySpeed.length / 3));
+    const fast = bySpeed.slice(0, third);
+    const slow = bySpeed.slice(-third);
+    const fastMem = fast.reduce((n, e) => n + e.freemem_mb, 0) / fast.length;
+    const slowMem = slow.reduce((n, e) => n + e.freemem_mb, 0) / slow.length;
+    if (slowMem < fastMem * 0.85) {
+      out.push({
+        kind: 'memory-correlation',
+        text: `the slowest runs had less free memory (${Math.round(slowMem)}MB vs ${Math.round(fastMem)}MB on the fastest) — this spread may be the machine, not the code`,
+      });
+    }
+    const withLoad = withEnv.filter((e) => typeof e.loadavg1 === 'number' && e.loadavg1 > 0);
+    if (withLoad.length >= 4) {
+      const byLoad = [...withLoad].sort((a, b) => a.ms - b.ms);
+      const t2 = Math.max(1, Math.floor(byLoad.length / 3));
+      const fastLoad = byLoad.slice(0, t2).reduce((n, e) => n + e.loadavg1, 0) / t2;
+      const slowLoad = byLoad.slice(-t2).reduce((n, e) => n + e.loadavg1, 0) / t2;
+      if (slowLoad > fastLoad * 1.5 && slowLoad - fastLoad > 0.5) {
+        out.push({
+          kind: 'load-correlation',
+          text: `the slowest runs happened at higher load (${slowLoad.toFixed(1)} vs ${fastLoad.toFixed(1)} 1-min load average)`,
+        });
+      }
+    }
+  }
+
+  if (out.length === 0) {
+    out.push({ kind: 'stable', text: `no structure in the spread: ${ms.length} runs spanning ${sorted[0]}-${max}ms (p50 ${p50}ms)` });
+  }
+  return out;
+}
+
 // Tighten: a bound that keeps headroom over the median AND the tail AND the
-// worst run actually observed on this machine.
+// worst run actually observed on this machine. A dominant test argues against
+// tightening at all: the bound would be measuring one test's mood.
 export function proposeBound({ p50, p90, max }) {
   return roundBound(Math.max((p50 || 0) * 3, (p90 || 0) * 1.5, (max || 0) * 1.1));
 }
@@ -69,6 +201,7 @@ export function planProposals(root, state) {
     const stamp = state.stamp(id);
     if (!stamp) continue;
     const st = seriesStats(state, id);
+    const diagnosis = diagnoseSeries(st.events);
     const bound = cl.fm.check?.expect?.max_ms || null;
 
     // Tighten needs a stable picture: at least 3 measured runs.
@@ -85,6 +218,7 @@ export function planProposals(root, state) {
           bound,
           proposed,
           samples: st.samples,
+          diagnosis,
         });
       }
     }
@@ -103,6 +237,7 @@ export function planProposals(root, state) {
           bound,
           proposed: proposeRelaxBound({ p90: st.p90, max: Math.max(last.ms, st.max || 0), observed: last.ms }),
           samples: st.samples,
+          diagnosis,
         });
       }
     }
@@ -158,15 +293,25 @@ export function writeProposals(root, state, { quiet = false } = {}) {
     const file = candidatePath(inboxDir, p.kind, p.id);
     if (fs.existsSync(file)) continue;
     const cid = `candidate.${p.kind}.${p.id}`.toLowerCase();
+    const tail = `p50 ${p.p50}ms, p90 ${p.p90}ms, worst ${p.max}ms over ${p.samples} samples`;
+    const why = (p.diagnosis || []).length
+      ? `\nWhy the spread: ${(p.diagnosis || []).map((d) => d.text).join('; ')}.`
+      : '';
+    // A dominant test is the one diagnosis that changes the *action*: the bound
+    // is a proxy for one test, so say so in the body a reviewer reads.
+    const dom = (p.diagnosis || []).find((d) => d.kind === 'dominant-test');
+    const dominant = dom
+      ? `\nThe runtime is dominated by a single test, so consider fixing or splitting it rather\nthan only adjusting this bound.`
+      : '';
     const body =
       p.kind === 'tighten'
-        ? `Recent runs: p50 ${p.p50}ms, p90 ${p.p90}ms, worst ${p.max}ms over ${p.samples} samples. The claim allows ${p.bound}ms.
+        ? `Recent runs: ${tail}. The claim allows ${p.bound}ms.${why}
 Propose tightening to ${p.proposed}ms — at least 3x the median, 1.5x the 90th percentile, and
 1.1x the worst run seen here — so a real slowdown fails the claim while ordinary
-variance does not.`
+variance does not.${dominant}`
         : `A run measured ${p.measured}ms against a ${p.bound}ms bound and broke the claim.
-History: p50 ${p.p50}ms, p90 ${p.p90}ms, worst ${p.max}ms over ${p.samples} samples.
-Propose relaxing to ${p.proposed}ms to stop the flapping while still catching real regressions.`;
+History: ${tail}.${why}
+Propose relaxing to ${p.proposed}ms to stop the flapping while still catching real regressions.${dominant}`;
     const fm = `---
 schema: manual/v1
 id: ${cid}
@@ -183,6 +328,7 @@ observation:
   p50_ms: ${p.p50}
   p90_ms: ${p.p90}
   worst_ms: ${p.max}
+  diagnosis: "${(p.diagnosis || []).map((d) => d.kind).join(', ') || 'none'}"
   evidence: "verify history in state.json; ${p.kind} proposal vs ${p.bound}ms bound"
 review:
   needed: human-approve

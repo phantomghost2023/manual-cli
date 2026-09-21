@@ -2,6 +2,25 @@
 
 All notable changes to manual-cli are documented here. Format: Keep a Changelog; versioning: SemVer.
 
+## [0.6.0] - 2026-09-21
+
+### Added
+- `manual journal [<id>]` and `manual journal revert <id>`: a committed audit trail of every accepted change — who accepted it, on which machine, the reason it was proposed, the exact diff, the previous file content, and the verify verdict that followed. Revert restores the claim byte-for-byte from any checkout (or after a push), journals the revert as its own entry, and returns the candidate to the inbox. The local `.manual/undo/` snapshot stays as the fast path; the journal is the durable one.
+- `manual ledger [--json]`: trust earned across machines in a committed `.manual/ledger.jsonl`, merged into every verify. Gold tier now requires passes on machines that actually exist rather than one laptop's synthetic count, and `history` shows trust alongside the git provenance it already had.
+- Per-test timings: for checks whose runner reports them (node TAP, mocha/jest spec output) each measurement records the slowest test, the test count, and the suite total, so a diagnosis can name the test that dominates a runtime.
+- Environment per measurement: free memory and 1-minute load average are recorded with every run, and `digest_changed` marks runs that followed a change to the claim's evidence.
+- `observe` now explains spiky series instead of only respecting them: cold start, trend, outlier, bimodal, memory correlation, load correlation, cold cache, and dominant test. The diagnosis is written into the candidate, the journal entry, and `manual history`.
+- `init` probes every discovered candidate in the sandbox and records `observation.probe_state` / `probe_note`, plus a body line telling the human not to accept a check that does not pass. `--no-probe` skips it.
+- The sandbox links gitignored dependency trees (`node_modules`, `.venv`, `venv`, `vendor/bundle`) from the checkout into its worktree — without this, every check needing an installed dependency failed in the verifier while passing in the working tree.
+- `docs/FIELD-NOTES.md`: what happened when the tool was pointed at expressjs/express.
+
+### Fixed
+- **`verify --json` never persisted anything.** It returned before `state.save()`, so the machine-readable mode — the one CI and agents use — printed fresh states and discarded them, leaving stamps, trust history and the flywheel's measurements stale on disk. Found by re-verifying a real repo and finding no new history entry for a run that had just reported success.
+- An empty `.manual/claims/` threw (`contains no claim files`), so `verify`, `doctor`, `graph`, `brief` and `report` all died on a repo that had just run `init`, or had just reverted its only claim. It is now a state, not an error: the read-only commands report it, count the candidates waiting in the inbox, and exit 0. `verify` no longer prints a bare `0 claims:`.
+- An inbox name that included its own path (`.manual/inbox/x.md` — what `ls` and the reports print) was rejected as unsafe by `inbox accept`/`preview`, and where it was accepted the sanitized name was then discarded, so the join produced `.manual/inbox/.manual/inbox/x.md`. Paths naming the inbox are now accepted and always reduced to their basename.
+- `acceptAndVerify` read the candidate text through the raw argument, so accepting by path silently recorded no `candidate_text` and a later revert lost the proposal.
+- `observe` used the tighten formula for relax proposals too; relaxing is about the observed worst case, not 3× the median.
+
 ## [0.5.0] - 2026-09-21
 
 ### Added

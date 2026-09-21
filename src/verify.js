@@ -5,6 +5,7 @@ import { verifyOne } from './runner.js';
 import { Sandbox } from './sandbox.js';
 import { c } from './color.js';
 import { changedFiles, findBase, selectForDiff } from './diff.js';
+import { recordLedger } from './ledger.js';
 
 // Verify orchestrator: dependency resolution, digest gating, TTL, execution order.
 
@@ -109,7 +110,10 @@ export async function verify(root, opts = {}) {
   }
 
   if (sharedSandbox) await sharedSandbox.exit();
-  return { claims, errors, results, config };
+  // Record the outcomes that change trust so other machines (and a fresh
+  // clone) can compute the same tier from the committed ledger.
+  const ledger = recordLedger(root, results, { quiet: true });
+  return { claims, errors, results, config, ledger };
 }
 
 function orderedById(ordered) {
@@ -131,7 +135,8 @@ export function printVerifyReport(res) {
   const counts = {};
   for (const r of res.results) counts[r.stamp.state] = (counts[r.stamp.state] || 0) + 1;
   const parts = Object.entries(counts).map(([k, v]) => `${v} ${k}`);
-  console.log(c.bold(`\n${res.results.length} claims: ${parts.join(', ')}`));
+  // An empty manual gets its explanation from the caller, not "0 claims: ".
+  if (res.results.length) console.log(c.bold(`\n${res.results.length} claims: ${parts.join(', ')}`));
   if (res.errors.length) {
     console.log(c.red('\nload errors:'));
     for (const e of res.errors) console.log(c.red(`  - ${e}`));
