@@ -51,15 +51,19 @@ function svgGraph(graph) {
     const a = pos.get(e.from);
     const b = pos.get(e.to);
     if (!a || !b) continue;
-    const x1 = a.x + NODE_W;
+    // Dependencies sit in lower-depth (left) columns, so an edge always runs
+    // right-to-left: it leaves the dependent's LEFT edge and arrives at the
+    // dependency's RIGHT edge. (Routing from the dependent's right edge would
+    // make every arrow wrap around both boxes.)
+    const x1 = a.x;
     const y1 = a.y + NODE_H / 2;
-    const x2 = b.x;
+    const x2 = b.x + NODE_W;
     const y2 = b.y + NODE_H / 2;
-    const dx = Math.max(30, (x1 - x2) / 2);
+    const dx = Math.max(20, (x1 - x2) / 2);
     const st = graph.nodes.get(e.from).state;
     parts.push(
       `<path class="edge edge-${st}${e.required ? '' : ' optional'}" data-from="${esc(e.from)}" data-to="${esc(e.to)}" ` +
-      `d="M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}" ` +
+      `d="M ${x1} ${y1} C ${x1 - dx} ${y1}, ${x2 + dx} ${y2}, ${x2} ${y2}" ` +
       `marker-end="url(#arrow)"><title>${esc(e.from)} depends on ${esc(e.to)}${e.required ? '' : ' (optional)'}</title></path>`,
     );
   }

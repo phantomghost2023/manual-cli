@@ -112,6 +112,24 @@ test('layout places every node without overlap inside its layer', () => {
   assert.ok(width > 0 && height > 12 * 40);
 });
 
+test('graph edges leave the dependent and arrive at the dependency', () => {
+  // beta sits in column 0 and alpha (which depends on beta) in column 1, so the
+  // arrow must run right-to-left: alpha's left edge -> beta's right edge.
+  const claims = [fakeClaim('alpha', { depends_on: [{ id: 'beta' }] }), fakeClaim('beta')];
+  const graph = buildGraph(claims);
+  const { pos } = layout(graph);
+  const html = renderFixture(claims);
+  const path = html.match(/<path class="edge[^"]*" data-from="alpha" data-to="beta"\s+d="([^"]+)"/);
+  assert.ok(path, 'no edge path rendered for alpha -> beta');
+  const [x1, y1] = path[1].match(/-?\d+(?:\.\d+)?/g).map(Number);
+  const nums = path[1].match(/-?\d+(?:\.\d+)?/g).map(Number);
+  const x2 = nums[nums.length - 2];
+  assert.equal(x1, pos.get('alpha').x, 'edge starts at the dependent\u2019s left edge');
+  assert.equal(x2, pos.get('beta').x + 190, 'edge ends at the dependency\u2019s right edge');
+  assert.ok(x1 > x2, 'the dependent sits to the right of its dependency');
+  assert.equal(y1, pos.get('alpha').y + 24, 'edge starts at the node\u2019s vertical center');
+});
+
 test('check rows mirror the real check schema, not a guess', () => {
   const html = renderReport(buildReportData(demo, { skipDoctor: true }));
   // command claim: run string + sibling expect keys from the runner
