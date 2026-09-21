@@ -12,7 +12,12 @@ manual observe  # flywheel: measurement drift -> inbox candidates
 manual doctor   # is the manual itself healthy?
 manual init     # discover claims by inspection, scaffold .manual/
 manual inbox    # list/accept candidate claims (humans accept, agents propose)
+manual hooks    # install/uninstall the pre-commit enforce gate
+manual mcp      # MCP server: agents pull verified briefs over JSON-RPC
 ```
+
+Time travel: `manual brief --at <ref> [files...]` reconstructs the manual as it
+existed at any commit (claims that were candidate/retired at that ref are excluded).
 
 ## Quickstart
 
@@ -39,6 +44,10 @@ node bin/manual.js verify --root /path/to/repo --force
 | `doctor` | Health report for the manual: never-verified claims, evidence changed since last verify, expired TTLs, broken claims. |
 | `init [--dry-run]` | Inspects package.json, lockfiles, test scripts, migrations, CODEOWNERS; scaffolds `.manual/`, a GitHub Actions workflow, and inbox candidates marked `origin: observed`. |
 | `inbox [accept <file>]` | List candidates; accept merges `proposes.patch` into the target claim's frontmatter (no clobbering) or moves a whole-claim candidate into `claims/`. |
+| `hooks install\|uninstall\|status` | Manage the `.git/hooks/pre-commit` gate that runs `manual enforce` (marked block, preserves user hooks). |
+| `mcp [--root dir]` | Speak MCP over stdio: `manual_brief`, `manual_verify`, `manual_doctor`, `manual_inbox` tools. Point your coding agent at `bin/manual.js mcp`. |
+| `eject [--dry-run]` | Vendor the CLI into `tools/manual-cli/` so CI workflows and hooks run fully self-contained. |
+| `brief --at <ref>` | Historical brief: the manual as of a past commit, for debugging old releases. |
 
 ## Claim file format (manual/v1)
 
@@ -84,7 +93,7 @@ Claims earn trust by being executed, not by being written: `ghost` (imported, ne
 ### Checks
 
 - `run` — shell (`bash -euo pipefail`), pass/fail via `expect: { exit, stdout_matches, stderr_matches, max_ms }`.
-- `expr` — sandboxed predicate over a tiny read-only API: `exists()`, `read()`, `manifest()`, `env()`, `nodeMajor()`, `codeowners()`.
+- `expr` — sandboxed predicate over a tiny read-only API: `exists()`, `read()`, `manifest()`, `env()`, `nodeMajor()`, `codeowners()`, `lockActive(owner, {withinDays})` (true when a branch named for that owner has recent commits or is checked out in a worktree — the coordination signal behind ownership claims).
 - `enforce` — policy claims reuse the same check as a pre-commit/PR gate.
 
 ### Evidence & incremental verify
@@ -112,10 +121,12 @@ Checks run in a throwaway `git worktree` (HEAD + overlay of your uncommitted dif
 
 ## Provenance of this tool
 
-The demo ships a genuine trap discovered while building it: `node --test --test-reporter=pipe` exits 7 (ERR_INVALID_ARG_VALUE). The trap claim's check reproduces the gotcha and passes *while the trap is live*; if Node ever makes it valid, the claim flips broken and retires itself. Dogfooding also caught: `NODE_TEST_CONTEXT` leaking into checks, a JSON-in-YAML quoting bug, and the spec's own wrong exit code — each fixed by evidence, not opinion.
+The demo ships a genuine trap discovered while building it: `node --test --test-reporter=pipe` exits 7 (ERR_INVALID_ARG_VALUE). The trap claim's check reproduces the gotcha and passes *while the trap is live*; if Node ever makes it valid, the claim flips broken and retires itself. Dogfooding also caught: `NODE_TEST_CONTEXT` leaking into checks, a JSON-in-YAML quoting bug, a spread-order bug that silently inverted expr results, and the spec's own wrong exit code — each fixed by evidence, not opinion. This repo runs its own manual: claims verify it, the pre-commit gate guards its commits, and its first flywheel proposal (tighten `tests.suite`) is sitting in the inbox awaiting human review.
 
 ## Test
 
 ```bash
-npm test        # 32 tests across 9 suites
+npm test        # 50 tests across 12 suites (includes seeded fuzzing of the parser/loader)
 ```
+
+Docs: [docs/TUTORIAL.md](docs/TUTORIAL.md) (5-minute walkthrough) · [docs/manual.1.md](docs/manual.1.md) (reference) · [completions.bash](completions.bash)

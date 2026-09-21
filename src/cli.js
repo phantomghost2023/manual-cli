@@ -10,6 +10,7 @@ import { doctor, printDoctor } from './doctor.js';
 import { init } from './init.js';
 import { writeProposals } from './observe.js';
 import { installHook, uninstallHook, hookStatus } from './hooks.js';
+import { eject } from './eject.js';
 import { c } from './color.js';
 
 function usage() {
@@ -24,6 +25,7 @@ Usage:
   manual init   [--root <dir>] [--dry-run]   # discover + scaffold .manual/
   manual inbox  [--root <dir>] [accept <file>]
   manual hooks  [--root <dir>] [install|uninstall|status]
+  manual eject  [--root <dir>] [--dry-run]   # vendor the CLI into tools/manual-cli
   manual brief  --at <ref> [files...]     # manual as it was at a past ref
 
 Verify runs each claim's check in a sandbox (git worktree when possible),
@@ -156,6 +158,22 @@ export async function main(argv = []) {
           : `created ${res.created.length} file(s), discovered ${res.findings} claim candidates:`);
         for (const f of res.created) console.log(`  + ${f}`);
         console.log(c.yellow('\nCandidates are in .manual/inbox/ — review, then `manual inbox accept <file>`.'));
+      }
+      return 0;
+    }
+
+    if (cmd === 'eject') {
+      const res = eject(root, { dryRun });
+      if (json) {
+        console.log(JSON.stringify(res, null, 2));
+      } else {
+        console.log(res.dryRun
+          ? `would copy ${res.count} file(s) to ${res.dest}`
+          : `ejected ${res.count} file(s) to ${res.dest}`);
+        if (!res.dryRun) {
+          console.log(c.green('CI and hooks can now run fully self-contained:'));
+          console.log(`  node ${'tools/manual-cli/bin/manual.js'} verify --diff HEAD~1`);
+        }
       }
       return 0;
     }

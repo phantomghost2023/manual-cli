@@ -88,7 +88,7 @@ describe('claims loader', () => {
   test('loads the demo manual without errors', () => {
     const { claims, errors } = loadManual(ROOT);
     assert.deepEqual(errors, []);
-    assert.equal(claims.length, 4);
+    assert.equal(claims.length, 5);
     const ids = claims.map((c) => c.fm.id);
     assert.ok(ids.includes('traps.reporter-pipe'));
   });

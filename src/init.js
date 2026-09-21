@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { nowIso } from './util.js';
+import { VENDORED_CLI } from './eject.js';
 
 // Init: discover facts about a repo by inspection and scaffold a .manual/
 // with confident, executable claims. Only emits claims it can back with
@@ -185,7 +186,7 @@ export function init(root, { dryRun = false } = {}) {
       fs.mkdirSync(wfDir, { recursive: true });
       fs.writeFileSync(
         wf,
-        `name: manual\non: [push, pull_request]\njobs:\n  verify:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with: { fetch-depth: 0 }\n      - uses: actions/setup-node@v4\n        with: { node-version: 22 }\n      - name: Verify claims relevant to this diff\n        run: |\n          git remote set-url origin \${{ github.server_url }}/\${{ github.repository }}.git || true\n          node path/to/manual-cli/bin/manual.js verify --diff \${{ github.event.pull_request.base.sha || 'HEAD~1' }}\n`,
+        `name: manual\non: [push, pull_request]\njobs:\n  verify:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with: { fetch-depth: 0 }\n      - uses: actions/setup-node@v4\n        with: { node-version: 22 }\n      - name: Verify claims relevant to this diff\n        run: |\n          # Self-contained when the CLI is vendored (manual eject).\n          if [ -f "${VENDORED_CLI}" ]; then\n            node ${VENDORED_CLI} verify --diff "\${{ github.event.pull_request.base.sha || 'HEAD~1' }}"\n          else\n            echo "manual-cli not vendored; run: node <path-to-manual-cli>/bin/manual.js eject --root ." >&2\n            exit 1\n          fi\n`,
       );
       created.push('.github/workflows/manual.yml');
     }

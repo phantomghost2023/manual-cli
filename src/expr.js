@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 // Sandboxed expression checks (`check.expr`). A tiny, explicit API is exposed
 // to the claim expression; nothing else from the process is reachable.
@@ -7,6 +8,12 @@ import path from 'node:path';
 function globFiles(root, pattern) {
   // local lazy import avoided to keep dependency graph simple; reuse glob.js
   return null; // placeholder replaced below
+}
+
+function gitLines(root, args) {
+  const r = spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' });
+  if (r.status !== 0) return [];
+  return (r.stdout || '').split('\n').map((s) => s.trim()).filter(Boolean);
 }
 
 export function makeExprApi(root) {
@@ -44,6 +51,34 @@ export function makeExprApi(root) {
         }
       }
       return [];
+    },
+    // True when `owner` appears to have in-flight work in this repo: a branch
+    // whose name contains their handle committed within `withinDays`, or any
+    // branch currently checked out in a linked worktree (active work).
+    lockActive: (owner, { withinDays = 21 } = {}) => {
+      if (!owner) return false;
+      const needle = String(owner).replace(/^@/, '').toLowerCase();
+      if (!needle) return false;
+      const cutoff = Date.now() / 1000 - withinDays * 86400;
+      const branches = new Map();
+      for (const line of gitLines(root, [
+        'for-each-ref', 'refs/heads', '--format=%(refname:short)%09%(committerdate:unix)',
+      ])) {
+        const [name, ts] = line.split('\t');
+        if (name) branches.set(name, ts ? Number(ts) : Infinity);
+      }
+      for (const line of gitLines(root, ['worktree', 'list', '--porcelain'])) {
+        if (line.startsWith('branch refs/heads/')) {
+          const name = line.slice('branch refs/heads/'.length);
+          if (!branches.has(name)) branches.set(name, Infinity); // checked out = active
+        }
+      }
+      for (const [name, ts] of branches) {
+        const n = name.toLowerCase();
+        const owned = n.includes(needle) || n.split('/').includes(needle);
+        if (owned && ts >= cutoff) return true;
+      }
+      return false;
     },
   };
 }

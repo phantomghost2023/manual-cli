@@ -7,6 +7,8 @@ import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { installHook, uninstallHook, hookStatus } from '../src/hooks.js';
+import { eject } from '../src/eject.js';
+import { loadManual } from '../src/claims.js';
 import { promoteTier } from '../src/runner.js';
 import { claimsAtRef, listManualCommits } from '../src/history.js';
 import { brief } from '../src/brief.js';
@@ -74,6 +76,33 @@ describe('hooks installer', () => {
   });
 });
 
+describe('eject', () => {
+  test('vendors the CLI so a repo can verify self-contained', () => {
+    const dir = tmp('manual-eject-');
+    gitInit(dir);
+    const res = eject(dir, { dryRun: false });
+    assert.ok(res.count > 10);
+    assert.equal(fs.existsSync(path.join(dir, 'tools', 'manual-cli', 'bin', 'manual.js')), true);
+    assert.equal(fs.existsSync(path.join(dir, 'tools', 'manual-cli', 'src', 'verify.js')), true);
+    // vendored copy excludes local state and the demo repo
+    assert.equal(fs.existsSync(path.join(dir, 'tools', 'manual-cli', '.manual')), false);
+    assert.equal(fs.existsSync(path.join(dir, 'tools', 'manual-cli', 'demo')), false);
+    // the vendored CLI actually works in the ejected repo
+    const { claims, errors } = loadManual(dir);
+    assert.deepEqual(errors, []); // repo's own manual still loads
+    assert.ok(fs.existsSync(path.join(dir, 'tools', 'manual-cli', 'package.json')));
+    cleanup(dir);
+  });
+
+  test('dry run lists files without writing', () => {
+    const dir = tmp('manual-ejd-');
+    const res = eject(dir, { dryRun: true });
+    assert.ok(res.count > 10);
+    assert.equal(fs.existsSync(path.join(dir, 'tools')), false);
+    cleanup(dir);
+  });
+});
+
 describe('tier promotion', () => {
   test('bronze -> silver -> gold requires 2 machines', () => {
     assert.equal(promoteTier('ghost', 1, 1), 'bronze');
@@ -98,9 +127,9 @@ describe('time travel', () => {
     assert.ok(ref, 'expected a manual commit');
 
     const { claims } = claimsAtRef(dir, ref);
-    assert.deepEqual(claims.map((c) => c.fm.id), ['tooling.node-esm']);
+    assert.deepEqual(claims.map((c) => c.fm.id).sort(), ['ownership.src-db', 'tooling.node-esm']);
 
-    // brief @ ref shows only the historical claim
+    // brief @ ref shows only historical claims
     const state = new State(dir);
     const out = brief(dir, ['src/anything.ts'], { state, budget: 400, at: ref, quiet: true });
     assert.match(out.lines.join('\n'), /tooling\.node-esm/);
@@ -120,8 +149,8 @@ describe('time travel', () => {
     execSync('git -c user.email=t@t -c user.name=t commit -qm retire', { cwd: dir });
     const ref = listManualCommits(dir)[0].sha;
     const { claims, retired } = claimsAtRef(dir, ref);
-    // at that commit the other three claims are still accepted
-    assert.deepEqual(claims.map((c) => c.fm.id).sort(), ['policy.tests-registered', 'tests.demo', 'traps.reporter-pipe']);
+    // at that commit the other four claims are still accepted
+    assert.deepEqual(claims.map((c) => c.fm.id).sort(), ['ownership.src-db', 'policy.tests-registered', 'tests.demo', 'traps.reporter-pipe']);
     assert.ok(retired.includes('tooling.node-esm'));
     cleanup(dir);
   });

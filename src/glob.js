@@ -34,7 +34,15 @@ export function globToRegExp(pattern) {
       } else if (ch === '[') {
         const close = p.indexOf(']', i);
         if (close > i) {
-          re += p.slice(i, close + 1);
+          const cls = p.slice(i, close + 1);
+          // Sanity-check the class compiles (e.g. [z-a] does not); if not,
+          // treat the brackets literally so a bad pattern can never throw.
+          try {
+            new RegExp(cls);
+            re += cls;
+          } catch {
+            re += cls.replace(/[-\[\]\^]/g, '\\$&');
+          }
           i = close;
         } else {
           re += '\\[';

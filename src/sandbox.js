@@ -12,6 +12,8 @@ export class Sandbox {
     this.root = root;
     this.mode = 'inplace';
     this.wt = null;
+    this.cwdBase = root;
+    this.rel = '';
   }
 
   gitOk() {
@@ -23,6 +25,13 @@ export class Sandbox {
 
   async enter() {
     if (!this.gitOk()) return this; // inplace fallback
+    const top = spawnSync('git', ['-C', this.root, 'rev-parse', '--show-toplevel'], {
+      encoding: 'utf8',
+    });
+    const toplevel = top.status === 0 ? (top.stdout || '').trim() : this.root;
+    // If the manual lives in a subdirectory of the repo, checks must run from
+    // that subdirectory inside the worktree — not from the worktree root.
+    this.rel = path.relative(toplevel, this.root) || '';
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'manual-wt-'));
     const add = spawnSync(
       'git',
@@ -44,13 +53,31 @@ export class Sandbox {
         encoding: 'buffer',
       });
     }
+    // Overlay untracked files too (excluding gitignored ones) — brand-new
+    // source files are precisely what mid-work checks must be able to see.
+    const others = spawnSync(
+      'git',
+      // --full-name: paths relative to the repo top, regardless of -C subdir
+      ['-C', this.root, 'ls-files', '--others', '--exclude-standard', '--full-name', '-z'],
+      { encoding: 'buffer' },
+    );
+    if (others.status === 0) {
+      for (const rel of others.stdout.toString('utf8').split('\0')) {
+        if (!rel) continue;
+        const src = path.join(toplevel, rel);
+        const dst = path.join(tmp, rel);
+        fs.mkdirSync(path.dirname(dst), { recursive: true });
+        try { fs.copyFileSync(src, dst); } catch { /* vanished mid-copy: skip */ }
+      }
+    }
     this.mode = 'worktree';
     this.wt = tmp;
+    this.cwdBase = this.rel ? path.join(tmp, this.rel) : tmp;
     return this;
   }
 
   get cwd() {
-    return this.mode === 'worktree' ? this.wt : this.root;
+    return this.mode === 'worktree' ? this.cwdBase : this.root;
   }
 
   exec(cmd, { timeoutMs = 60000 } = {}) {
