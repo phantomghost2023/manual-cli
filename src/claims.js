@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { splitFrontmatter, splitSections } from './md.js';
 import { parseYaml } from './yaml.js';
+import { normalizeSetup } from './setup.js';
 
 export const KINDS = new Set(['fact', 'command', 'trap', 'policy', 'ownership']);
 const CHECK_SHAPES = new Set(['run', 'expr', 'enforce']);
@@ -50,6 +51,30 @@ export function parseClaim(text, file) {
     throw new ClaimError(file, 'policy claims must define enforce { stage, paths, severity } (in check or at top level)');
   }
 
+  // check.setup declares the prerequisite an install/build must satisfy before
+  // `run` can mean anything. It is meaningless without a command to gate.
+  let setup = null;
+  if (check.setup !== undefined && check.setup !== null) {
+    setup = normalizeSetup(check);
+    if (!setup || !setup.run || setup.run === 'undefined') {
+      throw new ClaimError(file, 'check.setup needs a command: either `setup: npm ci` or `setup: { run: npm ci }`');
+    }
+    if (!check.run) {
+      throw new ClaimError(file, 'check.setup only applies to command claims (needs check.run); expr checks have no dependencies to install');
+    }
+    if (typeof check.setup === 'object') {
+      if (check.setup.evidence !== undefined && !Array.isArray(check.setup.evidence)) {
+        throw new ClaimError(file, 'check.setup.evidence must be a list of files/globs');
+      }
+      if (check.setup.cache !== undefined && !Array.isArray(check.setup.cache)) {
+        throw new ClaimError(file, 'check.setup.cache must be a list of directories the setup creates');
+      }
+      if (check.setup.timeout_s !== undefined && !(Number(check.setup.timeout_s) > 0)) {
+        throw new ClaimError(file, 'check.setup.timeout_s must be a positive number of seconds');
+      }
+    }
+  }
+
   const { intro, sections } = splitSections(body);
   if (!intro || intro.length < 8) {
     throw new ClaimError(file, 'prose body must start with a paragraph restating the statement');
@@ -62,6 +87,7 @@ export function parseClaim(text, file) {
     intro,
     gotchas: sections.get('gotchas') || null,
     check,
+    setup,
   };
 }
 

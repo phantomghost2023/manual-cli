@@ -19,6 +19,7 @@ import { buildGraph, graphToJson, toDot, toMermaid, printGraphSummary } from './
 import { writeReport } from './report.js';
 import { serveCommand } from './serve.js';
 import { loadManual } from './claims.js';
+import { ensureSetup, normalizeSetup, setupKey, setupStatus } from './setup.js';
 import { short } from './util.js';
 import { buildTimeline, describeTimeline, fmtDuration, fmtWhen, sparkline } from './timeline.js';
 import { diagnoseSeries, seriesEvents } from './observe.js';
@@ -47,9 +48,11 @@ function usage() {
   console.log(`manual — self-verifying repository operating manual (manual/v1)
 
 Usage:
-  manual verify [--root <dir>] [--force] [--diff [base]] [--only <ids>] [--json]
+  manual verify [--root <dir>] [--force] [--diff [base]] [--only <ids>] [--no-setup]
+                [--setup-force] [--json]   # prerequisites: see the setup command
   manual brief  [--root <dir>] [--budget N] [--json] [files...]
   manual enforce [--root <dir>] [--stage pre-commit|pr]
+  manual setup  [--root <dir>] [--force] [--claim <id>] [--json]  # declared prerequisites
   manual observe [--root <dir>]          # flywheel: measurements -> inbox candidates
   manual doctor [--root <dir>]           # manual health report
   manual init   [--root <dir>] [--dry-run] [--no-probe]   # discover + scaffold .manual/
@@ -71,7 +74,10 @@ stamps state.json, and respects dependency edges, digests and TTLs.
 --diff [base] verifies only claims relevant to changed files (plus policies
 and their dependency closure). Brief emits a token-budgeted briefing for the
 given files. Enforce compiles policy claims into pre-commit/PR gates.
-Observe turns measurement drift into inbox candidates for human review.`);
+Observe turns measurement drift into inbox candidates for human review.
+A claim can declare check.setup ("npm ci", a build step): it runs once per
+command+evidence pair, not per verify, and a claim whose setup did not complete
+is reported blocked rather than broken. --no-setup trusts the environment.`);
 }
 
 const flag = (argv, name) => {
@@ -110,7 +116,14 @@ export async function main(argv = []) {
         if (a === '--only') acc.push(...String(rest[i + 1] || '').split(',').filter(Boolean));
         return acc;
       }, []);
-      const res = await verify(root, { state, force, diff: diffArg, only });
+      const res = await verify(root, {
+        state,
+        force,
+        diff: diffArg,
+        only,
+        noSetup: rest.includes('--no-setup'),
+        setupForce: rest.includes('--setup-force'),
+      });
       // Persist before reporting, not after: the JSON branch used to return
       // early, so `verify --json` — the mode CI and agents actually use —
       // printed fresh states and then threw them away, leaving stamps, trust
@@ -125,9 +138,18 @@ export async function main(argv = []) {
             tier: r.stamp.tier,
             note: r.stamp.note,
             measured_ms: r.stamp.measured_ms ?? null,
+            // So CI can tell "the code is wrong" from "the environment isn't
+            // ready" without parsing prose.
+            setup: r.result?.setup
+              ? { run: r.result.setup.run, status: r.result.setup.status, ms: r.result.setup.ms ?? null }
+              : (r.stamp.setup ?? null),
           })),
         }, null, 2));
-        const code = res.errors.length ? 2 : res.results.some((r) => r.stamp.state === 'broken') ? 1 : 0;
+        const code = res.errors.length
+          ? 2
+          : res.results.some((r) => r.stamp.state === 'broken' || r.result?.blocked)
+            ? 1
+            : 0;
         return code;
       }
       const code = printVerifyReport(res);
@@ -198,8 +220,12 @@ export async function main(argv = []) {
       const res = init(root, { dryRun });
       if (!dryRun && !rest.includes('--no-probe')) {
         console.log(c.grey('\nprobing discovered candidates before proposing them…'));
-        const probes = await probeCandidates(root, {});
+        const probes = await probeCandidates(root, { setup: !rest.includes('--no-setup') });
         const bad = probes.filter((p) => p.state !== 'fresh');
+        const fixed = probes.filter((p) => p.setup);
+        if (fixed.length) {
+          console.log(c.grey(`${fixed.length} candidate(s) needed a prerequisite first; the setup is declared in the file so verify can repeat it.`));
+        }
         if (bad.length) {
           console.log(c.amber(`\n${bad.length} candidate(s) do not pass here — they are marked in the file; fix the command or install dependencies before accepting`));
         }
@@ -215,6 +241,59 @@ export async function main(argv = []) {
         console.log(c.yellow('\nCandidates are in .manual/inbox/ — review, then `manual inbox accept <file>`.'));
       }
       return 0;
+    }
+
+    if (cmd === 'setup') {
+      // Prerequisites are declared per claim (`check.setup`) but they are a
+      // property of the repository, so they are reported and run per *distinct*
+      // command: twelve claims that need `npm ci` need it once.
+      const { claims, errors } = loadManual(root);
+      for (const e of errors) console.error(c.red(`load error: ${e}`));
+      const onlyClaim = flag(rest, '--claim');
+      const groups = new Map();
+      for (const cl of claims) {
+        if (onlyClaim && cl.fm.id !== onlyClaim) continue;
+        const spec = cl.setup || normalizeSetup(cl.check);
+        if (!spec) continue;
+        const key = setupKey(root, spec);
+        if (!groups.has(key)) groups.set(key, { spec, key, claims: [] });
+        groups.get(key).claims.push(cl.fm.id);
+      }
+      if (groups.size === 0) {
+        if (json) console.log(JSON.stringify({ setups: [] }, null, 2));
+        else console.log(c.grey(onlyClaim
+          ? `claim ${onlyClaim} declares no setup`
+          : 'no claim declares a check.setup prerequisite — nothing to install'));
+        return onlyClaim ? 1 : 0;
+      }
+      const shouldRun = force || rest.includes('--run');
+      const out = [];
+      let failed = 0;
+      for (const g of groups.values()) {
+        const st = setupStatus(root, g.spec);
+        if (!shouldRun) {
+          if (json) {
+            out.push({ run: st.run, key: st.key, claims: g.claims, cached: st.cached, missing: st.missing, last: st.entry || null });
+          } else {
+            console.log(`${st.cached ? c.green('✔') : c.amber('▲')} ${st.run}  ${c.grey(g.claims.join(', '))}`);
+            console.log(c.grey(`    ${st.key} · ${st.cached
+              ? `cached — ran ${st.entry.at} (${st.entry.ms}ms)`
+              : st.entry
+                ? `last attempt failed: ${short(st.entry.note, 120)}`
+                : 'not satisfied on this machine yet'}${st.missing.length ? ` · missing: ${st.missing.join(', ')}` : ''}`));
+          }
+          continue;
+        }
+        const r = await ensureSetup(root, g.spec, { force: true });
+        out.push({ run: r.run, key: r.key, claims: g.claims, status: r.status, ms: r.ms ?? null, note: r.note || null });
+        if (r.status === 'failed' || r.status === 'timeout') failed += 1;
+        if (!json) {
+          console.log(`${r.status === 'ran' || r.status === 'cached' ? c.green('✔') : c.red('✖')} ${r.run}  ${short(r.note || r.status, 120)}`);
+        }
+      }
+      if (json) console.log(JSON.stringify({ setups: out, ran: shouldRun }, null, 2));
+      else if (!shouldRun) console.log(c.grey('\nrun them with `manual setup --force` (or let verify run what it needs)'));
+      return failed ? 1 : 0;
     }
 
     if (cmd === 'watch') {

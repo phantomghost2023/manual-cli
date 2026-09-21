@@ -51,6 +51,31 @@ function renderFixture(claims, stamps = {}, inbox, { journal = [], served = fals
   });
 }
 
+test('the card shows a declared prerequisite and whether this machine has it', () => {
+  const claim = fakeClaim('alpha');
+  const graph = buildGraph([claim], {});
+  const render = (setup) =>
+    renderReport({
+      root: '/repo',
+      repoName: 'fixture',
+      claims: [claim],
+      graph,
+      doctorRes: { rows: [{ id: 'alpha', state: 'unknown', tier: null, issues: [], setup }], suspect: [], healthy: 1, errors: [] },
+      inbox: [],
+      generatedAt: '2026-01-01T00:00:00.000Z',
+      version: '0.1.0',
+    });
+  const satisfied = render({ run: 'npm ci', cached: true, missing: [] });
+  assert.match(satisfied, /<dt>setup<\/dt><dd><code>npm ci<\/code>/);
+  assert.match(satisfied, /satisfied here/);
+  const pending = render({ run: 'make deps', cached: false, missing: ['vendor'] });
+  assert.match(pending, /runs on next verify/);
+  assert.match(pending, /missing vendor/);
+  // A claim with no prerequisite still gets the row, so the absence is stated
+  // rather than left to the reader.
+  assert.match(render(null), /<dt>setup<\/dt><dd><span class="muted">—<\/span>/);
+});
+
 test('report is a complete standalone document with no external references', () => {
   const html = renderFixture([fakeClaim('alpha', { depends_on: [{ id: 'beta' }] }), fakeClaim('beta')]);
   assert.match(html, /^<!doctype html>/i);

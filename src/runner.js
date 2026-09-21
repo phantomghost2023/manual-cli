@@ -4,11 +4,12 @@ import { evaluateExpr } from './expr.js';
 import { Sandbox } from './sandbox.js';
 import { nowIso } from './util.js';
 import { ledgerStats, mergeTrust, machineName } from './ledger.js';
+import { ensureSetup, normalizeSetup, setupStatus } from './setup.js';
 
 // Executes a claim's check and interprets the result by kind.
 // States: fresh | stale | broken | blocked | unknown.
 
-export async function runCheck(claim, root, { sandbox, timeoutMs }) {
+export async function runCheck(claim, root, { sandbox, timeoutMs, noSetup = false, setupForce = false, quiet = false } = {}) {
   const { check } = claim;
   const fm = claim.fm;
 
@@ -24,7 +25,43 @@ export async function runCheck(claim, root, { sandbox, timeoutMs }) {
   const own = !sandbox;
   try {
     if (!check.run) return { ok: false, error: 'no executable check' };
+
+    // Prerequisite first. A check that needs installed dependencies cannot
+    // report on the repository until they exist, so the setup's own outcome is
+    // part of the result — and its failure is `blocked`, not `broken`.
+    const spec = claim.setup || normalizeSetup(check);
+    let setup = null;
+    if (spec) {
+      if (noSetup) {
+        const st = setupStatus(root, spec);
+        if (st.missing.length) {
+          return {
+            ok: false,
+            blocked: true,
+            setup: { ...st, status: 'skipped' },
+            error: `setup skipped and ${st.missing.join(', ')} is missing — the claim is untested, not false`,
+          };
+        }
+        setup = { ...st, status: 'skipped' };
+      } else {
+        setup = await ensureSetup(root, spec, { force: setupForce, quiet });
+        // An install may create the very directory the check needs to see.
+        if (setup.status === 'ran' || setup.status === 'cached') sb.addDeps(spec.cache);
+        if (setup.status === 'failed' || setup.status === 'timeout') {
+          return {
+            ok: false,
+            blocked: true,
+            setup,
+            error: `setup failed: ${setup.run} (${setup.timedOut ? 'timed out' : `exit ${setup.exit}`}) — the claim is untested, not false`,
+          };
+        }
+      }
+    }
+
     const t0 = Date.now();
+    // Measured without the setup: an npm ci is not the suite's runtime, and
+    // folding minutes of install into the trend line would make every bound
+    // proposal wrong.
     const r = sb.exec(check.run, { timeoutMs: timeoutMs || fm.check?.expect?.max_ms || 60000 });
     const ms = Date.now() - t0;
     const expect = fm.check?.expect || {};
@@ -44,6 +81,7 @@ export async function runCheck(claim, root, { sandbox, timeoutMs }) {
       value: r.exit,
       exit: r.exit,
       ms,
+      setup,
       stdout: out.slice(0, 4000),
       // Parsed from the *untruncated* output: the slowest test is exactly the
       // line most likely to be past the 4000-char cut.
@@ -99,17 +137,27 @@ export function promoteTier(tier, passes, distinctMachines) {
 export function interpret(claim, result) {
   const kind = claim.fm.kind;
   if (!result.ok) {
+    // A missing prerequisite is not a false claim. `blocked` is the state that
+    // already means "this run says nothing about the claim"; using `broken` here
+    // would blame the repository for the environment and drop its trust tier.
+    if (result.blocked) {
+      const s = result.setup;
+      const note = s && s.status === 'skipped'
+        ? 'setup skipped — dependencies missing'
+        : `setup failed (${s?.run || 'setup'})`;
+      return { state: 'blocked', note };
+    }
     if (kind === 'trap') return { state: 'broken', note: 'gotcha no longer reproduces' };
     return { state: 'broken', note: result.error || `exit ${result.exit ?? '?'}` };
   }
   return { state: 'fresh', note: result.ms != null ? `${result.ms}ms` : 'ok' };
 }
 
-export async function verifyOne(claim, root, state, { sandbox, timeoutMs } = {}) {
+export async function verifyOne(claim, root, state, { sandbox, timeoutMs, noSetup, setupForce, quiet } = {}) {
   const t0 = Date.now();
   let result;
   try {
-    result = await runCheck(claim, root, { sandbox, timeoutMs });
+    result = await runCheck(claim, root, { sandbox, timeoutMs, noSetup, setupForce, quiet });
   } catch (e) {
     result = { ok: false, error: e.message };
   }
@@ -151,6 +199,11 @@ export async function verifyOne(claim, root, state, { sandbox, timeoutMs } = {})
     measured_ms: result.ms ?? null,
     note,
     env,
+    // Null, not omitted: a claim whose setup declaration was removed must stop
+    // reporting the prerequisites of the version before it.
+    setup: result.setup
+      ? { key: result.setup.key, status: result.setup.status, run: result.setup.run, ms: result.setup.ms ?? null }
+      : null,
     origin: claim.fm.provenance?.origin || 'authored',
     author: claim.fm.provenance?.author || null,
   });
@@ -164,6 +217,8 @@ export async function verifyOne(claim, root, state, { sandbox, timeoutMs } = {})
     // compiled artifacts are invalidated by exactly that, so it is the cheapest
     // available explanation for a spike.
     digest_changed: prev && prev.digest !== claim.digest ? 1 : 0,
+    // Install cost, kept out of `ms`: the trend line is the check's runtime.
+    ...(result.setup?.ms != null ? { setup_ms: result.setup.ms, setup_status: result.setup.status } : {}),
     // Only when the runner actually reported per-test timings; absent keys
     // keep old history entries and non-test commands honest.
     ...(result.timings

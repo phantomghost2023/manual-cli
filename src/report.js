@@ -118,6 +118,17 @@ function checkHtml(claim) {
   return '<span class="muted">no check (ownership claim)</span>';
 }
 
+// The prerequisite, when a claim declares one. "satisfied here" and "will run"
+// are different enough to the person reading the dashboard that they get
+// different colours: one is a fact about this machine, the other is a promise.
+function setupHtml(setup) {
+  if (!setup) return '<span class="muted">—</span>';
+  const badge = setup.cached
+    ? '<span class="badge" title="this machine already has the result">✔ satisfied here</span>'
+    : `<span class="badge warn" title="verify will run this before the check">⚙ runs on next verify${setup.missing?.length ? ` · missing ${esc(setup.missing.join(', '))}` : ''}</span>`;
+  return `<code>${esc(setup.run)}</code> ${badge}`;
+}
+
 function evidenceHtml(claim) {
   const ev = claim.fm.evidence || {};
   const keys = Object.keys(ev);
@@ -211,6 +222,9 @@ export function renderReport(data) {
   for (const n of graph.nodes.values()) kinds[n.kind] = (kinds[n.kind] || 0) + 1;
   const byId = new Map(claims.map((cl) => [cl.fm.id, cl]));
   const suspectIds = new Set(doctorRes?.suspect.map((r) => r.id) || []);
+  // Prerequisite state comes from doctor: it has the root and already answers
+  // "is this satisfied here" for every claim.
+  const setupById = new Map((doctorRes?.rows || []).filter((r) => r.setup).map((r) => [r.id, r.setup]));
 
   const stat = (label, value, cls = '') =>
     `<div class="stat ${cls}"><div class="stat-v">${esc(value)}</div><div class="stat-l">${esc(label)}</div></div>`;
@@ -240,6 +254,7 @@ export function renderReport(data) {
   <dl class="meta">
     <dt>check</dt><dd>${checkHtml(cl)}</dd>
     <dt>applies_to</dt><dd>${(cl.fm.applies_to || []).length ? [].concat(cl.fm.applies_to).map((p) => `<span class="chip">${esc(p)}</span>`).join(' ') : '<span class="muted">—</span>'}</dd>
+    <dt>setup</dt><dd>${setupHtml(setupById.get(id))}</dd>
     <dt>evidence</dt><dd>${evidenceHtml(cl)}</dd>
     <dt>depends on</dt><dd>${linkList(deps)}</dd>
     <dt>affects</dt><dd>${linkList(impact)}</dd>

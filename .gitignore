@@ -11,3 +11,6 @@ node_modules/
 
 # undo snapshots for accepted proposals (machine-local, like state.json)
 .manual/undo/
+
+# setup cache: what has already been installed on this machine
+.manual/cache/

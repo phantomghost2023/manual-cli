@@ -6,8 +6,8 @@ _manual_cli() {
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="verify brief enforce observe doctor init inbox hooks eject watch history journal ledger graph report serve mcp help"
-  flags="--root --force --diff --only --json --budget --at --stage --dry-run --port --open --pidfile --out --dot --mermaid --limit -h --help"
+  commands="verify brief enforce observe doctor init setup inbox hooks eject watch history journal ledger graph report serve mcp help"
+  flags="--root --force --diff --only --no-setup --setup-force --json --budget --at --stage --dry-run --port --open --pidfile --out --dot --mermaid --limit -h --help"
 
   if [ "$COMP_CWORD" -eq 1 ]; then
     COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
@@ -26,7 +26,14 @@ _manual_cli() {
       if [ "$prev" = "--diff" ]; then
         COMPREPLY=( $(compgen -W "$(git for-each-ref --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null)" -- "$cur") )
       elif [[ "$cur" == --* ]]; then
-        COMPREPLY=( $(compgen -W "--force --diff --only --root --json" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--force --diff --only --no-setup --setup-force --root --json" -- "$cur") )
+      fi
+      ;;
+    setup)
+      if [[ "$cur" == --* ]]; then
+        COMPREPLY=( $(compgen -W "--force --claim --json --root" -- "$cur") )
+      else
+        COMPREPLY=( $(compgen -W "$(ls .manual/claims/*.md 2>/dev/null | xargs -n1 basename 2>/dev/null | sed 's/\.md$//')" -- "$cur") )
       fi
       ;;
     hooks)

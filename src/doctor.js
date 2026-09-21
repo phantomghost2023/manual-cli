@@ -2,6 +2,7 @@ import { loadManual } from './claims.js';
 import { evidenceDigest } from './hash.js';
 import { parseTtl } from './util.js';
 import { staleProposals } from './observe.js';
+import { setupStatus } from './setup.js';
 import { c } from './color.js';
 
 // Doctor: a health report for the manual itself. Recomputes digests, checks
@@ -17,6 +18,19 @@ export function doctor(root, state) {
     const stamp = state.stamp(id);
     const d = evidenceDigest(root, cl.fm.evidence || {}, state.salt, digestCache);
     const row = { id, state: 'unverified', tier: stamp?.tier || null, issues: [] };
+
+    // A declared prerequisite is part of the claim's health: if it isn't
+    // satisfied here, the next verify can only say "blocked", and the human
+    // reading this report is the one who can install it.
+    if (cl.setup) {
+      const su = setupStatus(root, cl.setup);
+      row.setup = { run: su.run, cached: su.cached, missing: su.missing, last: su.entry?.at || null };
+      if (stamp?.state === 'blocked' && stamp.setup) {
+        row.issues.push(`prerequisite not satisfied: ${su.run} — untested, not false (fix with \`manual setup --force\`)`);
+      } else if (!su.cached && !stamp) {
+        row.issues.push(`declares a prerequisite (${su.run}) that has not been satisfied here yet`);
+      }
+    }
 
     if (!stamp) {
       row.issues.push('never verified — run `manual verify`');
@@ -49,6 +63,9 @@ export function printDoctor(res) {
     } else {
       console.log(`${c.amber('▲')} ${r.id.padEnd(36)} ${r.state}`);
       for (const i of r.issues) console.log(c.amber(`    - ${i}`));
+    }
+    if (r.setup) {
+      console.log(c.grey(`    ⚙ setup${r.setup.cached ? '' : ' (unsatisfied)'}: ${r.setup.run}${r.setup.missing.length ? ` — missing ${r.setup.missing.join(', ')}` : ''}`));
     }
   }
   for (const e of res.errors) console.log(c.red(`✖ load error: ${e}`));

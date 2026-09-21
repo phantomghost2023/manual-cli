@@ -3,6 +3,7 @@ import { claimsAtRef } from './history.js';
 import { matches } from './glob.js';
 import { short, estimateTokens } from './util.js';
 import { c } from './color.js';
+import { setupStatus } from './setup.js';
 
 // Token-budgeted session briefing: claims relevant to the files in play,
 // weighted by priority, glob specificity, trust tier, and trap-ness.
@@ -45,6 +46,19 @@ export function renderLine(claim, state, atRef = null) {
   return `${KIND_ICON[fm.kind] || '•'} ${fm.id} — ${short(fm.statement, 110)} [${tierTxt}${stateIcon}]`;
 }
 
+// A prerequisite that isn't satisfied here is the one thing an agent must know
+// before running a claim's command, so it rides on the line. A satisfied one
+// costs no tokens: it is the normal case.
+function setupSuffix(claim, root) {
+  if (!claim.setup || !root) return '';
+  try {
+    const st = setupStatus(root, claim.setup);
+    return st.cached ? '' : ` ⚙ needs: ${st.run}${st.missing.length ? ` (missing ${st.missing.join(', ')})` : ''}`;
+  } catch {
+    return '';
+  }
+}
+
 export function brief(root, paths, opts = {}) {
   const at = opts.at || null;
   const { claims, errors } = at
@@ -72,7 +86,7 @@ export function brief(root, paths, opts = {}) {
   const lines = [];
   let used = 0;
   for (const { cl } of scored) {
-    const line = renderLine(cl, state, at);
+    const line = renderLine(cl, state, at) + (at ? '' : setupSuffix(cl, root));
     const t = estimateTokens(line);
     if (used + t > budget && lines.length > 0) break;
     lines.push(line);

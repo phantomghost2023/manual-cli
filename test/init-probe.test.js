@@ -43,7 +43,8 @@ test('a discovered check that passes is proposed with that evidence', async () =
 });
 
 test('a discovered check that cannot run is marked broken, not proposed as true', async () => {
-  // The real case: a repo whose test runner is not installed.
+  // The real case: a repo whose test runner is not installed (found on
+  // express, where scripts.test is `mocha --require …`).
   const dir = fixture({ name: 'p', version: '1.0.0', scripts: { test: 'mocha test/' } }, {
     'test/a.js': 'describe("x", () => {});\n',
   });
@@ -52,12 +53,29 @@ test('a discovered check that cannot run is marked broken, not proposed as true'
     const probes = await probeCandidates(dir, { quiet: true });
     assert.equal(probes[0].state, 'broken');
     const { fm, body } = readCandidate(dir, 'init-tests.suite.md');
-    // the statement names the real runner rather than claiming "npm test"
-    assert.match(fm.statement, /runs with `mocha`/);
-    assert.equal(fm.observation.probe_state, 'broken');
+    // `mocha` is a local binary: node_modules/.bin is only on PATH under
+    // `npm test`, so the claim documents — and runs — the repo's own entry
+    // point, and names the runner it dispatches to.
+    assert.equal(fm.check.run, 'npm test');
+    assert.match(fm.statement, /runs with `npm test` \(mocha\)/);
+    assert.match(fm.observation.probe_state, /broken/);
     assert.match(fm.observation.probe_note, /exit|not found|ENOENT/);
     assert.match(body, /does not pass here/);
     assert.match(body, /Do not accept it as-is/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a script that starts with a system binary is run as written', async () => {
+  const dir = fixture({ name: 'p', version: '1.0.0', scripts: { test: 'node --test test/' } }, {
+    'test/a.test.js': 'import { test } from "node:test"; test("ok", () => {});\n',
+  });
+  try {
+    init(dir, {});
+    const { fm } = readCandidate(dir, 'init-tests.suite.md');
+    assert.equal(fm.check.run, 'node --test test/', 'no need to go through npm for this one');
+    assert.match(fm.statement, /runs with `node`/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

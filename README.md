@@ -43,11 +43,12 @@ node bin/manual.js verify --root /path/to/repo --force
 
 | Command | What it does |
 |---|---|
-| `verify [--force] [--diff [base]] [--only <ids>]` | Run checks (skipping claims whose evidence digests are unchanged and within TTL), stamp `state.json`, exit 1 if anything is broken. `--diff` verifies only claims relevant to changed files, plus all policies and dependency closure. `--only` restricts the run to named claims plus their transitive dependencies — a claim whose deps are unstamped would otherwise report `blocked`, which says nothing about the claim. |
+| `verify [--force] [--diff [base]] [--only <ids>] [--no-setup] [--setup-force]` | Run checks (skipping claims whose evidence digests are unchanged and within TTL), stamp `state.json`, exit 1 if anything is broken or held back by an unmet prerequisite. `--diff` verifies only claims relevant to changed files, plus all policies and dependency closure. `--only` restricts the run to named claims plus their transitive dependencies — a claim whose deps are unstamped would otherwise report `blocked`, which says nothing about the claim. `--no-setup` trusts the environment (CI installs its own dependencies); `--setup-force` re-runs a prerequisite the cache considers done. |
+| `setup [--force] [--claim <id>] [--json]` | What the manual needs installed before it can say anything: every claim's `check.setup`, deduplicated by command, with whether this machine has satisfied it and when it last ran. `--force` runs them (the plumbing `init`/`verify` do automatically). Exits 1 if an install fails. |
 | `brief [--budget N] [files...]` | Token-budgeted briefing: claims relevant to the files in play, weighted by priority × glob specificity × trust tier; traps score double; `when: true` claims always included. |
 | `enforce [--stage pre-commit\|pr]` | Runs every policy claim's check as a gate. The claim's check IS the gate — enforcement and documentation are the same object and cannot drift. |
 | `observe` | Reads verify history in `state.json`, writes inbox candidates when measurements diverge from claim bounds: *tighten* (the bound sits far above what runs cost) or *relax* (the bound itself broke the claim). Proposed bounds respect the tail — at least 3× the median, 1.5× p90, and 1.1× the worst run seen — and it refuses to propose a tightening the observed tail would violate. Every proposal carries a *diagnosis* of why the series is spiky (cold start, trend, outlier, two clusters, correlated with free memory or machine load, cold-cache after an evidence change, or a single test dominating the suite), because naming the cause changes the right action. It also reports candidates that have gone *stale* (evidence moved since they were written). |
-| `doctor` | Health report for the manual: never-verified claims, evidence changed since last verify, expired TTLs, broken claims. |
+| `doctor` | Health report for the manual: never-verified claims, evidence changed since last verify, expired TTLs, broken claims, and prerequisites that are declared but unsatisfied (with the command that fixes them). |
 | `init [--dry-run]` | Inspects package.json, lockfiles, test scripts, migrations, CODEOWNERS; scaffolds `.manual/`, a GitHub Actions workflow, and inbox candidates marked `origin: observed`. |
 | `inbox [accept \| preview \| undo]` | List candidates. `preview <file>` shows the exact frontmatter change without touching anything. `accept <file>` merges `proposes.patch` into the target claim's frontmatter (no clobbering) or moves a whole-claim candidate into `claims/` — and then **re-verifies the affected claim**, exiting 1 with an undo token if the proposal turns out to be false. `undo <token>` restores the claim file byte-for-byte and puts the candidate back. |
 | `hooks install\|uninstall\|status` | Manage the `.git/hooks/pre-commit` gate that runs `manual enforce` (marked block, preserves user hooks). |
@@ -142,6 +143,10 @@ evidence:
 depends_on:
   - { id: tooling.modules, required: true }   # dep not fresh ⇒ blocked
 check:
+  setup:                       # optional prerequisite, run once per command+evidence
+    run: npm ci
+    evidence: ["package.json", "package-lock.json"]
+    cache: ["node_modules"]
   run: node --test
   expect: { exit: 0, max_ms: 30000 }
 verify: on_change              # on_change | on_demand | always
@@ -172,11 +177,57 @@ Claims earn trust by being executed, not by being written: `ghost` (imported, ne
 - `expr` — sandboxed predicate over a tiny read-only API: `exists()`, `read()`, `manifest()`, `env()`, `nodeMajor()`, `codeowners()`, `lockActive(owner, {withinDays})` (true when a branch named for that owner has recent commits or is checked out in a worktree — the coordination signal behind ownership claims).
 - `enforce` — policy claims reuse the same check as a pre-commit/PR gate.
 
+### Prerequisites: `check.setup`
+
+A command check that needs installed dependencies or a build step cannot prove
+anything on its own. On a fresh clone `npm test` exits 127, and the claim used
+to read **broken** — which blamed the repository for the checkout.
+
+```yaml
+check:
+  setup:
+    run: npm ci                  # or a build step: "make deps"
+    evidence:                    # what decides whether the install is still valid
+      - package.json
+      - package-lock.json
+    cache: ["node_modules"]      # the directories its success is measured by
+    timeout_s: 900
+  run: npm test
+```
+
+- **`blocked`, not `broken`.** A claim whose setup did not complete is
+  *untested*: it reports `blocked`, keeps the tier it had earned, and fails CI
+  with the reason instead of the claim's name. "Untested is not disproven."
+- **Once per (command, evidence) pair, not per verify.** The key is the command
+  plus the *content* of its evidence, so bumping a lockfile re-installs and
+  re-verifying untouched code does not. Twelve claims needing `npm ci` need it
+  once. The cache lives in `.manual/cache/` (gitignored — it describes a machine,
+  not the truth), and it is only trusted while the directories it declares still
+  exist: delete `node_modules` by hand and the next verify reinstalls.
+- **Install cost is not suite cost.** The setup runs before the clock starts, so
+  `measured_ms` stays the check's own runtime and the flywheel's bounds keep
+  meaning something.
+- **Installs are not sandboxed.** They run in the checkout, exactly as a
+  developer would, because that is where dependency trees belong and because a
+  throwaway worktree would reinstall on every verify. Only the directories the
+  setup declares are created, and only by the command it declares.
+- **`init` detects it.** A command candidate on a checkout without dependencies
+  arrives with the setup already declared from the repo's own package manager
+  (npm/pnpm/yarn/bun, lockfile-aware); a check that fails with "Cannot find
+  module" teaches the probe the same thing. `manual setup` shows what is
+  declared and what is satisfied here; `manual setup --force` warms it.
+- **`--no-setup` trusts the environment** (the CI path, where the workflow
+  installs dependencies itself) — and refuses to call a claim broken when the
+  prerequisite it declares is visibly absent. `--setup-force` re-runs an install
+  the cache considers done.
+
 ### Evidence & incremental verify
 
 Each claim hashes its evidence inputs (file globs → sorted path+size+content digests; env vars → salted hashes, values never stored; runtime versions). Digest unchanged + still fresh + within TTL ⇒ skip. Subsecond on the hot path.
 
 Checks run in a throwaway `git worktree` (HEAD + overlay of your uncommitted diff) so mutating checks can't dirty the checkout; non-git roots run in place. The sandbox strips `NODE_TEST_CONTEXT` so results can't be corrupted by the parent process's test-runner state (a bug the tool caught in its own test suite).
+
+It also links dependency trees that git ignores (`node_modules`, `.venv`, `vendor/bundle`) into the worktree — a verifier that can't run the repo's own tests isn't verifying anything — and puts their `bin/` directories on `PATH`, the way `npm run` does, so a claim that runs `mocha test/` works and isn't reported as a failing suite. It removes those links itself before teardown: a recursive delete follows a Windows junction into the target, which emptied the developer's `node_modules` while leaving the directory in place.
 
 ### The flywheel
 
@@ -213,6 +264,7 @@ it. The diagnosis is recorded in the candidate, in the journal entry, and in
   ledger.jsonl       # committed trust ledger: passes per claim per machine
   state.json         # gitignored: stamps, digests, trust history, env salt
   undo/*.json        # gitignored: local byte-exact undo snapshots (pruned to 20)
+  cache/setup.json   # gitignored: which prerequisites this machine has satisfied
 .github/workflows/manual.yml   # written by init when .github exists
 ```
 
@@ -223,7 +275,7 @@ The demo ships a genuine trap discovered while building it: `node --test --test-
 ## Test
 
 ```bash
-npm test        # 145 tests across 27 suites (seeded fuzzing, real-git integration, HTTP end-to-end)
+npm test        # 181 tests across 34 suites (seeded fuzzing, real-git integration, HTTP end-to-end)
 npm run bench   # 500-claim scale benchmark (see numbers below)
 ```
 

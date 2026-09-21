@@ -194,14 +194,107 @@ parsed claims are stat-cached. The honest limit is not claim count, it is
 *check cost*: one claim running a real repo's test suite dominates any verify it
 participates in, and `max_ms` is the only scheduling control that exists.
 
+### Third pass: a clone whose dependencies are not installed
+
+Finding 5 above was the one that made adoption fail at step one, so the fix was
+built and then pointed back at the same repo — this time at a fresh `git clone`
+of express, with no `node_modules` at all.
+
+```
+$ manual init
+probing discovered candidates before proposing them…
+✔ probed init-tests.suite.md: fresh (19546ms)
+1 candidate(s) needed a prerequisite first; the setup is declared in the file so verify can repeat it.
+
+$ manual inbox accept init-tests.suite.md
+proposal init-tests.suite.md: verified: fresh
+verified: tests.suite is fresh
+```
+
+The candidate that discovery produced, and the states the same claim reports when
+the machine changes under it:
+
+```yaml
+check:
+  setup:
+    run: npm install          # no lockfile in this repo; npm ci when there is one
+    evidence: ["package.json"]
+    cache: ["node_modules"]
+  run: npm test               # scripts.test is `mocha --require …`
+  expect: { exit: 0, max_ms: 120000 }
+```
+
+```
+$ rm -rf node_modules && manual verify --force
+  ⚙ setup: npm install (node_modules missing)
+  ⚙ setup: ok (31714ms)
+✅ tests.suite     fresh    26660ms          # install excluded from the measurement
+
+$ manual verify --no-setup --force             # dependencies absent, setup declined
+🚫 tests.suite     blocked  setup skipped — dependencies missing
+exit=1 · tier silver, passes 1 — untouched: untested is not disproven
+
+$ manual setup
+✔ npm install  tests.suite
+    setup-b6a38a7cb290b4c8 · cached — ran 2026-09-21T22:22:14.067Z (31714ms)
+```
+
+Every bug below was found by running that sequence, and each one was in the path
+a new user takes on their first real repository.
+
+**F. The check ran the script body, which cannot run outside `npm run`.**
+`scripts.test` here is `mocha --require test/support/env …`, and `mocha` lives in
+`node_modules/.bin` — a directory npm puts on `PATH` and a plain shell does not.
+So the probe installed dependencies successfully (36.9s, cache entry `ok: true`)
+and *then* reported `exit 127`: a successful install followed by "broken" reads
+as a failing test suite. Discovery now runs a script whose first word is a local
+binary through the package manager's own entry point, and says so in both the
+statement and the note, so the claim's prose and its check cannot drift apart
+again. The same reason motivated prepending dependency `bin` directories to
+`PATH` in the sandbox: a hand-written `mocha test/` claim has the same right to
+work.
+
+**G. The probe gave every suite twenty seconds.** The first attempt after the
+install fix still said `broken (exit null)` — the process had been killed, not
+failed. `exit null` is a timeout masquerading as a verdict, and on a suite that
+takes 26s under load it is guaranteed. The probe now waits at least as long as
+the claim's own `max_ms`, because a false "broken" during discovery costs more
+than a slow one.
+
+**H. Verifying twice emptied `node_modules`.** The worst bug of the three, and
+the least visible: the first verify linked the installed tree into its worktree,
+and the teardown's recursive delete **followed the junction into the target**,
+leaving `node_modules` present, on disk, and empty. The sandbox looked healthy
+and the repository was broken afterwards — in the developer's own checkout, from
+a read-only-looking command. Two verifies in a row in the test suite surfaced it
+(the second reported the dependency the first had installed as missing). The
+sandbox now removes the links it created before the worktree is deleted, and a
+test asserts the installed tree survives a verify.
+
+**I. A gate that passed a policy it never ran.** `enforce` treated only
+`broken` as a failure, so a policy that reported `blocked` — an unfresh
+dependency, and now a prerequisite that could not be installed — passed the
+pre-commit gate silently. It is the same shape as finding A (`verify --json`
+reporting success and persisting nothing): the exit code is right, the output is
+right, and nothing was checked. Every non-fresh state fails a gate now.
+
 ### Still open
 
-- **Prerequisites** (finding 5): a real repo needs `npm ci` or a build before a
-  command check can pass at all. A `requires:` field or a once-per-sandbox setup
-  step is the missing concept, and without it the first accepted claim on a
-  fresh clone can only ever be broken.
+- **Prerequisites** are now first-class (`check.setup`), but they are still
+  *per claim*: two claims with different ecosystems (npm and a Python venv) each
+  declare their own step, and nothing dedupes a shared build step across globs.
 - **Scheduling** (finding 7): no per-claim schedule, so a minutes-long suite and
-  a 1ms `exists()` check compete in the same verify.
+  a 1ms `exists()` check compete in the same verify. An install that takes 30s
+  now sits inside that same window, which makes the case stronger, not weaker.
+- **This repo's own bound is now tight, and the evidence says so.** The setup
+  tests added a git worktree and several sandboxed verifies, so `npm test` here
+  went from ~38s to ~76s against a 120s `max_ms` — with a busy machine already
+  producing a 100s run. The inbox proposal to tighten `tests.suite` to 69s was
+  written before any of this existed and is now actively wrong; `doctor` flags it
+  as stale and recomputes what the recorded tail would support, which is the tool
+  telling on itself. Relaxing the bound is a human
+  decision, and the honest note is that the feature which makes installs cheap
+  made the suite that proves it expensive.
 - **Manual size** (finding 6): `init` produces one or two claims on a real repo.
   Growing from 2 to 50 is still human work — the tool's value scales with a
   manual it cannot yet help you write.

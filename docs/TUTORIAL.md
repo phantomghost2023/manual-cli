@@ -57,6 +57,44 @@ manual verify --force
 
 Each check runs in a throwaway git worktree; stamps land in `.manual/state.json` (gitignored — local machine state, not truth). Exit 1 if anything is broken. Fix doc or code — you now know which, and why.
 
+## 3b. When the tests need dependencies installed
+
+Every real repository has this problem: on a fresh clone, `npm test` exits 127,
+and the first claim about the suite is false before anyone has typed anything.
+`init` sees it (no `node_modules`, dependencies declared) and ships the
+candidate with the prerequisite attached:
+
+```yaml
+check:
+  setup:
+    run: npm install
+    evidence: ["package.json"]
+    cache: ["node_modules"]
+  run: npm test          # not the raw script: mocha needs node_modules/.bin on PATH
+  expect: { exit: 0, max_ms: 120000 }
+```
+
+The probe runs the setup, then probes again, and reports what it actually found:
+
+```
+$ manual init
+probing discovered candidates before proposing them…
+✔ probed init-tests.suite.md: fresh (19546ms)
+1 candidate(s) needed a prerequisite first; the setup is declared in the file so verify can repeat it.
+```
+
+From then on the install is part of the claim's premise, not a surprise:
+
+```bash
+manual setup                  # what is declared, and whether this machine has it
+manual setup --force           # install it now instead of waiting for verify
+manual verify --no-setup       # trust the environment (CI already installed)
+```
+
+The install runs **once per command+evidence pair**, not once per verify, and if
+it cannot complete the claim is `blocked` — untested, not disproven — so a laptop
+without network never demotes a claim that was true on three other machines.
+
 ## 4. Use it daily
 
 Before editing files, ask what the manual knows:
@@ -158,7 +196,9 @@ Vendors the CLI into `tools/manual-cli/` inside the repo, so CI workflows and ho
 
 - `fact`/`command` broken → repo changed: update claim or fix code.
 - `trap` broken → **celebrate**: the gotcha is fixed; retire the claim.
-- `blocked` → a dependency isn't fresh; fix upstream first.
+- `blocked` → either a dependency claim isn't fresh (fix upstream) or a
+declared prerequisite (`check.setup`) didn't complete: install it, then re-run.
+`manual setup` names the command.
 - Trust demotes on broken and is re-earned by execution — that's the point.
 - `manual history <id>` says *why* it went red when the numbers explain it:
 cold start, trend, outlier, two clusters, memory or load correlation, cold

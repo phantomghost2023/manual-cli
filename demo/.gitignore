@@ -7,3 +7,6 @@
 
 # Undo snapshots for accepted proposals.
 .manual/undo/
+
+# What has already been installed on this machine (see check.setup).
+.manual/cache/

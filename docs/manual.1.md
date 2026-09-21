@@ -13,13 +13,26 @@ Every claim about a repository is a markdown file in `.manual/claims/` backed by
 ## COMMANDS
 
 ```
-verify [--force] [--diff [base]] [--only <ids>] [--json]
+verify [--force] [--diff [base]] [--only <ids>] [--no-setup] [--setup-force]
+       [--json]
     Run each claim's check (skipping unchanged evidence digests within TTL),
-    stamp state.json, exit 1 if anything is broken. --diff selects only claims
+    stamp state.json, exit 1 if anything is broken or held back by a
+    prerequisite that could not be established. --diff selects only claims
     relevant to changed files, plus all policies, plus dependency closure.
     --only takes a comma-separated list of claim ids and runs just those plus
     their transitive dependencies (a claim whose dependencies are unstamped
     reports `blocked`, which says nothing about the claim itself).
+    --no-setup trusts the environment (CI installs its own dependencies) and
+    refuses to call a claim broken when the prerequisite it declares is
+    visibly absent; --setup-force re-runs an install the cache considers done.
+
+setup [--force] [--claim <id>] [--json]
+    What the manual needs installed before it can say anything: each claim's
+    check.setup, deduplicated by (command, evidence), with whether this machine
+    has satisfied it, when it last ran, and how long it took. Listing is free —
+    nothing is installed. --force runs the commands (the same plumbing init and
+    verify use), --claim restricts it to one claim's prerequisite. Exit 1 if an
+    install fails or times out.
 
 brief [--budget N] [--at <ref>] [--json] [files...]
     Token-budgeted briefing for the files in play. Weighted by priority x
@@ -142,14 +155,41 @@ help
 
 Claim file `.manual/claims/<id>.md` — YAML frontmatter (schema, id, kind, statement, priority, applies_to, evidence, depends_on, check, verify, ttl, provenance, lifecycle) + prose body. `check` is one of `run` (shell + expect{exit,stdout_matches,stderr_matches,max_ms}), `expr` (sandboxed predicate over exists/read/manifest/env/nodeMajor/codeowners/lockActive), or `enforce` (policy gate: stage, paths, severity).
 
+A command check may declare `setup` — the prerequisite that has to exist before
+`run` can mean anything (`setup: npm ci`, or a map with `run`, `evidence` (files
+whose content invalidates the install, default: the repo's lockfiles), `cache`
+(the directories its success is measured by, default node_modules) and
+`timeout_s`, default 900). It runs once per (command, evidence) pair rather than
+once per verify, in the checkout rather than the sandbox, before the clock
+starts — so `measured_ms` stays the check's own runtime. A claim whose setup did
+not complete is `blocked`, not `broken`: it keeps the trust it earned, fails CI,
+and says why. Setup is rejected on `expr` checks, which have nothing to install.
+
 Kinds: `fact`, `command`, `trap` (broken = gotcha fixed → retire), `policy`, `ownership`. Trust tiers: ghost → bronze → silver (≥1 pass) → gold (≥5 passes across ≥2 machines); broken demotes and resets the ledger.
 
 `.manual/state.json` is gitignored machine state: stamps, digests, measurement history, env salt (env values are never stored).
 
+## PREREQUISITES
+
+A fresh clone is not a broken repository. `npm test` without an install exits
+127, and before `check.setup` existed that made the first claim on any real repo
+false on arrival — the repository was blamed for the checkout. Now the
+prerequisite is declared, run once per command+evidence pair, cached in
+`.manual/cache/` (machine state, gitignored) with its result recorded in the
+stamp and `history`, and its failure is reported as `blocked` with the command
+that would fix it. `init` declares it from the repo's own package manager when
+dependencies are missing, and infers it from a "Cannot find module" probe when
+they aren't obviously package-managed. A script that begins with a system binary
+(node, pytest, make) is run as written; one that calls a local binary (mocha,
+jest, vitest) is run through the package manager's own entry point, because that
+is the only place node_modules/.bin reaches PATH — the same reason the sandbox
+prepends dependency bin directories to PATH for every check.
+
 ## EXIT CODES
 
-0 all fresh/passed · 1 something broken, a blocked gate, a graph cycle, or a
-suspect doctor report · 2 usage errors, load errors, or an unrunnable command.
+0 all fresh/passed · 1 something broken, a blocked gate, a claim whose declared
+prerequisite could not be established, a graph cycle, or a suspect doctor report
+· 2 usage errors, load errors, or an unrunnable command.
 
 ## PROPOSALS MUST PROVE THEMSELVES
 

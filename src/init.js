@@ -5,6 +5,7 @@ import { parseYaml, stringifyYaml } from './yaml.js';
 import { splitFrontmatter } from './md.js';
 import { runCheck } from './runner.js';
 import { Sandbox } from './sandbox.js';
+import { normalizeSetup } from './setup.js';
 import { VENDORED_CLI } from './eject.js';
 
 // Init: discover facts about a repo by inspection and scaffold a .manual/
@@ -17,6 +18,64 @@ function readJson(p) {
   } catch {
     return null;
   }
+}
+
+// How to install this repo's dependencies, when it has any.
+//
+// Only ecosystems whose install lands in a project-local directory are
+// proposed: an install that writes to a shared or global location (pip without
+// a venv, `go install`) is not something a discovery command should do to a
+// machine, so those repos get the failure message and a human decides.
+export function installCommand(root, pkg = null) {
+  const p = pkg || readJson(path.join(root, 'package.json')) || {};
+  const has = (f) => fs.existsSync(path.join(root, f));
+  const js = { cache: ['node_modules'] };
+  if (String(p.packageManager || '').startsWith('pnpm') || has('pnpm-lock.yaml')) {
+    return { run: 'pnpm install --frozen-lockfile', evidence: ['package.json', 'pnpm-lock.yaml'], ...js };
+  }
+  if (String(p.packageManager || '').startsWith('yarn') || has('yarn.lock')) {
+    return { run: 'yarn install --frozen-lockfile', evidence: ['package.json', 'yarn.lock'], ...js };
+  }
+  if (String(p.packageManager || '').startsWith('bun') || has('bun.lockb')) {
+    return { run: 'bun install --frozen-lockfile', evidence: ['package.json', 'bun.lockb'], ...js };
+  }
+  if (has('package-lock.json') || has('npm-shrinkwrap.json')) {
+    return { run: 'npm ci', evidence: ['package.json', 'package-lock.json'], ...js };
+  }
+  if (depCount(p) > 0) return { run: 'npm install', evidence: ['package.json'], ...js };
+  return null;
+}
+
+// Commands that a shell can run without the package manager's PATH injection.
+const SYSTEM_BINS = /^(node|nodejs|deno|bun|python|python3|pytest|go|cargo|make|cmake|bash|sh|zsh|ruby|rake|php|dotnet|java|mvn|gradle|ant|npm|pnpm|yarn)$/;
+
+// The repo's own "run the tests" entry point, in whatever manager it uses.
+// `bun run test`, never `bun test`: the latter is bun's built-in runner and
+// would silently ignore the script the repository actually wrote.
+export function packageManagerTestCommand(root, pkg = null) {
+  const p = pkg || readJson(path.join(root, 'package.json')) || {};
+  if (!p.scripts || typeof p.scripts.test !== 'string' || !p.scripts.test.trim()) return null;
+  const has = (f) => fs.existsSync(path.join(root, f));
+  const pm = String(p.packageManager || '');
+  if (pm.startsWith('pnpm') || has('pnpm-lock.yaml')) return 'pnpm test';
+  if (pm.startsWith('yarn') || has('yarn.lock')) return 'yarn test';
+  if (pm.startsWith('bun') || has('bun.lockb')) return 'bun run test';
+  return 'npm test';
+}
+
+export function depCount(pkg = {}) {
+  return ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']
+    .reduce((n, k) => n + Object.keys(pkg[k] || {}).length, 0);
+}
+
+// Output shapes that mean "the tool is missing", not "the assertion failed".
+// This is the signal that turns a false-looking probe into a declared
+// prerequisite: exit 127 (command not found) and node's module resolution
+// errors are both about the environment, never about the repository.
+export function looksLikeMissingDeps(out) {
+  return /cannot find module|module_not_found|err_module_not_found|command not found|jest: not found|mocha: not found|vitest: not found|npm error code enoent|exit 127|\b127\b(?!\d)/i.test(
+    String(out || ''),
+  );
 }
 
 export function detect(root) {
@@ -67,30 +126,56 @@ export function detect(root) {
 
   const scripts = pkg.scripts || {};
   const testScript = scripts.test || '';
+  const pmRunTest = packageManagerTestCommand(root, pkg);
   const hasTests = ['test', 'tests', 'src', 'lib'].some((d) =>
     fs.existsSync(path.join(root, d)),
   );
   if (testScript && hasTests) {
-    // The statement must describe the command that actually runs. Falling back
-    // to "npm test" for an unrecognized runner produced a claim whose prose and
-    // whose check disagreed (found on a real repo: mocha!).
-    const known = /vitest/.test(testScript)
-      ? 'vitest run'
-      : /jest/.test(testScript)
-        ? 'npx jest'
-        : /--test/.test(testScript)
-          ? 'node --test'
-          : null;
-    const runner = known || testScript.trim().split(/\s+/)[0];
+    // What the check runs must be what the statement says, and it must be able
+    // to run outside `npm run`.
+    //
+    // Found on a real repo (express): `scripts.test` is `mocha --require …`,
+    // and mocha lives in node_modules/.bin, which npm puts on PATH and a plain
+    // shell does not. Running the script body directly therefore exited 127 —
+    // after an install that had already succeeded, which reads as "the tests
+    // fail" when nothing was ever tested. A script whose first word is a
+    // system binary (node, pytest, make) is runnable as-is; anything else is a
+    // local binary and has to go through the package manager's own entry
+    // point, which is also what the README and CI tell a human to type.
+    const firstWord = (testScript.trim().split(/\s+/)[0] || '').replace(/^npx$/, '');
+    const local = firstWord === '' || !SYSTEM_BINS.test(firstWord);
+    const throughPm = local && pmRunTest;
+    const checkRun = throughPm || testScript;
+    const runner = throughPm || firstWord || testScript.trim();
+    // A command claim whose dependencies are not installed is false about the
+    // checkout, not about the repo. Declaring the prerequisite here — from the
+    // package manager and the lockfile, without running anything — means the
+    // candidate carries the reason it will fail and the fix.
+    const install = depCount(pkg) > 0 && !fs.existsSync(path.join(root, 'node_modules'))
+      ? installCommand(root, pkg)
+      : null;
     findings.push({
       kind: 'command',
       id: 'tests.suite',
-      statement: `The test suite runs with \`${runner}\`.`,
+      // The prose names the runner too, because "npm test" alone doesn't tell a
+      // reader that mocha is what will actually be run.
+      statement: throughPm
+        ? `The test suite runs with \`${runner}\` (${firstWord}).`
+        : `The test suite runs with \`${runner}\`.`,
       priority: 'high',
       applies_to: ['src/**', 'test/**', 'lib/**'],
       evidence: { files: ['package.json', 'src/**', 'test/**'] },
-      check: { run: testScript, expect: { exit: 0, max_ms: 120000 } },
-      note: `Discovered from package.json scripts.test = "${testScript}".`,
+      check: { run: checkRun, expect: { exit: 0, max_ms: 120000 } },
+      setup: install,
+      note: [
+        `Discovered from package.json scripts.test = "${testScript}".`,
+        throughPm
+          ? `The script calls a local binary (${firstWord}), so the check runs it through \`${throughPm}\` — the way node_modules/.bin reaches PATH.`
+          : null,
+        install
+          ? `Dependencies are not installed in this checkout, so the candidate declares a setup (${install.run}); verify runs it before the check.`
+          : null,
+      ].filter(Boolean).join(' '),
     });
   }
 
@@ -124,6 +209,15 @@ export function detect(root) {
   return { pkg, findings };
 }
 
+// The check block, including the prerequisite when one was discovered.
+function checkBlock(f) {
+  if (f.check.expr) return `  expr: ${JSON.stringify(f.check.expr)}`;
+  const setup = f.setup
+    ? `  setup:\n    run: ${JSON.stringify(f.setup.run)}\n    evidence:\n${(f.setup.evidence || []).map((p) => `      - "${p}"`).join('\n')}\n    cache:\n${(f.setup.cache || []).map((p) => `      - ${p}`).join('\n')}\n`
+    : '';
+  return `${setup}  run: ${JSON.stringify(f.check.run)}\n  expect:\n    exit: ${f.check.expect?.exit ?? 0}\n    max_ms: ${f.check.expect?.max_ms ?? 120000}`;
+}
+
 function claimFile(f) {
   const fm = `---
 schema: manual/v1
@@ -137,7 +231,7 @@ evidence:
   files:
 ${(f.evidence.files || ['**']).map((p) => `    - "${p}"`).join('\n')}
 check:
-${f.check.expr ? `  expr: ${JSON.stringify(f.check.expr)}` : `  run: ${JSON.stringify(f.check.run)}\n  expect:\n    exit: ${f.check.expect?.exit ?? 0}\n    max_ms: ${f.check.expect?.max_ms ?? 120000}`}
+${checkBlock(f)}
 verify: on_change
 provenance:
   author: agent:manual-cli
@@ -160,7 +254,9 @@ ${f.note || 'Discovered automatically. Review, adjust, and accept.'}
 // test" for a repo whose dependencies were not installed, so the first
 // accepted claim in that repo was false on arrival (exit 127). Discovery is
 // cheap; claiming is not. Probing turns "observed" into "observed and tried".
-export async function probeCandidates(root, { timeoutMs = 20000, quiet = false } = {}) {
+// `inferInstall` is how a prerequisite is guessed from a failed check. It is a
+// parameter so tests can exercise the inference without a real package manager.
+export async function probeCandidates(root, { timeoutMs = 20000, quiet = false, setup = true, inferInstall = installCommand } = {}) {
   const inboxDir = path.join(root, '.manual', 'inbox');
   let files = [];
   try {
@@ -179,20 +275,58 @@ export async function probeCandidates(root, { timeoutMs = 20000, quiet = false }
       const { fm: fmRaw, body } = splitFrontmatter(text);
       const fm = fmRaw ? parseYaml(fmRaw) : {};
       if (!fm.check) continue;
-      const claim = { fm, check: fm.check };
-      let probe;
-      try {
-        const r = await runCheck(claim, root, { sandbox, timeoutMs });
-        probe = { state: r.ok ? 'fresh' : 'broken', note: r.ok ? `${r.ms ?? '?'}ms` : (r.error || `exit ${r.exit}`), ms: r.ms ?? null };
-      } catch (e) {
-        probe = { state: 'untested', note: e.message, ms: null };
+
+      const attempt = async () => {
+        try {
+          return await runCheck({ fm, check: fm.check, setup: normalizeSetup(fm.check) }, root, {
+            sandbox,
+            // The probe's short cap is a floor, not a ceiling: a real suite
+            // that takes 20s is not a broken claim, and reporting it as one is
+            // how discovery loses a human's trust. The claim's own bound is
+            // what will be asserted later, so it is what we wait for here.
+            timeoutMs: Math.max(timeoutMs, fm.check?.expect?.max_ms || 0),
+            noSetup: !setup,
+            quiet: true,
+          });
+        } catch (e) {
+          return { ok: false, error: e.message, ms: null };
+        }
+      };
+
+      let r = await attempt();
+      // A check that fails because its dependency isn't installed is not a
+      // false claim. Infer the prerequisite from the repo's own package
+      // manager, declare it in the candidate, and probe again — the second
+      // probe is the one that says something about the repository.
+      let declared = null;
+      if (!r.ok && !r.blocked && setup && !fm.check.setup) {
+        const install = inferInstall(root);
+        if (install && looksLikeMissingDeps(`${r.stdout || ''}\n${r.error || ''}`)) {
+          fm.check.setup = { run: install.run, evidence: install.evidence, cache: install.cache };
+          declared = install;
+          r = await attempt();
+        }
       }
-      const next = { ...fm, observation: { ...(fm.observation || {}), ...{ at: nowIso(), by: 'agent:manual-cli', probe_state: probe.state, probe_note: probe.note } } };
+      const probe = {
+        state: r.ok ? 'fresh' : r.blocked ? 'blocked' : 'broken',
+        note: r.ok ? `${r.ms ?? '?'}ms` : (r.error || `exit ${r.exit}`),
+        ms: r.ms ?? null,
+      };
+      const next = {
+        ...fm,
+        observation: {
+          ...(fm.observation || {}),
+          ...{ at: nowIso(), by: 'agent:manual-cli', probe_state: probe.state, probe_note: probe.note },
+          ...(declared ? { setup: declared.run, setup_state: r.setup?.status || 'unknown' } : {}),
+        },
+      };
       const noteLine = probe.state === 'fresh'
-        ? `Probed before proposing: the check passes on this checkout (${probe.note}).`
-        : `Probed before proposing: **the check does not pass here** (${probe.note}). It may need dependencies installed, a build step, or a different command. Do not accept it as-is.`;
+        ? `Probed before proposing: the check passes on this checkout (${probe.note})${declared ? `, after declaring its prerequisite (${declared.run})` : ''}.`
+        : probe.state === 'blocked'
+          ? `Probed before proposing: **the prerequisite could not be established here** (${probe.note}). The claim is untested — install it, then re-run \`manual verify\`. It is not a false claim, and it will report \`blocked\` rather than \`broken\` until then.`
+          : `Probed before proposing: **the check does not pass here** (${probe.note}). It may need dependencies installed, a build step, or a different command. Do not accept it as-is.`;
       fs.writeFileSync(full, `---\n${stringifyYaml(next)}---\n${body.trim()}\n\n${noteLine}\n`);
-      results.push({ file: f, ...probe });
+      results.push({ file: f, ...probe, setup: declared ? declared.run : (normalizeSetup(fm.check)?.run || null) });
       if (!quiet) {
         const icon = probe.state === 'fresh' ? '✔' : '✖';
         console.log(`${icon} probed ${f}: ${probe.state} (${probe.note})`);
@@ -224,7 +358,10 @@ export function init(root, { dryRun = false } = {}) {
     }
     if (!fs.existsSync(path.join(root, '.gitignore')) ||
         !fs.readFileSync(path.join(root, '.gitignore'), 'utf8').includes('.manual/state.json')) {
-      fs.appendFileSync(path.join(root, '.gitignore'), '\n# manual verify stamps are machine state, not truth\n.manual/state.json\n');
+      fs.appendFileSync(
+        path.join(root, '.gitignore'),
+        '\n# manual verify stamps are machine state, not truth\n.manual/state.json\n\n# what has already been installed here (check.setup cache)\n.manual/cache/\n',
+      );
     }
   }
 
@@ -244,7 +381,7 @@ export function init(root, { dryRun = false } = {}) {
       fs.mkdirSync(wfDir, { recursive: true });
       fs.writeFileSync(
         wf,
-        `name: manual\non: [push, pull_request]\njobs:\n  verify:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with: { fetch-depth: 0 }\n      - uses: actions/setup-node@v4\n        with: { node-version: 22 }\n      - name: Verify claims relevant to this diff\n        run: |\n          # Self-contained when the CLI is vendored (manual eject).\n          if [ -f "${VENDORED_CLI}" ]; then\n            node ${VENDORED_CLI} verify --diff "\${{ github.event.pull_request.base.sha || 'HEAD~1' }}"\n          else\n            echo "manual-cli not vendored; run: node <path-to-manual-cli>/bin/manual.js eject --root ." >&2\n            exit 1\n          fi\n`,
+        `name: manual\non: [push, pull_request]\njobs:\n  verify:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n        with: { fetch-depth: 0 }\n      - uses: actions/setup-node@v4\n        with: { node-version: 22 }\n      - name: Verify claims relevant to this diff\n        run: |\n          # The workflow installs dependencies for the whole job, so verify --\n          # no-setup trusts the environment instead of repeating an install per\n          # claim's declared prerequisite.\n          if [ -f "${VENDORED_CLI}" ]; then\n            node ${VENDORED_CLI} verify --diff "\${{ github.event.pull_request.base.sha || 'HEAD~1' }}" --no-setup\n          else\n            echo "manual-cli not vendored; run: node <path-to-manual-cli>/bin/manual.js eject --root ." >&2\n            exit 1\n          fi\n`,
       );
       created.push('.github/workflows/manual.yml');
     }

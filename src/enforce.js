@@ -33,8 +33,13 @@ export async function enforce(root, state, { stage = 'pre-commit' } = {}) {
     }
     ran.push(cl.fm.id);
     const { stamp } = await verifyOne(cl, root, state, { timeoutMs: 120000 });
-    if (stamp.state === 'broken') {
-      failures.push({ id: cl.fm.id, severity: enf.severity || 'block', note: stamp.note });
+    // Anything that is not fresh fails the gate. Treating only `broken` as a
+    // failure let a `blocked` policy — a dependency that is not fresh, or a
+    // prerequisite that could not be installed — pass a pre-commit gate
+    // silently, which is a gate that reports success for a check it never ran.
+    if (stamp.state !== 'fresh') {
+      const why = stamp.state === 'blocked' ? `blocked — ${stamp.note}` : stamp.note;
+      failures.push({ id: cl.fm.id, severity: enf.severity || 'block', note: why });
     }
   }
   return { ran, failures, errors };

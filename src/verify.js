@@ -44,6 +44,11 @@ export async function verify(root, opts = {}) {
   const config = loadConfig(root);
   const state = opts.state; // provided by CLI (owns save)
   const force = opts.force || false;
+  // Prerequisites: `--no-setup` trusts the environment (CI installs its own
+  // dependencies), `--setup-force` re-runs an install the cache considers done.
+  const noSetup = opts.noSetup || false;
+  const setupForce = opts.setupForce || false;
+  const quiet = opts.quiet || false;
 
   // Digest claims up front (cheap: hashing only; deduped per evidence spec).
   const digestCache = new Map();
@@ -105,6 +110,9 @@ export async function verify(root, opts = {}) {
     const r = await verifyOne(cl, root, state, {
       sandbox: sharedSandbox,
       timeoutMs: (config.verify.default_timeout_s || 60) * 1000,
+      noSetup,
+      setupForce,
+      quiet,
     });
     results.push(r);
   }
@@ -141,5 +149,13 @@ export function printVerifyReport(res) {
     console.log(c.red('\nload errors:'));
     for (const e of res.errors) console.log(c.red(`  - ${e}`));
   }
-  return counts.broken ? 1 : 0;
+  // A claim held back by an unsatisfied prerequisite is not a false claim, but
+  // it is not a verified one either — CI must not pass on it.
+  const stalled = res.results.filter((r) => r.result?.blocked);
+  if (stalled.length) {
+    console.log(c.amber(`\n${stalled.length} claim(s) could not be tested: their declared setup did not complete.`));
+    for (const r of stalled) console.log(c.amber(`  - ${r.claim.fm.id}: ${r.result.setup?.run}${r.result.setup?.note ? ` — ${r.result.setup.note}` : ''}`));
+    console.log(c.grey('    fix the prerequisite (or pass --no-setup when the environment already has it), then re-run.'));
+  }
+  return counts.broken || stalled.length ? 1 : 0;
 }

@@ -2,6 +2,24 @@
 
 All notable changes to manual-cli are documented here. Format: Keep a Changelog; versioning: SemVer.
 
+## [0.7.0] - 2026-09-21
+
+### Added
+- **`check.setup`: a declared prerequisite for command checks.** A fresh clone is not a broken repository, but `npm test` without an install exits 127 and the claim used to read `broken` — blaming the repo for the checkout. A claim can now declare the install or build step it depends on (`setup: npm ci`, or a map with `run`, `evidence`, `cache`, `timeout_s`), and a claim whose setup did not complete reports **`blocked`**: untested, not disproven, keeping the trust it earned, failing CI with the reason instead of the claim's name. Setup is rejected on `expr` checks.
+- It runs **once per (command, evidence) pair, not per verify**: the key is the command plus the *content* of its evidence, so a lockfile change re-installs and re-verifying untouched code does not; twelve claims needing `npm ci` pay for it once (memoised within a run, cached on disk across runs in `.manual/cache/`, gitignored). The cache is only trusted while the directories it declares still exist — delete `node_modules` by hand and the next verify reinstalls it. Failures are recorded for diagnosis but never trusted, so a transient network failure cannot blind the manual.
+- Installs run in the checkout, not the sandbox: dependency trees belong where the developer puts them, a throwaway worktree would reinstall on every verify, and the sandbox's existing link of `node_modules` into the worktree makes the result visible to the check. Setup cost is excluded from `measured_ms`, so bounds and the flywheel's proposals keep meaning the suite's own runtime; the stamp and `history` record it separately.
+- `manual setup [--force] [--claim <id>] [--json]`: what is declared, whether this machine has satisfied it, when it last ran, and how long it took — deduplicated by command. Listing installs nothing; `--force` runs them.
+- `verify --no-setup` (trust the environment — the CI path, where the workflow installs dependencies itself) and `verify --setup-force` (re-run an install the cache considers done). `--no-setup` refuses to call a claim broken when the prerequisite it declares is visibly absent.
+- `init` declares the prerequisite it can see: dependencies declared, `node_modules` missing, and the install command follows the repo's own manager (npm/pnpm/yarn/bun, lockfile-aware). When dependencies aren't obviously package-managed, the probe learns it from the failure instead — a check that exits with "Cannot find module" gets the inferred setup written into the candidate and is probed again, so the second probe is the one that says something about the repo.
+- A discovered test script that starts with a system binary (`node`, `pytest`, `make`) is run as written; one that calls a local binary (`mocha`, `jest`, `vitest`) is run through the package manager's own entry point (`npm test`), because that is the only place `node_modules/.bin` reaches `PATH` — and the statement names both. The check no longer silently disagrees with its own prose.
+- The sandbox prepends dependency `bin` directories (`node_modules/.bin`, `.venv/bin`, `vendor/bin`) to `PATH` for every check, the way `npm run` and `pip` do, so a claim that runs `mocha test/` works and is not reported as a failing suite.
+- `doctor` reports prerequisites that are declared but unsatisfied (with the command that fixes them), `brief` marks a claim whose prerequisite is missing on this machine (`⚙ needs: npm ci`), and the report/dashboard shows a setup row per claim.
+
+### Fixed
+- **A pre-commit policy gate passed policies it never ran.** `enforce` only reported `broken` as a failure, so a `blocked` policy — an unfresh dependency, or now a prerequisite that could not be installed — passed the gate silently. A gate that reports success for a check it did not run is worse than no gate; every non-fresh state now fails it, with the reason.
+- **The sandbox emptied the developer's `node_modules` on Windows.** A recursive delete follows a junction into its target, so tearing the worktree down removed the *contents* of the linked dependency tree while leaving the directory in place — the sandbox appeared to work and the repo was broken afterwards. Found by verifying twice in one test: the second run reported a missing dependency the install had already satisfied. The links are now removed by the sandbox that made them, before the worktree is deleted.
+- Discovery probed with a flat 20-second cap, which killed a real suite mid-run and proposed the candidate as `broken`. The probe now waits at least as long as the claim's own `max_ms`, because a false "broken" during discovery is worse than a slow one.
+
 ## [0.6.0] - 2026-09-21
 
 ### Added
