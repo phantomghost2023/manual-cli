@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { splitFrontmatter, splitSections } from './md.js';
 import { parseYaml } from './yaml.js';
-import { normalizeSetup, normalizeSetupMap, requiredNames } from './setup.js';
+import { normalizeSetup, normalizeSetupMap, prereqOrder, requiredNames } from './setup.js';
 
 export const KINDS = new Set(['fact', 'command', 'trap', 'policy', 'ownership']);
 const CHECK_SHAPES = new Set(['run', 'expr', 'enforce']);
@@ -200,6 +200,16 @@ export function loadConfig(root) {
   }
   const { specs, errors } = normalizeSetupMap(cfg.setup);
   setupErrors.push(...errors);
+  // The prerequisite graph is validated even when no claim references it: a
+  // cycle or a dangling edge is a property of the declaration, and it would
+  // otherwise surface as a confusing blocked claim much later.
+  const graph = prereqOrder({ setup: specs });
+  for (const u of graph.unknown) {
+    setupErrors.push(`manual.yaml: prerequisite "${u.required_by}" requires "${u.name}", which is not declared`);
+  }
+  for (const c of graph.cycles) {
+    setupErrors.push(`manual.yaml: prerequisite cycle ${c.join(' → ')} — no order satisfies it`);
+  }
   return {
     brief: { ...defaults.brief, ...(cfg.brief || {}) },
     verify: {
@@ -208,6 +218,7 @@ export function loadConfig(root) {
       ci: { ...defaults.verify.ci, ...((cfg.verify || {}).ci || {}) },
     },
     setup: specs,
+    setupOrder: graph.order,
     setupErrors,
   };
 }

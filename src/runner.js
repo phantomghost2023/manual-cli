@@ -4,7 +4,7 @@ import { evaluateExpr } from './expr.js';
 import { Sandbox } from './sandbox.js';
 import { nowIso } from './util.js';
 import { ledgerStats, mergeTrust, machineName } from './ledger.js';
-import { ensureSetup, resolvePrereqs, setupStatus } from './setup.js';
+import { ensureSetup, resolvePrereqs, setupStatus, SETUP_OK_STATUSES } from './setup.js';
 import { loadConfigCached } from './claims.js';
 
 // Executes a claim's check and interprets the result by kind.
@@ -33,6 +33,16 @@ export async function runCheck(claim, root, { sandbox, timeoutMs, noSetup = fals
     // the result — and a failure is `blocked`, not `broken`.
     const resolved = resolvePrereqs(claim, config || loadConfigCached(root));
     const setups = [];
+    if (resolved.cycles.length) {
+      const loop = resolved.cycles[0];
+      return {
+        ok: false,
+        blocked: true,
+        setups,
+        setupError: { name: loop[0], run: null, status: 'cycle', note: loop.join(' → ') },
+        error: `prerequisite cycle: ${loop.join(' → ')} — no order satisfies it, so the claim cannot be prepared`,
+      };
+    }
     if (resolved.unknown.length) {
       const name = resolved.unknown[0];
       return {
@@ -64,7 +74,7 @@ export async function runCheck(claim, root, { sandbox, timeoutMs, noSetup = fals
       setups.push({ name, ...setup });
       // An install may create the very directory the check needs to see, and a
       // second prerequisite may need the first one's artifacts on PATH.
-      if (setup.status === 'ran' || setup.status === 'cached') sb.addDeps(spec.cache);
+      if (SETUP_OK_STATUSES.has(setup.status)) sb.addDeps(spec.cache);
       if (setup.status === 'failed' || setup.status === 'timeout') {
         return {
           ok: false,
@@ -180,7 +190,9 @@ export function interpret(claim, result) {
         ? 'setup skipped — dependencies missing'
         : e?.status === 'unknown'
           ? `unknown prerequisite "${e.name}"`
-          : `setup failed (${label})`;
+          : e?.status === 'cycle'
+            ? `prerequisite cycle: ${e.note}`
+            : `setup failed (${label})`;
       return { state: 'blocked', note };
     }
     if (kind === 'trap') return { state: 'broken', note: 'gotcha no longer reproduces' };

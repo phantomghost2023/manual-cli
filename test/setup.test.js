@@ -7,11 +7,14 @@ import { execSync } from 'node:child_process';
 import {
   ensureSetup,
   normalizeSetup,
+  planPrereqs,
+  prereqOrder,
   readSetupCache,
   resetSetupMemo,
   resolvePrereqs,
   setupKey,
   setupStatus,
+  verifyLockfile,
 } from '../src/setup.js';
 import { loadConfig, loadManual, parseClaim } from '../src/claims.js';
 import { verify, printVerifyReport } from '../src/verify.js';
@@ -170,7 +173,16 @@ Something is true about this repository today.
     const cl = parse(
       '  setup:\n    run: make deps\n    evidence: ["Makefile"]\n    cache: ["vendor"]\n    timeout_s: 30\n  run: npm test\n',
     );
-    assert.deepEqual(cl.setup, { run: 'make deps', evidence: ['Makefile'], cache: ['vendor'], timeout_s: 30 });
+    assert.deepEqual(cl.setup, {
+      run: 'make deps',
+      evidence: ['Makefile'],
+      cache: ['vendor'],
+      timeout_s: 30,
+      requires: [],
+      verify: null,
+      verifyBuiltin: null,
+      share: false,
+    });
   });
 
   test('setup without a command is rejected, not silently ignored', () => {
@@ -189,6 +201,15 @@ Something is true about this repository today.
   test('a claim without setup parses exactly as before', () => {
     const cl = parse('  run: npm test\n');
     assert.equal(cl.setup, null);
+  });
+
+  test('normalizing an already-normalized setup changes nothing', () => {
+    // Specs travel: a declared one is normalized when manual.yaml is read, then
+    // normalized again when a claim resolves it. The second pass must not
+    // reinterpret `builtin:lockfile` (a marker) as a command to run.
+    const once = normalizeSetup({ setup: { run: 'npm ci', verify: { builtin: 'lockfile' }, requires: ['node'], share: true } });
+    assert.equal(once.verifyBuiltin, 'lockfile');
+    assert.deepEqual(normalizeSetup({ setup: once }), once);
   });
 });
 
@@ -818,5 +839,319 @@ describe('manual setup: the command', () => {
     // Nothing declares a setup: a clean exit, not a failure.
     fs.rmSync(path.join(root, '.manual', 'claims', 'tests.suite.md'));
     assert.match(execSync(`node "${bin}" setup`, { cwd: root, encoding: 'utf8' }), /no prerequisites declared/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A repository's prerequisites are not a flat list: an install comes first, a
+// build sits on top of it, codegen sits on top of that. Writing the edge down
+// (`build.requires: [node]`) means the order is computed from the graph, so a
+// claim that lists its requirements in the wrong order still runs them in the
+// only order that can work — and a graph with no valid order is refused rather
+// than guessed at.
+// ---------------------------------------------------------------------------
+describe('repo-level prerequisites: edges between steps', () => {
+  const writeConfig = (root, text) => fs.writeFileSync(path.join(root, '.manual', 'manual.yaml'), text);
+
+  const claimRequiring = (id, requires) => `---
+schema: manual/v1
+id: ${id}
+kind: command
+statement: The suite passes once its dependencies exist.
+priority: high
+applies_to: ["**"]
+evidence:
+  files:
+    - "package.json"
+check:
+  requires: ${Array.isArray(requires) ? `[${requires.join(', ')}]` : requires}
+  run: "node test/run.js"
+  expect:
+    exit: 0
+verify: on_change
+provenance:
+  author: test
+  origin: authored
+  evidence: "prerequisite edges"
+lifecycle: accepted
+---
+
+The suite passes once its dependencies exist.
+`;
+
+  // node installs, build depends on it, and they are different commands so the
+  // install log can show which ran when.
+  const dagConfig = (counter, extra = '') =>
+    `schema: manual/v1\nsetup:\n` +
+    `  node:\n    run: "node fake-install.js ${counter} node"\n    evidence: ["package.json"]\n    cache: ["node_modules"]\n` +
+    `  build:\n    run: "node fake-install.js ${counter} build"\n    evidence: ["package.json"]\n    cache: ["node_modules"]\n    requires: [node]\n` +
+    extra;
+
+  test('a dependency edge orders the steps, whatever order the claim wrote', async () => {
+    const { root, counter } = makeDepRepo();
+    writeConfig(root, dagConfig(counter));
+    // Written in the order it is *not* safe to run in.
+    fs.writeFileSync(path.join(root, '.manual', 'claims', 'tests.suite.md'), claimRequiring('tests.suite', ['build', 'node']));
+    const res = await verify(root, { state: new State(root), force: true });
+    assert.equal(res.results[0].stamp.state, 'fresh');
+    // node before build, and node only once: the edge is an ordering constraint,
+    // not a second reason to install.
+    assert.deepEqual(fs.readFileSync(counter, 'utf8').split('\n').filter(Boolean), ['node', 'build']);
+    assert.deepEqual(res.results[0].stamp.setups.map((s) => s.name), ['node', 'build']);
+  });
+
+  test('a claim that requires only the build still gets the install it sits on', async () => {
+    const { root, counter } = makeDepRepo();
+    writeConfig(root, dagConfig(counter));
+    fs.writeFileSync(path.join(root, '.manual', 'claims', 'tests.suite.md'), claimRequiring('tests.suite', 'build'));
+    const res = await verify(root, { state: new State(root), force: true });
+    assert.equal(res.results[0].stamp.state, 'fresh');
+    assert.deepEqual(fs.readFileSync(counter, 'utf8').split('\n').filter(Boolean), ['node', 'build'], 'the edge is what makes the order correct, not the claim');
+  });
+
+  test('a cycle is refused, not resolved into a wrong order', async () => {
+    const config = { setup: { a: { requires: ['b'] }, b: { requires: ['a'] } } };
+    const g = prereqOrder(config);
+    assert.deepEqual(g.order, [], 'no order exists, so none is invented');
+    assert.equal(g.cycles.length, 1);
+    assert.deepEqual(g.cycles[0], ['a', 'b', 'a']);
+
+    const { root, counter } = makeDepRepo();
+    writeConfig(
+      root,
+      `schema: manual/v1\nsetup:\n  a:\n    run: "node fake-install.js ${counter} a"\n    cache: ["node_modules"]\n    requires: [b]\n  b:\n    run: "node fake-install.js ${counter} b"\n    cache: ["node_modules"]\n    requires: [a]\n`,
+    );
+    fs.writeFileSync(path.join(root, '.manual', 'claims', 'tests.suite.md'), claimRequiring('tests.suite', 'a'));
+    const res = await verify(root, { state: new State(root), force: true });
+    assert.equal(res.results[0].stamp.state, 'blocked');
+    assert.match(res.results[0].stamp.note, /cycle/i);
+    assert.equal(countInstalls(counter), 0, 'neither step of a cycle runs: there is no first one');
+  });
+
+  test('a dependency on a name nobody declares is reported like a typo in the claim', () => {
+    const g = prereqOrder({ setup: { build: { requires: ['node'] } } });
+    assert.deepEqual(g.order, ['build']);
+    assert.deepEqual(g.unknown, [{ name: 'node', required_by: 'build' }]);
+  });
+
+  test('the plan is the run: deduped across claims, in the computed order', () => {
+    const { root, counter } = makeDepRepo();
+    writeConfig(root, dagConfig(counter));
+    const config = loadConfig(root);
+    const claims = [
+      { fm: { id: 'tests.a' }, check: { requires: ['build'] } },
+      { fm: { id: 'tests.b' }, check: { requires: ['build', 'node'] } },
+    ];
+    const plan = planPrereqs(claims, config);
+    assert.deepEqual(plan.steps.map((s) => s.name), ['node', 'build']);
+    assert.deepEqual(plan.steps[0].claims, ['tests.a', 'tests.b'], 'both claims are listed against the install they share');
+    assert.deepEqual(plan.steps[1].spec.requires, ['node']);
+    assert.deepEqual(plan.unknown, []);
+  });
+
+  test('manual setup --plan prints the order and establishes nothing', async () => {
+    const { root, counter } = makeDepRepo();
+    const bin = path.resolve('bin/manual.js');
+    writeConfig(root, dagConfig(counter));
+    fs.writeFileSync(path.join(root, '.manual', 'claims', 'tests.suite.md'), claimRequiring('tests.suite', 'build'));
+
+    const run = (args) => {
+      try {
+        return { status: 0, out: execSync(`node "${bin}" ${args}`, { cwd: root, encoding: 'utf8' }) };
+      } catch (e) {
+        return { status: Number(e.status), out: String(e.stdout || '') };
+      }
+    };
+
+    const before = run('setup --plan --json');
+    assert.equal(before.status, 1, 'an unsatisfied plan is not a success');
+    const planned = JSON.parse(before.out);
+    assert.deepEqual(planned.plan.map((s) => s.name), ['node', 'build']);
+    assert.deepEqual(planned.plan.map((s) => s.cached), [false, false]);
+    assert.deepEqual(planned.plan.find((s) => s.name === 'build').requires, ['node']);
+    assert.equal(countInstalls(counter), 0, 'a plan that installed something would not be a plan');
+
+    const human = run('setup --plan').out;
+    assert.match(human, /1\. node → .*fake-install\.js .* node/);
+    assert.match(human, /2\. build → .*fake-install\.js .* build.*needs node/);
+
+    // Satisfy it, and the same plan now reads as done — with the order intact.
+    assert.equal(run('setup --force').status, 0);
+    const after = run('setup --plan --json');
+    assert.equal(after.status, 0);
+    assert.deepEqual(JSON.parse(after.out).plan.map((s) => s.cached), [true, true]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// "It ran once" is not evidence that the tree is still there. The lockfile
+// builtin answers the question a marker cannot — is this install still the one
+// the lockfile describes? — and the store lets another checkout on this machine
+// borrow a tree that was verified, right now, where it was built.
+// ---------------------------------------------------------------------------
+describe('setup: a satisfied install is verified, not merely remembered', () => {
+  const LOCK = JSON.stringify({
+    name: 'dep-repo',
+    lockfileVersion: 3,
+    packages: {
+      '': { name: 'dep-repo' },
+      'node_modules/fake-dep': { version: '1.0.0' },
+      'node_modules/fake-dep/node_modules/inner': { version: '1.0.0' },
+    },
+  }) + '\n';
+
+  // The nested package is the point: losing it does not change the immediate
+  // contents of node_modules, so the cheap witness cannot see it.
+  const installNested = (root, counter) =>
+    fs.writeFileSync(
+      path.join(root, 'fake-install.js'),
+      "const fs = require('node:fs');\n" +
+        "fs.mkdirSync('node_modules/fake-dep/node_modules/inner', { recursive: true });\n" +
+        "fs.writeFileSync('node_modules/fake-dep/ok.txt', 'ok');\n" +
+        "fs.writeFileSync('node_modules/fake-dep/node_modules/inner/index.js', '');\n" +
+        `fs.appendFileSync(${JSON.stringify(counter)}, 'install\\n');\n`,
+    );
+
+  const spec = (run, verify) =>
+    normalizeSetup({ setup: { run, evidence: ['package.json', 'package-lock.json'], cache: ['node_modules'], ...(verify ? { verify } : {}) } });
+
+  test('the lockfile builtin compares the tree against the lockfile, cheaply', async () => {
+    const { root, counter, installCmd } = makeDepRepo({ lockfile: LOCK });
+    installNested(root, counter);
+
+    const s = spec(installCmd, { builtin: 'lockfile' });
+    const first = await ensureSetup(root, s, { quiet: true });
+    assert.equal(first.status, 'ran');
+    const ok = verifyLockfile(root);
+    assert.equal(ok.ok, true);
+    assert.match(ok.note, /2 package\(s\) present/);
+
+    // Cached, and re-checked: the second ask pays for the verifier, not installs.
+    assert.equal((await ensureSetup(root, s, { quiet: true })).status, 'cached');
+    assert.equal(countInstalls(counter), 1);
+
+    // A subtree disappears without touching the top level of node_modules.
+    fs.rmSync(path.join(root, 'node_modules/fake-dep/node_modules'), { recursive: true });
+    const v = verifyLockfile(root);
+    assert.equal(v.ok, false);
+    assert.match(v.note, /1\/2 installed package\(s\) missing/);
+
+    // So the cached install is distrusted — by the verifier, which is the only
+    // layer that could have noticed — and rebuilt. (A later verify is a later
+    // process, so the in-run memo is cleared first.)
+    resetSetupMemo();
+    let distrusted = null;
+    const third = await ensureSetup(root, s, {
+      quiet: true,
+      onRun: () => {
+        distrusted = readSetupCache(root).entries[setupKey(root, s)].invalidated;
+      },
+    });
+    assert.equal(third.status, 'ran');
+    assert.equal(countInstalls(counter), 2);
+    assert.equal(distrusted.by, 'verify');
+    assert.match(distrusted.note, /missing/);
+    const entry = readSetupCache(root).entries[setupKey(root, s)];
+    assert.match(entry.reason, /distrusted \(verify\)/);
+    assert.ok(fs.existsSync(path.join(root, 'node_modules/fake-dep/node_modules/inner/index.js')), 'and the install repaired it');
+  });
+
+  test('a verifier with nothing to compare says so, and does not force a reinstall', async () => {
+    // Real shape: express ships .npmrc with package-lock=false, so there is no
+    // lockfile to compare against. "No" here would mean reinstalling on every
+    // verify — the same symptom as a verifier that cannot run at all.
+    const { root, counter, installCmd } = makeDepRepo();
+    fs.rmSync(path.join(root, 'package-lock.json'));
+    const s = spec(installCmd, { builtin: 'lockfile' });
+    assert.deepEqual(verifyLockfile(root), { ok: null, ms: 0, note: 'no package lockfile to compare the install against' });
+
+    assert.equal((await ensureSetup(root, s, { quiet: true })).status, 'ran');
+    resetSetupMemo();
+    assert.equal((await ensureSetup(root, s, { quiet: true })).status, 'cached', 'unverifiable is not the same as false');
+    assert.equal(countInstalls(counter), 1);
+
+    // And the gap is reportable rather than silent.
+    const st = setupStatus(root, s);
+    assert.equal(st.cached, true);
+    assert.match(st.verify_unavailable, /no package-lock\.json or npm-shrinkwrap\.json/);
+  });
+
+  test('without a verifier, the same stale tree stays trusted — the boundary is explicit', async () => {
+    const { root, counter, installCmd } = makeDepRepo({ lockfile: LOCK });
+    installNested(root, counter);
+    // A different command, so this is a different install with its own key.
+    const s = spec(`${installCmd} unverified`, null);
+    assert.equal((await ensureSetup(root, s, { quiet: true })).status, 'ran');
+    fs.rmSync(path.join(root, 'node_modules/fake-dep/node_modules'), { recursive: true });
+    assert.equal(await ensureSetup(root, s, { quiet: true }).then((r) => r.status), 'cached');
+    assert.equal(countInstalls(counter), 1, 'a marker cannot see inside a directory it only hashed the names of');
+  });
+
+  test('a verifier declared in manual.yaml survives resolution and is not run as a command', async () => {
+    const { root, counter, installCmd } = makeDepRepo({ lockfile: LOCK });
+    installNested(root, counter);
+    fs.writeFileSync(
+      path.join(root, '.manual', 'manual.yaml'),
+      `schema: manual/v1\nsetup:\n  node:\n    run: ${JSON.stringify(installCmd)}\n    evidence: ["package.json", "package-lock.json"]\n    cache: ["node_modules"]\n    verify:\n      builtin: lockfile\n`,
+    );
+    const config = loadConfig(root);
+    const { specs } = resolvePrereqs({ check: { requires: ['node'] } }, config);
+    assert.equal(specs[0].spec.verifyBuiltin, 'lockfile', 'the declared verifier reaches the runner intact');
+
+    assert.equal((await ensureSetup(root, specs[0].spec, { quiet: true })).status, 'ran');
+    resetSetupMemo();
+    assert.equal((await ensureSetup(root, specs[0].spec, { quiet: true })).status, 'cached');
+    assert.equal(countInstalls(counter), 1, 'a verifier that is run as a command fails, and every verify reinstalls');
+
+    // The verifier is what notices a loss the witness cannot see.
+    fs.rmSync(path.join(root, 'node_modules/fake-dep/node_modules'), { recursive: true });
+    resetSetupMemo();
+    assert.equal((await ensureSetup(root, specs[0].spec, { quiet: true })).status, 'ran');
+    assert.equal(countInstalls(counter), 2);
+  });
+
+  test('an install another checkout verified is borrowed, and re-verified before it is', async () => {
+    const { base, root: a, counter, installCmd } = makeDepRepo({ lockfile: LOCK });
+    installNested(a, counter);
+    const store = path.join(base, 'store');
+    const prevStore = process.env.MANUAL_STORE;
+    process.env.MANUAL_STORE = store;
+    try {
+      const s = spec(installCmd, { builtin: 'lockfile' });
+      s.share = true;
+      assert.equal((await ensureSetup(a, s, { quiet: true })).status, 'ran');
+      assert.equal(countInstalls(counter), 1);
+
+      // A second checkout of the same repository: same files, same evidence,
+      // nothing installed, and this checkout's cache knows nothing.
+      const b = path.join(base, 'clone');
+      fs.cpSync(a, b, { recursive: true, filter: (src) => !src.includes('node_modules') && !src.includes(path.join('.manual', 'cache')) });
+      assert.ok(!fs.existsSync(path.join(b, 'node_modules')));
+
+      const borrowed = await ensureSetup(b, s, { quiet: true });
+      assert.equal(borrowed.status, 'adopted');
+      assert.equal(borrowed.link, a);
+      assert.equal(countInstalls(counter), 1, 'the second checkout never ran the install');
+      assert.equal(fs.readFileSync(path.join(b, 'node_modules/fake-dep/ok.txt'), 'utf8'), 'ok', 'and the tree is really there');
+      assert.equal(setupStatus(b, s).cached, true);
+
+      // A third checkout that has not adopted yet: the plan says the work is
+      // already done elsewhere, before it spends anything finding that out.
+      const c = path.join(base, 'clone-2');
+      fs.cpSync(a, c, { recursive: true, filter: (src) => !src.includes('node_modules') && !src.includes(path.join('.manual', 'cache')) });
+      assert.equal(setupStatus(c, s).cached, false);
+      assert.equal(setupStatus(c, s).borrowable_from, a);
+
+      // If the tree it would borrow is damaged, there is nothing to borrow: the
+      // store records where an install was verified, not a promise it still is.
+      fs.rmSync(path.join(a, 'node_modules/fake-dep'), { recursive: true });
+      assert.equal(setupStatus(c, s).borrowable_from, null);
+      const fresh = await ensureSetup(c, s, { quiet: true });
+      assert.equal(fresh.status, 'ran');
+      assert.equal(countInstalls(counter), 2, 'so it installs for itself instead of borrowing a broken tree');
+    } finally {
+      if (prevStore === undefined) delete process.env.MANUAL_STORE;
+      else process.env.MANUAL_STORE = prevStore;
+    }
   });
 });

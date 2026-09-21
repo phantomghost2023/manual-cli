@@ -1,6 +1,6 @@
 {
   "name": "manual-cli",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Self-verifying repository operating manual: claims with evidence inputs, provenance, trust tiers, dependency edges, traps, token-budgeted briefs, policy gates, an agent flywheel, and an MCP server.",
   "type": "module",
   "bin": {

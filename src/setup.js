@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { filesDigest, sha256 } from './hash.js';
@@ -30,6 +31,11 @@ import { nowIso, short } from './util.js';
 const DEFAULT_CACHE = ['node_modules'];
 const DEFAULT_TIMEOUT_S = 900;
 
+// The statuses that mean "the check may now run": a step that succeeded because
+// it was borrowed is a success — the directories are there and were verified
+// where they were built.
+export const SETUP_OK_STATUSES = new Set(['ran', 'cached', 'adopted']);
+
 // ---------------------------------------------------------------------------
 // Named prerequisites (declared once, in .manual/manual.yaml)
 //
@@ -52,13 +58,30 @@ const DEFAULT_TIMEOUT_S = 900;
 //     requires: node
 //     run: npm test
 //
+// Prerequisites can depend on each other (`build` needs the install first), so
+// a claim's list is expanded through those edges and ordered topologically.
 // Resolution is by name, then by inline setup, and deduplication is by
 // (command, evidence) as before — so ten claims requiring `node` pay for one
 // install, and a claim requiring both `node` and `python` pays for two, once
 // each, whatever order the claims run in.
+//
+//   setup:
+//     node:  { run: npm ci, verify: "npm ls --depth=0" }
+//     build: { run: make build, requires: [node], cache: ["dist"] }
 // ---------------------------------------------------------------------------
 
 const NAME_RE = /^[a-z0-9][a-z0-9.-]*$/;
+
+// Deduplication key for a step, independent of what it is called.
+export function specKey(spec) {
+  return `${spec.run}\0${spec.evidence.join(',')}\0${spec.cache.join(',')}`;
+}
+
+// Names as written: one name, or a list, both accepted everywhere a name is.
+export function nameList(raw) {
+  if (raw === undefined || raw === null || raw === '') return [];
+  return (Array.isArray(raw) ? raw : [raw]).map(String);
+}
 
 // A named prerequisite keeps the claim's name for it, so a failure can say
 // *which* step could not be established (`python: .venv/bin/pip install …`).
@@ -91,9 +114,61 @@ export function normalizeSetupMap(raw, file = '.manual/manual.yaml') {
       errors.push(`${file}: prerequisite "${name}".timeout_s must be a positive number of seconds`);
       continue;
     }
+    if (spec.requires !== undefined && !Array.isArray(spec.requires) && typeof spec.requires !== 'string') {
+      errors.push(`${file}: prerequisite "${name}".requires must be a name or a list of names`);
+      continue;
+    }
+    const v = normalizeVerify(spec.verify);
+    if (v.error) {
+      errors.push(`${file}: prerequisite "${name}".verify ${v.error}`);
+      continue;
+    }
+    if (spec.share !== undefined && typeof spec.share !== 'boolean') {
+      errors.push(`${file}: prerequisite "${name}".share must be true or false`);
+      continue;
+    }
     specs[name] = normalizeSetup({ setup: spec });
   }
   return { specs, errors };
+}
+
+// The declared prerequisites in dependency order: a step comes after everything
+// it requires. Cycles are reported rather than resolved silently — a cycle means
+// no order exists, and pretending otherwise would run one of the steps too early.
+// Steps inside a cycle are left out of `order` for the same reason: there is no
+// position for them, and a partial list that omits them is the truth, whereas a
+// list that contains them is a sequence that cannot be executed. Callers refuse
+// on a non-empty `cycles` anyway (see runner.js).
+export function prereqOrder(config = {}) {
+  const setup = config.setup || {};
+  const order = [];
+  const unknown = [];
+  const cycles = [];
+  const state = new Map();
+  const stack = [];
+  const visit = (name) => {
+    if (state.get(name) === 'done') return;
+    if (state.get(name) === 'visiting') {
+      cycles.push([...stack.slice(stack.indexOf(name)), name]);
+      return;
+    }
+    state.set(name, 'visiting');
+    stack.push(name);
+    for (const dep of setup[name].requires || []) {
+      if (!setup[dep]) {
+        unknown.push({ name: dep, required_by: name });
+        continue;
+      }
+      visit(dep);
+    }
+    stack.pop();
+    state.set(name, 'done');
+    order.push(name);
+  };
+  for (const name of Object.keys(setup)) visit(name);
+  const inCycle = new Set();
+  for (const cy of cycles) for (const name of cy.slice(0, -1)) inCycle.add(name);
+  return { order: order.filter((name) => !inCycle.has(name)), unknown, cycles };
 }
 
 export function declaredPrereqs(config) {
@@ -102,38 +177,108 @@ export function declaredPrereqs(config) {
 
 // The names a claim requires, in the order it lists them.
 export function requiredNames(claim) {
-  const raw = claim?.check?.requires ?? claim?.fm?.check?.requires;
-  if (raw === undefined || raw === null || raw === '') return [];
-  return (Array.isArray(raw) ? raw : [raw]).map(String);
+  return nameList(claim?.check?.requires ?? claim?.fm?.check?.requires);
 }
 
 // A claim's prerequisites, in the order they must run: the named installs it
-// requires, then its own inline setup — the specific step that builds on them.
+// requires (each expanded through its own `requires` edges), then its own inline
+// setup — the specific step that builds on them.
 export function resolvePrereqs(claim, config = {}) {
+  const setup = config.setup || {};
   const specs = [];
   const unknown = [];
-  const seen = new Set();
+  const cycles = [];
+  const done = new Set();
+  const seenKeys = new Set();
+  const stack = [];
   const push = (name, raw) => {
     if (!raw) return;
     // Normalizing here keeps the caller's shapes interchangeable: a spec from
     // manual.yaml is already normalized, a shorthand string is not, and neither
     // should decide whether deduplication works.
     const spec = normalizeSetup({ setup: raw });
-    const key = `${spec.run}\0${spec.evidence.join(',')}\0${spec.cache.join(',')}`;
-    if (seen.has(key)) return; // one claim listing the same step twice, or two names for it
-    seen.add(key);
+    const key = specKey(spec);
+    if (seenKeys.has(key)) return; // one claim listing the same step twice, or two names for it
+    seenKeys.add(key);
     specs.push({ name, spec });
   };
-  for (const name of requiredNames(claim)) {
-    const spec = config?.setup?.[name];
+  const visit = (name) => {
+    if (done.has(name)) return;
+    const spec = setup[name];
     // A name with no definition is not a skipped step, it is a typo — the
     // caller reports it rather than letting the check run unprepared.
-    if (!spec) unknown.push(name);
-    else push(name, spec);
-  }
+    if (!spec) {
+      unknown.push(name);
+      return;
+    }
+    if (stack.includes(name)) {
+      cycles.push([...stack.slice(stack.indexOf(name)), name]);
+      return;
+    }
+    stack.push(name);
+    for (const dep of spec.requires || []) visit(dep);
+    stack.pop();
+    done.add(name);
+    push(name, spec);
+  };
+  for (const name of requiredNames(claim)) visit(name);
   const inline = claim?.setup || normalizeSetup(claim?.check);
   if (inline) push(null, inline);
-  return { specs, unknown };
+  return { specs, unknown, cycles };
+}
+
+// The exact sequence a full verify would execute, deduped, claim by claim (a
+// claim's closure runs at that claim's turn). This is what `setup --plan`
+// prints, so the plan is the run and not an approximation of it.
+export function planPrereqs(claims, config = {}) {
+  const steps = [];
+  const byKey = new Map();
+  const unknown = new Map();
+  const cycles = [];
+  for (const cl of claims) {
+    const id = cl.fm?.id || null;
+    const { specs, unknown: miss, cycles: loop } = resolvePrereqs(cl, config);
+    for (const name of miss) unknown.set(name, [...(unknown.get(name) || []), id]);
+    for (const cy of loop) if (!cycles.some((c) => c.join('>') === cy.join('>'))) cycles.push(cy);
+    for (const { name, spec } of specs) {
+      const key = specKey(spec);
+      if (byKey.has(key)) {
+        const step = byKey.get(key);
+        if (id && !step.claims.includes(id)) step.claims.push(id);
+        continue;
+      }
+      const step = { name, spec, key, claims: id ? [id] : [], inline: name === null };
+      byKey.set(key, step);
+      steps.push(step);
+    }
+  }
+  return { steps, unknown: [...unknown.entries()].map(([name, claims]) => ({ name, claims })), cycles };
+}
+
+// Built-in verifiers. A command can answer "is this install still valid?", but
+// the question is the same in every repo of an ecosystem, and the obvious command
+// is too slow to run on every verify: `npm ls --depth=0` takes ~11s on a real
+// dependency tree. Comparing the installed tree against the lockfile answers it
+// with a few hundred `stat` calls instead.
+export const VERIFY_BUILTINS = new Set(['lockfile']);
+
+// `verify: "npm ls --depth=0"` is a command; `verify: { builtin: lockfile }` is
+// one of ours. The map form is required for builtins, so a bare word is never
+// ambiguous.
+export function normalizeVerify(raw) {
+  if (raw === undefined || raw === null) return { verify: null, builtin: null };
+  if (typeof raw === 'string') {
+    if (!raw.trim()) return { error: 'must be a command that exits 0 for a valid install' };
+    return { verify: raw, builtin: null };
+  }
+  if (typeof raw === 'object' && !Array.isArray(raw)) {
+    const name = raw.builtin;
+    if (!VERIFY_BUILTINS.has(name)) {
+      return { error: `builtin must be one of: ${[...VERIFY_BUILTINS].join(', ')}` };
+    }
+    return { verify: `builtin:${name}`, builtin: name, builtinOptions: { ...raw, builtin: undefined } };
+  }
+  return { error: 'must be a command, or { builtin: lockfile }' };
 }
 
 export function normalizeSetup(check) {
@@ -141,12 +286,87 @@ export function normalizeSetup(check) {
   if (!raw) return null;
   const spec = typeof raw === 'string' ? { run: raw } : { ...raw };
   const cache = spec.cache === undefined ? DEFAULT_CACHE : spec.cache;
+  // Idempotent: a spec that has already been normalized carries verifyBuiltin,
+  // and `verify` in its `builtin:name` form. Re-deriving the builtin from that
+  // string is impossible by design (the map form exists precisely so a bare word
+  // is never ambiguous), and doing it anyway silently downgraded the builtin to
+  // a shell command that always fails — found on a real repo, where every cached
+  // install was distrusted and reinstalled after `builtin:lockfile: command not
+  // found`. Normalizing twice must be the same as normalizing once.
+  const v = spec.verifyBuiltin !== undefined && spec.verifyBuiltin !== null
+    ? { verify: spec.verify ?? `builtin:${spec.verifyBuiltin}`, builtin: spec.verifyBuiltin }
+    : normalizeVerify(spec.verify);
   return {
     run: String(spec.run),
     evidence: Array.isArray(spec.evidence) ? spec.evidence.map(String) : [],
     cache: Array.isArray(cache) ? cache.map(String) : [],
     timeout_s: Number(spec.timeout_s) > 0 ? Number(spec.timeout_s) : DEFAULT_TIMEOUT_S,
+    // A prerequisite can depend on another one (`build` needs `node`), be
+    // re-checked before its cached result is trusted, and be borrowed from
+    // another checkout on this machine that already installed it.
+    requires: nameList(spec.requires),
+    verify: v.verify || null,
+    verifyBuiltin: v.builtin || null,
+    share: spec.share === true,
   };
+}
+
+// The `lockfile` builtin: every package the lockfile says should be installed is
+// actually installed. It answers the question the cache key cannot — an install
+// made from *this* lockfile can still have lost a subtree in the meantime (an
+// interrupted `npm ci`, a deletion, an antivirus quarantine) — in a few hundred
+// `stat` calls rather than by walking the tree.
+export function lockfileIn(root) {
+  return ['package-lock.json', 'npm-shrinkwrap.json'].find((f) => fs.existsSync(path.join(root, f))) || null;
+}
+
+// Three answers, not two: yes, no, and "there is nothing here to compare
+// against". Found on a real repository (express ships `.npmrc` with
+// `package-lock=false`), where "no" would mean distrusting every cached install
+// and reinstalling it on every verify — the same symptom as a verifier that
+// cannot run at all, for a repo that is perfectly fine.
+export function verifyLockfile(root) {
+  const lockName = lockfileIn(root);
+  if (!lockName) return { ok: null, note: 'no package lockfile to compare the install against', ms: 0 };
+  let lock;
+  try {
+    lock = JSON.parse(fs.readFileSync(path.join(root, lockName), 'utf8'));
+  } catch (e) {
+    return { ok: null, note: `unreadable ${lockName}: ${e.message}`, ms: 0 };
+  }
+  const t0 = Date.now();
+  const declared = Object.keys(lock.packages || {}).filter((k) => k && k.startsWith('node_modules/'));
+  const missing = declared.filter((k) => !fs.existsSync(path.join(root, k)));
+  const ms = Date.now() - t0;
+  if (missing.length) {
+    return {
+      ok: false,
+      ms,
+      note: `${missing.length}/${declared.length} installed package(s) missing, e.g. ${missing[0]}`,
+      missing: missing.slice(0, 5),
+    };
+  }
+  return { ok: true, ms, note: `${declared.length} package(s) present, matching ${lockName}` };
+}
+
+// Run a prerequisite's verifier and describe the outcome. Command verifiers are
+// capped at two minutes: this check runs on the path where the point is to avoid
+// work, so a verifier that hangs is worse than a verifier that says no.
+export function runVerifier(root, spec) {
+  if (spec.verifyBuiltin === 'lockfile') return verifyLockfile(root);
+  if (!spec.verify) return null;
+  const r = execInRoot(root, spec.verify, Math.min(spec.timeout_s, 120));
+  return { ok: r.status === 0, ms: r.ms, note: r.status === 0 ? `exit 0 in ${r.ms}ms` : r.note };
+}
+
+// Whether a declared verifier can answer at all *here* — a stat, so it is cheap
+// enough for `manual setup` and the plan to report it without running anything.
+export function verifierAvailable(root, spec) {
+  if (spec.verifyBuiltin === 'lockfile') {
+    const f = lockfileIn(root);
+    return f ? null : 'no package-lock.json or npm-shrinkwrap.json in this checkout';
+  }
+  return null;
 }
 
 // Files that decide what an install would produce, when a claim doesn't say.
@@ -189,19 +409,139 @@ function writeSetupCache(root, data) {
   fs.writeFileSync(p, JSON.stringify(data, null, 2) + '\n');
 }
 
+// ---------------------------------------------------------------------------
+// Trusting a cached install
+//
+// "This ran once" is not evidence that the tree is still there, still complete,
+// or still the one the lockfile describes. Three layers, cheapest first:
+//   1. the declared directories exist (a stat each) — the oldest check, which
+//      misses a tree that was emptied in place;
+//   2. a witness: the immediate entries of those directories, hashed and
+//      counted, which catches a wiped, replaced, or half-installed tree at the
+//      cost of one readdir;
+//   3. `verify:` — an optional command the prerequisite can answer with
+//      ("npm ls --depth=0"), and the only thing that can tell a stale tree from
+//      a complete one.
+// A cached result that fails a layer is distrusted and rebuilt, and the layer
+// that caught it is recorded, so a surprise reinstall is explainable.
+// ---------------------------------------------------------------------------
+
+export function witnessFor(root, dirs) {
+  const out = {};
+  for (const rel of dirs) {
+    let names;
+    try {
+      names = fs.readdirSync(path.join(root, rel)).sort();
+    } catch {
+      return null; // a declared directory that isn't there has no witness
+    }
+    out[rel] = { n: names.length, sig: sha256(names.join('\0')).slice(0, 16) };
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+// An entry with no witness predates this check: fall back to layer 1.
+export function witnessMatches(root, witness) {
+  if (!witness) return true;
+  const now = witnessFor(root, Object.keys(witness));
+  if (!now) return false;
+  for (const [rel, w] of Object.entries(witness)) {
+    const cur = now[rel];
+    if (!cur || cur.n !== w.n || cur.sig !== w.sig) return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Sharing a verified install with other checkouts on this machine
+//
+// The cache is per checkout, so a second clone installs the same tree again from
+// scratch. The store records where a verified install lives (not a copy of it),
+// keyed by platform + command + evidence content: a checkout whose evidence
+// matches can link the other checkout's directories instead of installing. It is
+// opt-in per prerequisite (`share: true`) because the tree is then genuinely
+// shared — mutating it in one checkout mutates it in the other, exactly as the
+// sandbox's own dependency links do.
+// ---------------------------------------------------------------------------
+
+export function storeFilePath() {
+  const home = process.env.MANUAL_STORE || path.join(os.homedir(), '.cache', 'manual-cli');
+  return path.join(home, 'setup-store.json');
+}
+
+export function readStore() {
+  try {
+    const d = JSON.parse(fs.readFileSync(storeFilePath(), 'utf8'));
+    return d && d.results ? d : { version: 1, results: {} };
+  } catch {
+    return { version: 1, results: {} };
+  }
+}
+
+function writeStore(data) {
+  const p = storeFilePath();
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(data, null, 2) + '\n');
+}
+
+// Platform is part of the identity: a Windows node_modules is not a Linux one.
+export function storeKey(root, spec) {
+  const patterns = spec.evidence.length ? spec.evidence : defaultSetupEvidence(root);
+  const d = filesDigest(root, patterns);
+  return sha256(`${process.platform}\0${spec.run}\0${d.digest}`).slice(0, 32);
+}
+
+export function recordStore(root, spec, witness) {
+  const data = readStore();
+  data.results[storeKey(root, spec)] = {
+    run: spec.run,
+    platform: process.platform,
+    checkout: root,
+    at: nowIso(),
+    witness,
+    verify: spec.verify,
+  };
+  writeStore(data);
+}
+
+// An install on this machine that this checkout can borrow — verified *now*,
+// because the checkout that made it may have moved on since.
+export function storeLookup(root, spec) {
+  const key = storeKey(root, spec);
+  const entry = readStore().results[key];
+  if (!entry?.checkout) return null;
+  if (path.resolve(entry.checkout) === path.resolve(root)) return null;
+  if (!fs.existsSync(entry.checkout)) return null;
+  if (entry.witness && !witnessMatches(entry.checkout, entry.witness)) return null;
+  return { key, entry, source: entry.checkout };
+}
+
 // What would happen if this setup were needed right now — used by `manual
-// setup`, doctor and the report, and free of side effects: no install runs.
+// setup`, doctor and the report. Free of side effects: nothing is installed, and
+// the expensive layer (a `verify:` command) is not run here; the witness is a
+// readdir, so it is worth answering with.
 export function setupStatus(root, spec) {
   const key = setupKey(root, spec);
   const entry = readSetupCache(root).entries[key] || null;
   const missing = spec.cache.filter((d) => !fs.existsSync(path.join(root, d)));
+  const witnessOk = entry?.witness ? witnessMatches(root, entry.witness) : null;
+  const borrowed = !entry?.ok && spec.share ? storeLookup(root, spec) : null;
   return {
     key,
     run: spec.run,
     cache: spec.cache,
-    cached: Boolean(entry?.ok) && missing.length === 0,
+    cached: Boolean(entry?.ok) && missing.length === 0 && witnessOk !== false,
     entry,
     missing,
+    witness_ok: witnessOk,
+    verify: spec.verify,
+    // A declared verifier that cannot run here is reported rather than silently
+    // skipped: "verified" and "unverifiable" are different facts about a tree.
+    verify_unavailable: verifierAvailable(root, spec),
+    requires: spec.requires,
+    share: spec.share,
+    // A step that is not satisfied here but is available from another checkout.
+    borrowable_from: borrowed?.source || null,
   };
 }
 
@@ -214,6 +554,50 @@ function setupEnv(root) {
   const env = { ...process.env, MANUAL_ROOT: root, MANUAL_SETUP: '1' };
   delete env.NODE_TEST_CONTEXT;
   return env;
+}
+
+// One place for "run a command for this prerequisite", so the install and the
+// `verify:` command cannot drift apart in env, cwd or error shape.
+function execInRoot(root, cmd, timeoutS) {
+  const t0 = Date.now();
+  const r = spawnSync('bash', ['-e', '-u', '-o', 'pipefail', '-c', cmd], {
+    cwd: root,
+    encoding: 'buffer',
+    timeout: timeoutS * 1000,
+    env: setupEnv(root),
+    maxBuffer: 8 * 1024 * 1024,
+  });
+  const dec = (b) => (Buffer.isBuffer(b) ? b.toString('utf8') : String(b ?? ''));
+  return {
+    ms: Date.now() - t0,
+    status: r.status,
+    stdout: dec(r.stdout),
+    stderr: dec(r.stderr),
+    timedOut: r.status === null && r.error?.code === 'ETIMEDOUT',
+    note: short(dec(r.stderr) || dec(r.stdout) || `exit ${r.status}`, 300),
+  };
+}
+
+// Borrow another checkout's verified install by linking its directories. Refuses
+// on any doubt: a missing source directory, or a directory that already exists
+// here (linking over one would discard it, and a symlink over a real tree is how
+// you lose a node_modules).
+function adopt(root, spec, hit) {
+  if (spec.cache.length === 0) return null; // nothing to link, nothing to check
+  const linked = [];
+  for (const rel of spec.cache) {
+    const src = path.join(hit.source, rel);
+    const dst = path.join(root, rel);
+    if (!fs.existsSync(src) || fs.existsSync(dst)) return null;
+    try {
+      fs.mkdirSync(path.dirname(dst), { recursive: true });
+      fs.symlinkSync(src, dst, process.platform === 'win32' ? 'junction' : 'dir');
+      linked.push(rel);
+    } catch {
+      return null;
+    }
+  }
+  return linked;
 }
 
 export async function ensureSetup(root, spec, { force = false, quiet = false, onRun = null } = {}) {
@@ -231,58 +615,118 @@ export async function ensureSetup(root, spec, { force = false, quiet = false, on
   const entry = cache.entries[key];
   const missing = spec.cache.filter((d) => !fs.existsSync(path.join(root, d)));
 
-  // Cached and still present: the premise is already established.
+  // Layer 1: the directories are there. Layers 2 and 3 ask whether they are the
+  // ones we installed — a wiped tree, or one the lockfile no longer describes.
   if (!force && entry?.ok && missing.length === 0) {
-    const out = {
-      key,
-      status: 'cached',
-      run: spec.run,
-      ms: entry.ms ?? null,
-      at: entry.at,
-      note: `already satisfied at ${entry.at}${entry.ms != null ? ` (${entry.ms}ms)` : ''}`,
+    const witnessOk = witnessMatches(root, entry.witness);
+    const check = witnessOk ? runVerifier(root, spec) : null;
+    // `ok === null` is the verifier's "nothing to compare against": it is not a
+    // reason to rebuild, and treating it as one would make every verify reinstall
+    // on any repo without the file the verifier needs.
+    if (witnessOk && (!check || check.ok !== false)) {
+      const out = {
+        key,
+        status: 'cached',
+        run: spec.run,
+        ms: entry.ms ?? null,
+        at: entry.at,
+        verified_at: check ? nowIso() : entry.verified_at || null,
+        note: `already satisfied at ${entry.at}${entry.ms != null ? ` (${entry.ms}ms)` : ''}`,
+      };
+      memo.set(memoKey, out);
+      return out;
+    }
+    entry.invalidated = {
+      at: nowIso(),
+      by: witnessOk ? 'verify' : 'witness',
+      note: witnessOk ? (check?.note || 'the verifier said no') : 'the declared directories changed since it ran',
     };
-    memo.set(memoKey, out);
-    return out;
+    cache.entries[key] = entry;
+    writeSetupCache(root, cache);
+    // Announced here rather than at the install, because the answer may instead
+    // be to borrow another checkout's tree — and a reinstall nobody can explain
+    // reads as a cache that does not work.
+    if (!quiet) {
+      console.log(`  ⚙ setup: ${spec.run} (cached install distrusted — ${entry.invalidated.by}: ${short(entry.invalidated.note, 160)})`);
+    }
+  }
+
+  // A verified install of the same command and evidence, made by another
+  // checkout on this machine, costs a symlink instead of an install.
+  if (!force && spec.share) {
+    const hit = storeLookup(root, spec);
+    const linked = hit ? adopt(root, spec, hit) : null;
+    if (linked) {
+      const at = nowIso();
+      cache.entries[key] = {
+        run: spec.run,
+        ok: true,
+        at,
+        // Not zero: the time this checkout spent, which is the honest number for
+        // a borrowed tree.
+        ms: 0,
+        dirs: spec.cache,
+        witness: hit.entry.witness,
+        adopted_from: hit.source,
+        reason: 'borrowed from another checkout',
+      };
+      writeSetupCache(root, cache);
+      const out = {
+        key,
+        status: 'adopted',
+        run: spec.run,
+        ms: 0,
+        at,
+        link: hit.source,
+        note: `borrowed ${linked.join(', ')} from ${hit.source}`,
+      };
+      memo.set(memoKey, out);
+      if (!quiet) console.log(`  ⚙ setup: ${spec.run} — borrowed from ${hit.source} (verified there, never installed here)`);
+      return out;
+    }
   }
 
   if (onRun) onRun({ key, run: spec.run, missing });
   if (!quiet) {
+    // "Why now?" has four different answers, and a reinstall nobody can explain
+    // is indistinguishable from a cache that does not work. Found on a real repo:
+    // the entry was valid and the declared directories were present, so the honest
+    // reason was the verifier's (or `--force`) — and it printed " missing".
     const why = entry?.ok
-      ? `${missing.join(', ')} missing`
+      ? entry.invalidated
+        ? 'rebuilding the distrusted install'
+        : missing.length
+          ? `${missing.join(', ')} missing`
+          : 'forced'
       : entry
-        ? `previous attempt failed`
+        ? 'previous attempt failed'
         : 'not yet run here';
     console.log(`  ⚙ setup: ${spec.run} (${why})`);
   }
 
-  const t0 = Date.now();
-  const r = spawnSync('bash', ['-e', '-u', '-o', 'pipefail', '-c', spec.run], {
-    cwd: root,
-    encoding: 'buffer',
-    timeout: spec.timeout_s * 1000,
-    env: setupEnv(root),
-    maxBuffer: 8 * 1024 * 1024,
-  });
-  const ms = Date.now() - t0;
-  const dec = (b) => (Buffer.isBuffer(b) ? b.toString('utf8') : String(b ?? ''));
-  const stdout = dec(r.stdout);
-  const stderr = dec(r.stderr);
-  const timedOut = r.status === null && r.error?.code === 'ETIMEDOUT';
+  const r = execInRoot(root, spec.run, spec.timeout_s);
+  const witness = r.status === 0 ? witnessFor(root, spec.cache) : null;
 
   if (r.status === 0) {
+    // Having just run, the tree is by definition the one the command produced —
+    // so `verify:` is recorded rather than paid for. It pays for itself the next
+    // time this install is reused.
     cache.entries[key] = {
       run: spec.run,
       ok: true,
       at: nowIso(),
-      ms,
+      ms: r.ms,
       dirs: spec.cache,
+      witness,
+      verify: spec.verify,
       // Recorded so a later reader can tell a first install from a reinstall.
-      reason: entry?.ok ? 'deps missing' : entry ? 'previous attempt failed' : 'not yet run here',
+      reason: entry?.ok ? (entry.invalidated ? `cached install distrusted (${entry.invalidated.by})` : 'deps missing') : entry ? 'previous attempt failed' : 'not yet run here',
     };
     writeSetupCache(root, cache);
-    const out = { key, status: 'ran', run: spec.run, ms, at: cache.entries[key].at, note: `${ms}ms` };
+    if (spec.share) recordStore(root, spec, witness);
+    const out = { key, status: 'ran', run: spec.run, ms: r.ms, at: cache.entries[key].at, note: `${r.ms}ms` };
     memo.set(memoKey, out);
-    if (!quiet) console.log(`  ⚙ setup: ok (${ms}ms)`);
+    if (!quiet) console.log(`  ⚙ setup: ok (${r.ms}ms)`);
     return out;
   }
 
@@ -293,19 +737,19 @@ export async function ensureSetup(root, spec, { force = false, quiet = false, on
     run: spec.run,
     ok: false,
     at: nowIso(),
-    ms,
+    ms: r.ms,
     dirs: spec.cache,
-    note: short(stderr || stdout || (timedOut ? 'timed out' : `exit ${r.status}`), 300),
+    note: r.note || (r.timedOut ? 'timed out' : `exit ${r.status}`),
   };
   writeSetupCache(root, cache);
   const out = {
     key,
-    status: timedOut ? 'timeout' : 'failed',
+    status: r.timedOut ? 'timeout' : 'failed',
     run: spec.run,
-    ms,
+    ms: r.ms,
     exit: r.status,
-    timedOut,
-    note: short(stderr || stdout || `exit ${r.status}`, 300),
+    timedOut: r.timedOut,
+    note: r.note || `exit ${r.status}`,
   };
   memo.set(memoKey, out);
   return out;

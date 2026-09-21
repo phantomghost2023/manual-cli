@@ -19,7 +19,7 @@ import { buildGraph, graphToJson, toDot, toMermaid, printGraphSummary } from './
 import { writeReport } from './report.js';
 import { serveCommand } from './serve.js';
 import { loadManual } from './claims.js';
-import { declaredPrereqs, ensureSetup, requiredNames, resolvePrereqs, setupKey, setupStatus } from './setup.js';
+import { declaredPrereqs, ensureSetup, planPrereqs, requiredNames, resolvePrereqs, setupKey, setupStatus } from './setup.js';
 import { short } from './util.js';
 import { buildTimeline, describeTimeline, fmtDuration, fmtWhen, sparkline } from './timeline.js';
 import { diagnoseSeries, seriesEvents } from './observe.js';
@@ -52,7 +52,8 @@ Usage:
                 [--setup-force] [--json]   # prerequisites: see the setup command
   manual brief  [--root <dir>] [--budget N] [--json] [files...]
   manual enforce [--root <dir>] [--stage pre-commit|pr]
-  manual setup  [--root <dir>] [--force] [--all] [--claim <id>] [--json]  # declared prerequisites
+  manual setup  [--root <dir>] [--plan] [--force] [--all] [--claim <id>] [--json]
+                # declared prerequisites; --plan prints the ordered, deduped plan
   manual observe [--root <dir>]          # flywheel: measurements -> inbox candidates
   manual doctor [--root <dir>]           # manual health report
   manual init   [--root <dir>] [--dry-run] [--no-probe]   # discover + scaffold .manual/
@@ -294,6 +295,58 @@ export async function main(argv = []) {
       // --force warms what claims need. A declared install no claim references
       // is a fact about the repo, not a request to run it: `--all` says so.
       const all = rest.includes('--all');
+
+      // --plan answers the question the inventory cannot: in what order, and how
+      // many installs, before anything runs at all.
+      if (rest.includes('--plan')) {
+        const plan = planPrereqs(claims, config);
+        const steps = plan.steps.map((s) => {
+          const st = setupStatus(root, s.spec);
+          return {
+            name: s.name,
+            run: s.spec.run,
+            requires: s.spec.requires,
+            inline: s.inline,
+            claims: s.claims,
+            cached: st.cached,
+            missing: st.missing,
+            verify: s.spec.verify,
+            verify_unavailable: st.verify_unavailable,
+            share: s.spec.share,
+            borrowable_from: st.borrowable_from,
+          };
+        });
+        const broken = steps.filter((s) => !s.cached).length + plan.unknown.length + plan.cycles.length;
+        if (json) {
+          console.log(JSON.stringify({ plan: steps, unknown: plan.unknown, cycles: plan.cycles, declared: declaredPrereqs(config).map((d) => d.name) }, null, 2));
+        } else {
+          console.log(c.bold(`prerequisite plan — ${steps.length} step(s), ${claims.length} claim(s), in the order a full verify runs them\n`));
+          steps.forEach((s, i) => {
+            const label = `${s.name || '(inline)'} → ${s.run}`;
+            // "Satisfied here" is the cheap answer (a stat, a readdir) and is
+            // honest about it: a step that declares a verifier is re-checked
+            // when it is actually used, and the plan says so rather than
+            // implying the tree was inspected.
+            const state = s.cached
+              ? c.green(s.verify ? `satisfied here (re-checked with ${s.verify} before use)` : 'satisfied here')
+              : s.borrowable_from
+                ? c.green('can be borrowed')
+                : c.amber('will run');
+            const deps = s.requires.length ? c.grey(` needs ${s.requires.join(', ')}`) : '';
+            console.log(`  ${i + 1}. ${label}${deps}  ${c.grey(s.claims.join(', '))}  ${state}`);
+            if (!s.cached && s.verify) console.log(c.grey(`       re-checked with: ${s.verify}`));
+            // A verifier that cannot run here is not a satisfied step either, and
+            // saying so is the difference between "checked" and "unverifiable".
+            if (s.verify_unavailable) console.log(c.grey(`       ⚠ ${s.verify} cannot run here: ${s.verify_unavailable}`));
+          });
+          for (const u of plan.unknown) console.log(c.red(`  ✖ ${u.name} is required by ${u.claims.join(', ')} but nothing declares it`));
+          for (const cy of plan.cycles) console.log(c.red(`  ✖ cycle: ${cy.join(' → ')}`));
+          const declaredOnly = declaredPrereqs(config).filter((d) => !steps.some((s) => s.name === d.name));
+          for (const d of declaredOnly) console.log(c.grey(`  • ${d.name} (${d.spec.run}) is declared and no claim requires it`));
+          console.log(c.grey(`\n${steps.length - broken} satisfied, ${broken} to establish — verify pays for each once, in this order.`));
+        }
+        return broken ? 1 : 0;
+      }
       const out = [];
       let failed = 0;
       for (const g of groups.values()) {
@@ -314,6 +367,7 @@ export async function main(argv = []) {
               : st.entry
                 ? `last attempt failed: ${short(st.entry.note, 120)}`
                 : 'not satisfied on this machine yet'}${st.missing.length ? ` · missing: ${st.missing.join(', ')}` : ''}`));
+            if (st.verify_unavailable) console.log(c.grey(`    ⚠ ${st.verify} cannot run here: ${st.verify_unavailable}`));
           }
           continue;
         }

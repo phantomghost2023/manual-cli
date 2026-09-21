@@ -44,7 +44,7 @@ node bin/manual.js verify --root /path/to/repo --force
 | Command | What it does |
 |---|---|
 | `verify [--force] [--diff [base]] [--only <ids>] [--no-setup] [--setup-force]` | Run checks (skipping claims whose evidence digests are unchanged and within TTL), stamp `state.json`, exit 1 if anything is broken or held back by an unmet prerequisite. `--diff` verifies only claims relevant to changed files, plus all policies and dependency closure. `--only` restricts the run to named claims plus their transitive dependencies — a claim whose deps are unstamped would otherwise report `blocked`, which says nothing about the claim. `--no-setup` trusts the environment (CI installs its own dependencies); `--setup-force` re-runs a prerequisite the cache considers done. |
-| `setup [--force] [--all] [--claim <id>] [--json]` | What the manual needs installed before it can say anything: every prerequisite declared in `manual.yaml`, deduplicated by command, with the claims that reference it and whether this machine has satisfied it. `--force` runs what claims need, `--all` includes declared steps no claim references, `--claim` narrows to one claim. Listing installs nothing. Exits 1 on a failed install or a prerequisite some claim requires but nobody declares. |
+| `setup [--plan] [--force] [--all] [--claim <id>] [--json]` | What the manual needs installed before it can say anything: every prerequisite declared in `manual.yaml`, deduplicated by command, with the claims that reference it and whether this machine has satisfied it. `--plan` prints the ordered, deduped sequence a full verify would execute — computed through the `requires` edges between steps — without running any of it; it exits 1 while any step is unsatisfied, so it works as a CI preflight. `--force` runs what claims need, `--all` includes declared steps no claim references, `--claim` narrows to one claim. Listing installs nothing. Exits 1 on a failed install or a prerequisite some claim requires but nobody declares. |
 | `brief [--budget N] [files...]` | Token-budgeted briefing: claims relevant to the files in play, weighted by priority × glob specificity × trust tier; traps score double; `when: true` claims always included. |
 | `enforce [--stage pre-commit\|pr]` | Runs every policy claim's check as a gate. The claim's check IS the gate — enforcement and documentation are the same object and cannot drift. |
 | `observe` | Reads verify history in `state.json`, writes inbox candidates when measurements diverge from claim bounds: *tighten* (the bound sits far above what runs cost) or *relax* (the bound itself broke the claim). Proposed bounds respect the tail — at least 3× the median, 1.5× p90, and 1.1× the worst run seen — and it refuses to propose a tightening the observed tail would violate. Every proposal carries a *diagnosis* of why the series is spiky (cold start, trend, outlier, two clusters, correlated with free memory or machine load, cold-cache after an evidence change, or a single test dominating the suite), because naming the cause changes the right action. It also reports candidates that have gone *stale* (evidence moved since they were written). |
@@ -250,6 +250,92 @@ check:
   installs dependencies itself) — and refuses to call a claim broken when the
   prerequisite it declares is visibly absent. `--setup-force` re-runs an install
   the cache considers done.
+
+One step usually sits on another: a build needs the install, codegen needs the
+build. Writing the edge down means the order is computed instead of hand-kept,
+so a claim that lists its requirements in the wrong order still runs them in the
+only order that works.
+
+```yaml
+setup:
+  node:  { run: npm ci }
+  build:
+    run: make build
+    requires: [node]          # the install comes first, whatever a claim says
+    cache: ["dist"]
+```
+
+`manual setup --plan` prints the ordered, deduped sequence *before* anything
+runs — how many installs a full verify will pay for, in what order, and which
+claims each one is for:
+
+```console
+$ manual setup --plan
+prerequisite plan — 1 step(s), 1 claim(s), in the order a full verify runs them
+
+  1. node → npm install  tests.suite  will run
+       re-checked with: builtin:lockfile
+
+0 satisfied, 1 to establish — verify pays for each once, in this order.
+```
+
+A cycle is refused (`prerequisite cycle a → b → a — no order satisfies it`)
+rather than resolved into a sequence that cannot run, and the steps inside it
+are left out of the plan's order for the same reason. A dependency on a name
+nobody declares is reported against the step that wanted it. Exit status 1 while
+anything is unsatisfied makes `manual setup --plan` usable as a CI preflight.
+
+#### A satisfied prerequisite is verified, not merely remembered
+
+"It ran once" is not evidence that the tree is still there. Three layers decide,
+cheapest first: the declared directories exist (a stat each); a **witness** of
+their immediate entries (a readdir, which catches a wiped or replaced tree); and
+`verify:` — the layer that can tell a stale tree from a complete one.
+
+```yaml
+setup:
+  node:
+    run: npm ci
+    evidence: ["package.json", "package-lock.json"]
+    cache: ["node_modules"]
+    verify:
+      builtin: lockfile        # every package the lockfile names is installed
+    share: true                # other checkouts on this machine may borrow it
+```
+
+- **`builtin: lockfile`** answers the question a marker cannot — is this install
+  still the one the lockfile describes? — by comparing the installed tree
+  against `package-lock.json` / `npm-shrinkwrap.json` in a few hundred `stat`
+  calls. On a 403-package express tree that is **~64ms**; the obvious command,
+  `npm ls --depth=0`, takes **10.9s**, which is why the easy answer was never
+  being run. A `verify:` command is still accepted for other ecosystems; the
+  map form is required for builtins so a bare word is never ambiguous.
+- **Yes, no, and "nothing to compare against" are different answers.** A repo can
+  ship `.npmrc` with `package-lock=false` (express does) and commit no lockfile
+  at all; treating that as "no" would reinstall on every verify for a repository
+  that is perfectly fine. It is reported instead — `⚠ builtin:lockfile cannot run
+  here: no package-lock.json or npm-shrinkwrap.json in this checkout` in `manual
+  setup` and in the plan — because "unverifiable" and "verified" are different
+  facts about a tree. The builtin is only as good as the lockfile's provenance.
+- **A distrusted install is rebuilt, and the reason is printed**:
+
+  ```console
+  ⚙ setup: npm install (cached install distrusted — verify: 3/403 installed package(s) missing, e.g. node_modules/mocha/node_modules/brace-expansion)
+  ⚙ setup: npm install (rebuilding the distrusted install)
+  ```
+
+  The witness alone could not have seen this: losing `node_modules/mocha/node_modules`
+  does not change the immediate contents of `node_modules`. Without a verifier
+  the same stale tree stays trusted — that boundary is deliberate, and the plan
+  says so out loud (`satisfied here (re-checked with builtin:lockfile before use)`).
+- **`share: true` lets another checkout borrow a verified tree** instead of
+  installing it again: the store records *where* an install was verified (not a
+  copy of it), keyed by platform + command + evidence content, and a checkout
+  whose evidence matches links the other's directories. It is opt-in because the
+  tree is then genuinely shared — mutating it in one checkout mutates it in the
+  other. The record is re-verified *now*, at the moment of borrowing: damage the
+  source tree and the next checkout installs for itself rather than inheriting
+  the damage.
 
 ### Evidence & incremental verify
 

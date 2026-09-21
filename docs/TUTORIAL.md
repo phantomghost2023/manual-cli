@@ -97,7 +97,8 @@ probing discovered candidates before proposing them…
 From then on the install is part of the claim's premise, not a surprise:
 
 ```bash
-manual setup                  # declared prerequisites, who needs them, what this machine has
+manual setup                   # declared prerequisites, who needs them, what this machine has
+manual setup --plan            # the ordered sequence a full verify would run, and none of it is run
 manual setup --force           # install what claims need, now instead of waiting for verify
 manual setup --all             # also run declared steps no claim references
 manual verify --no-setup       # trust the environment (CI already installed)
@@ -106,6 +107,41 @@ manual verify --no-setup       # trust the environment (CI already installed)
 The install runs **once per command+evidence pair**, not once per verify, and if
 it cannot complete the claim is `blocked` — untested, not disproven — so a laptop
 without network never demotes a claim that was true on three other machines.
+
+Two things make a *satisfied* install trustworthy rather than merely remembered.
+Steps can depend on each other (`build: { requires: [node] }`), so the order is
+computed, and `manual setup --plan` shows it before paying for it:
+
+```console
+$ manual setup --plan
+prerequisite plan — 2 step(s), 3 claim(s), in the order a full verify runs them
+
+  1. node → npm install  tests.suite, build.bundle  satisfied here (re-checked with builtin:lockfile before use)
+  2. build → make build  tests.suite  will run  needs node
+
+1 satisfied, 1 to establish — verify pays for each once, in this order.
+```
+
+And `verify:` answers "is this install still the one the lockfile describes?" —
+cheaply, with the builtin:
+
+```yaml
+setup:
+  node:
+    run: npm install
+    evidence: ["package.json", "package-lock.json"]
+    cache: ["node_modules"]
+    verify: { builtin: lockfile }   # 64ms on a 403-package tree
+    share: true                     # other checkouts on this machine may borrow it
+```
+
+When it says no, the reinstall explains itself instead of looking like a cache
+that does not work:
+
+```console
+⚙ setup: npm install (cached install distrusted — verify: 3/403 installed package(s) missing, e.g. node_modules/mocha/node_modules/brace-expansion)
+⚙ setup: npm install (rebuilding the distrusted install)
+```
 
 ## 4. Use it daily
 

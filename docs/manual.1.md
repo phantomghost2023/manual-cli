@@ -26,16 +26,20 @@ verify [--force] [--diff [base]] [--only <ids>] [--no-setup] [--setup-force]
     refuses to call a claim broken when the prerequisite it declares is
     visibly absent; --setup-force re-runs an install the cache considers done.
 
-setup [--force] [--all] [--claim <id>] [--json]
+setup [--plan] [--force] [--all] [--claim <id>] [--json]
     What the manual needs installed before it can say anything: every
     prerequisite declared under `setup:` in .manual/manual.yaml, deduplicated by
     (command, evidence), plus any inline check.setup a claim carries — with the
     claims that reference each one, whether this machine has satisfied it, when
     it last ran, and how long it took. Listing is free — nothing is installed.
-    --force runs what claims require (the same plumbing init and verify use),
-    --all also runs declared steps no claim references, --claim narrows to one
-    claim's prerequisites. Exit 1 if an install fails or times out, or if a
-    claim requires a name nothing declares.
+    --plan prints the ordered, deduplicated sequence a full verify would execute
+    — expanded through the `requires` edges between steps, with the claims each
+    step is for and whether it is satisfied here or can be borrowed — and runs
+    none of it. It exits 1 while any step is unsatisfied, so it is usable as a
+    CI preflight. --force runs what claims require (the same plumbing init and
+    verify use), --all also runs declared steps no claim references, --claim
+    narrows to one claim's prerequisites. Exit 1 if an install fails or times
+    out, or if a claim requires a name nothing declares.
 
 brief [--budget N] [--at <ref>] [--json] [files...]
     Token-budgeted briefing for the files in play. Weighted by priority x
@@ -186,6 +190,35 @@ order the claim lists them, then the claim's own inline step, once per (command,
 evidence) pair rather than once per verify, in the checkout rather than the
 sandbox, before the clock starts — so `measured_ms` stays the check's own
 runtime and `setup_ms` records the install separately in `history`.
+
+A prerequisite can depend on another one, and the order is then computed from a
+graph rather than hand-kept:
+
+    setup:
+      node:  { run: npm ci }
+      build: { run: make build, requires: [node], cache: ["dist"] }
+
+A step runs after everything it requires, so a claim that lists `[build, node]`
+still installs before it builds, and `requires` inside `manual.yaml` is validated
+when the config is read: a cycle is a load error (`verify` exits 2, `doctor`
+reports it) and blocks the claims that reach it, because no order satisfies a
+cycle and inventing one would run a step too early. Steps inside a cycle are left
+out of the computed order for the same reason. `manual setup --plan` prints the
+resulting sequence without executing it.
+
+Two keys make a satisfied prerequisite checkable rather than merely remembered.
+`verify:` is re-run before a cached install is trusted — a command that exits 0,
+or the builtin `{ builtin: lockfile }`, which compares the installed tree against
+`package-lock.json`/`npm-shrinkwrap.json` by stat (64ms against a 403-package
+tree, where `npm ls --depth=0` takes ~11s). A cache entry whose declared
+directories are present, whose witness still matches and whose verifier still
+says yes is reused; one that fails a layer is recorded as distrusted — with the
+layer that caught it, printed on the reinstall — and rebuilt. `share: true`
+records a verified install in a machine-wide store (platform + command +
+evidence content) so another checkout with the same evidence links those
+directories instead of installing again; the record is re-verified at the moment
+of borrowing, so damaging the source tree sends the next checkout back to its own
+install.
 
 A claim whose prerequisite did not complete is `blocked`, not `broken`: it keeps
 the trust it earned, fails CI, and says which step failed. A `requires` name that
