@@ -5,6 +5,7 @@ import { buildGraph, impactOf } from './graph.js';
 import { doctor } from './doctor.js';
 import { readInbox } from './inbox.js';
 import { buildTimeline, fmtDuration, fmtWhen, sparkline } from './timeline.js';
+import { readJournal } from './journal.js';
 import { nowIso } from './util.js';
 
 // A single self-contained HTML artifact: no CDN, no build step, no server
@@ -177,8 +178,32 @@ function timelineHtml(timeline) {
   ${list}`;
 }
 
+// Every accepted change, why it was made, and whether it held. The journal is
+// committed, so this section is the same on every checkout — not just the one
+// that happened to accept the proposal.
+function journalHtml(journal, served) {
+  if (!journal || journal.length === 0) {
+    return '<p class="muted">nothing accepted yet — accepted proposals are recorded here with the reason they were made</p>';
+  }
+  const reverted = new Set(journal.filter((e) => e.reverts).map((e) => e.reverts));
+  const rows = journal.slice(0, 12).map((e) => {
+    const verdict = e.verdict?.state || null;
+    const canRevert = served && e.entry === 'accept' && !reverted.has(e.id);
+    return `<li>
+      <span class="when">${esc(fmtWhen(e.at))}</span>
+      <b class="entry-${esc(e.entry)}">${esc(e.entry)}</b>
+      <code>${esc(e.claim || e.id)}</code>
+      <span class="muted">${esc(e.machine || '')}</span>
+      <div class="muted small">${esc(String(e.reason || '').slice(0, 160))}${verdict ? ` · verified ${esc(verdict)}` : ''}${reverted.has(e.id) ? ' · reverted' : ''}
+        ${canRevert ? `<button class="revert" data-entry="${esc(e.id)}" hidden>revert this change</button>` : ''}
+      </div>
+    </li>`;
+  }).join('');
+  return `<div class="tl-summary"><span>${journal.length} entries</span><span>${reverted.size} reverted</span><span>committed to .manual/journal/</span></div><ul class="events">${rows}</ul>`;
+}
+
 export function renderReport(data) {
-  const { repoName, claims, graph, doctorRes, inbox, generatedAt, served, version, timeline } = data;
+  const { repoName, claims, graph, doctorRes, inbox, generatedAt, served, version, timeline, journal } = data;
   const counts = {};
   for (const n of graph.nodes.values()) counts[n.state] = (counts[n.state] || 0) + 1;
   const total = graph.nodes.size;
@@ -382,6 +407,11 @@ export function renderReport(data) {
 </section>
 
 <section>
+  <h2>Journal (${(journal || []).length})</h2>
+  ${journalHtml(journal, served)}
+</section>
+
+<section>
   <h2>Flywheel inbox (${inbox.length})</h2>
   <ul class="inbox">${inboxHtml}</ul>
 </section>
@@ -520,6 +550,26 @@ ${cards}
     });
   }
 
+  // Reverting from the page runs the same code path as the CLI journal revert:
+  // it restores the bytes the entry recorded and re-verifies the claim.
+  document.querySelectorAll('button.revert').forEach(function (btn) {
+    btn.hidden = false;
+    btn.addEventListener('click', function () {
+      var id = btn.dataset.entry;
+      if (!confirm('Revert ' + id + '?\n\nThe claim goes back to the content recorded before that change, and it will be re-verified.')) return;
+      btn.disabled = true;
+      btn.textContent = 'reverting\u2026';
+      fetch('/api/journal/revert', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: id })
+      }).then(function (r) { return r.json(); }).then(function (j) {
+        if (j.error) { btn.textContent = j.error; return; }
+        location.reload();
+      }).catch(function () { btn.textContent = 'revert failed'; btn.disabled = false; });
+    });
+  });
+
   if (location.hash) {
     var t = document.querySelector(location.hash);
     if (t) t.scrollIntoView();
@@ -545,6 +595,7 @@ export function buildReportData(root, opts = {}) {
     doctorRes,
     inbox: readInbox(root),
     timeline,
+    journal: opts.skipJournal ? [] : readJournal(root),
     generatedAt: nowIso(),
     version: opts.version || null,
     served: !!opts.served,

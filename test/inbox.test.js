@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { previewInbox, safeInboxName, readInbox } from '../src/inbox.js';
+import { readJournal } from '../src/journal.js';
 import { startServer } from '../src/serve.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -108,6 +109,36 @@ test('inbox JSON endpoints preview and accept over HTTP', async () => {
 
     const missing = await fetch(s.url + 'api/inbox/accept', { method: 'POST', body: '{}' });
     assert.equal(missing.status, 400);
+
+    // The accepted change is now in the committed journal, and the dashboard's
+    // revert endpoint runs the same code path as `manual journal revert`.
+    const entries = readJournal(dir);
+    assert.equal(entries.length, 1);
+    const acceptedEntry = entries[0];
+    assert.equal(acceptedEntry.entry, 'accept');
+    assert.equal(acceptedEntry.claim, 'tests.demo');
+    const before = fs.readFileSync(path.join(dir, '.manual', 'claims', 'tests.demo.md'), 'utf8');
+
+    const reverted = await fetch(s.url + 'api/journal/revert', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: acceptedEntry.id }),
+    });
+    assert.equal(reverted.status, 200);
+    const rv = await reverted.json();
+    assert.equal(rv.reverted, true);
+    assert.equal(rv.verified.state, 'fresh');
+    const after = fs.readFileSync(path.join(dir, '.manual', 'claims', 'tests.demo.md'), 'utf8');
+    assert.doesNotMatch(after, /max_ms: 10000/, 'the patched bound is gone again');
+    assert.equal(readJournal(dir).length, 2, 'the revert is journaled as its own entry');
+
+    const bad = await fetch(s.url + 'api/journal/revert', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'nope' }),
+    });
+    assert.equal(bad.status, 400);
+    assert.ok(before.length > 0);
   } finally {
     await s.close();
     fs.rmSync(dir, { recursive: true, force: true });

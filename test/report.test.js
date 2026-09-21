@@ -33,9 +33,11 @@ function fakeClaim(id, extra = {}) {
   };
 }
 
-function renderFixture(claims, stamps = {}, inbox) {
+function renderFixture(claims, stamps = {}, inbox, { journal = [], served = false } = {}) {
   const graph = buildGraph(claims, stamps);
   return renderReport({
+    journal,
+    served,
     root: '/repo',
     repoName: 'fixture',
     claims,
@@ -212,6 +214,54 @@ test('doctor issues appear in the attention section', () => {
     generatedAt: '2026-01-01T00:00:00.000Z',
   });
   assert.match(html, /TTL 30d expired 2d ago/);
+});
+
+// The journal is the audit trail: what changed, why, on which machine, and
+// whether it held. It is committed, so this section is identical everywhere.
+const entry = (over = {}) => ({
+  id: '20260921T194044Z-tests.demo',
+  entry: 'accept',
+  at: '2026-09-21T19:40:44.000Z',
+  machine: 'laptop-1',
+  claim: 'tests.demo',
+  file: 'tighten.md',
+  mode: 'patch',
+  reason: 'recent runs put p50 at 9s against a 120s bound',
+  verdict: { state: 'fresh', note: '12ms' },
+  ...over,
+});
+
+test('an empty journal says so instead of rendering nothing', () => {
+  const html = renderFixture([fakeClaim('alpha')]);
+  assert.match(html, /nothing accepted yet/);
+  assert.match(html, /<h2>Journal \(0\)<\/h2>/);
+});
+
+test('journal entries carry the reason, machine and verdict', () => {
+  const html = renderFixture([fakeClaim('alpha')], {}, undefined, { journal: [entry()] });
+  assert.match(html, /<h2>Journal \(1\)<\/h2>/);
+  assert.match(html, /1 entries/);
+  assert.match(html, /laptop-1/);
+  assert.match(html, /recent runs put p50 at 9s against a 120s bound/);
+  assert.match(html, /verified fresh/);
+  assert.match(html, /entry-accept/);
+});
+
+test('the static report offers no revert button, the live dashboard does', () => {
+  const staticHtml = renderFixture([fakeClaim('alpha')], {}, undefined, { journal: [entry()] });
+  assert.doesNotMatch(staticHtml, /button class="revert"/);
+  const servedHtml = renderFixture([fakeClaim('alpha')], {}, undefined, { journal: [entry()], served: true });
+  assert.match(servedHtml, /button class="revert" data-entry="20260921T194044Z-tests\.demo"/);
+});
+
+test('a reverted accept is marked and can no longer be reverted again', () => {
+  const journal = [
+    entry({ id: 'rev-1', entry: 'revert', reverts: '20260921T194044Z-tests.demo' }),
+    entry(),
+  ];
+  const html = renderFixture([fakeClaim('alpha')], {}, undefined, { journal, served: true });
+  assert.match(html, /1 reverted/);
+  assert.doesNotMatch(html, /button class="revert" data-entry="20260921T194044Z-tests\.demo"/);
 });
 
 test('writeReport writes the artifact and buildReportData reads the demo manual', () => {

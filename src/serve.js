@@ -6,7 +6,7 @@ import { verify } from './verify.js';
 import { buildReportData, renderReport } from './report.js';
 import { graphToJson } from './graph.js';
 import { previewInbox, readInbox } from './inbox.js';
-import { acceptAndVerify, undoAndVerify } from './flywheel.js';
+import { acceptAndVerify, undoAndVerify, revertFromJournal } from './flywheel.js';
 import { c } from './color.js';
 
 // `manual serve` — a local dashboard over the same artifact `manual report`
@@ -141,6 +141,29 @@ export function createHandler(root, opts = {}) {
       try {
         const state = new State(root);
         const out = await undoAndVerify(root, token, { state, quiet: true });
+        state.save();
+        return json(res, 200, out);
+      } catch (e) {
+        return json(res, 400, { error: e.message });
+      }
+    }
+
+    if (route === '/api/journal/revert') {
+      if (req.method !== 'POST') return json(res, 405, { error: 'POST required' });
+      let body = '';
+      for await (const chunk of req) {
+        body += chunk;
+        if (body.length > 64 * 1024) return json(res, 413, { error: 'body too large' });
+      }
+      let id = url.searchParams.get('id');
+      if (!id && body) {
+        try { id = JSON.parse(body).id; } catch { /* handled below */ }
+      }
+      try {
+        // Same code path as `manual journal revert`: restore the recorded bytes
+        // and re-verify, then journal the revert as its own entry.
+        const state = new State(root);
+        const out = await revertFromJournal(root, id, { state, quiet: true });
         state.save();
         return json(res, 200, out);
       } catch (e) {

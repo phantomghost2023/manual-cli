@@ -117,7 +117,9 @@ serve [--port N] [--open] [--pidfile <file>]
     Serve the same page as a loopback dashboard, regenerated per request:
     GET / (report), GET /api/graph, GET /api/claims, GET /api/inbox,
     GET /api/inbox/preview?file=, GET /health, POST /api/verify (re-runs the
-    real checks and rewrites state.json), POST /api/inbox/accept
+    real checks and rewrites state.json), POST /api/journal/revert
+    ({"id":"..."}) which reverts an accepted change from its journal entry,
+    POST /api/inbox/accept
     ({"file":"..."}) which applies a proposal and returns the verify verdict,
     and POST /api/inbox/undo ({"token":"..."}) which reverts it. Candidate names are validated
     to stay inside .manual/inbox/. Binds 127.0.0.1 only; if the port is taken

@@ -113,8 +113,13 @@ GET  /                the report           POST /api/verify          run the che
 GET  /api/graph       graph JSON           POST /api/inbox/accept    apply + verify a proposal
 GET  /api/claims      claim JSON           POST /api/inbox/undo      revert an accepted one
 GET  /health          liveness             GET  /api/inbox/preview   show a proposal's diff
-GET  /api/inbox       list candidates
+GET  /api/inbox       list candidates      POST /api/journal/revert  undo an accepted change
 ```
+
+The page also renders the **journal**: every accepted change with its reason,
+machine, verdict and revert state — the same committed record `manual journal`
+prints, with a revert button in the live dashboard and no button in the static
+file (a committed artifact should not carry a mutation affordance).
 
 ## Claim file format (manual/v1)
 
