@@ -92,11 +92,15 @@ and the previous file content.
 manual journal                                  # every accepted change, newest first
 manual journal 20260921T194044Z-tests.suite     # one entry: why, diff, verdict
 manual journal revert <id>                      # works from any checkout, or after a push
+manual journal revert <id> --force              # when the claim moved on since (says so)
 ```
 
 Reverting restores the claim byte-for-byte, journals the revert itself as a new
 entry pointing back at the original, and puts the candidate back in the inbox so
-the proposal stays reviewable. What it cannot do is un-push: the journal makes a
+the proposal stays reviewable. If the claim changed *after* the accept being
+reverted, the revert is refused rather than quietly discarding those later
+edits; `--force` overrides, in the CLI and in the dashboard (`409` plus a
+*revert anyway* button). What it cannot do is un-push: the journal makes a
 change *traceable and revertible*, not *secret*.
 
 `serve` adds the two things a static file cannot do: **re-verify now**

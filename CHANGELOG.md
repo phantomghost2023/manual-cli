@@ -15,6 +15,7 @@ All notable changes to manual-cli are documented here. Format: Keep a Changelog;
 - `docs/FIELD-NOTES.md`: what happened when the tool was pointed at expressjs/express.
 
 ### Fixed
+- A `journal revert` that would discard edits made *after* the accepted change now refuses and explains (`--force` overrides; the dashboard returns 409 and offers a *revert anyway* button) — a byte-exact restore is the only honest revert, but silently overwriting later work is not.
 - **`verify --json` never persisted anything.** It returned before `state.save()`, so the machine-readable mode — the one CI and agents use — printed fresh states and discarded them, leaving stamps, trust history and the flywheel's measurements stale on disk. Found by re-verifying a real repo and finding no new history entry for a run that had just reported success.
 - An empty `.manual/claims/` threw (`contains no claim files`), so `verify`, `doctor`, `graph`, `brief` and `report` all died on a repo that had just run `init`, or had just reverted its only claim. It is now a state, not an error: the read-only commands report it, count the candidates waiting in the inbox, and exit 0. `verify` no longer prints a bare `0 claims:`.
 - An inbox name that included its own path (`.manual/inbox/x.md` — what `ls` and the reports print) was rejected as unsafe by `inbox accept`/`preview`, and where it was accepted the sanitized name was then discarded, so the join produced `.manual/inbox/.manual/inbox/x.md`. Paths naming the inbox are now accepted and always reduced to their basename.

@@ -156,18 +156,24 @@ export function createHandler(root, opts = {}) {
         if (body.length > 64 * 1024) return json(res, 413, { error: 'body too large' });
       }
       let id = url.searchParams.get('id');
-      if (!id && body) {
-        try { id = JSON.parse(body).id; } catch { /* handled below */ }
+      let force = false;
+      if (body) {
+        try {
+          const parsed = JSON.parse(body);
+          if (!id) id = parsed.id;
+          force = !!parsed.force;
+        } catch { /* handled below */ }
       }
       try {
         // Same code path as `manual journal revert`: restore the recorded bytes
-        // and re-verify, then journal the revert as its own entry.
+        // and re-verify, then journal the revert as its own entry. Drift is a
+        // 409 with the reason, never a silent overwrite.
         const state = new State(root);
-        const out = await revertFromJournal(root, id, { state, quiet: true });
+        const out = await revertFromJournal(root, id, { state, quiet: true, force });
         state.save();
         return json(res, 200, out);
       } catch (e) {
-        return json(res, 400, { error: e.message });
+        return json(res, /has changed since/.test(e.message) ? 409 : 400, { error: e.message });
       }
     }
 

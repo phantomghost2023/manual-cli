@@ -3,7 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { previewInbox, acceptInbox, safeInboxName, readInbox } from './inbox.js';
 import { verify } from './verify.js';
-import { appendEntry, findEntry, restoreFromEntry } from './journal.js';
+import { appendEntry, findEntry, restoreFromEntry, entryDrift } from './journal.js';
 
 // The flywheel's missing half.
 //
@@ -234,9 +234,19 @@ export async function undoAndVerify(root, token, { state, quiet = false } = {}) 
 
 // Revert an accepted change from its journal entry — the portable path, for
 // when the local undo snapshot is gone, pruned, or on another machine.
-export async function revertFromJournal(root, idOrFile, { state, quiet = false } = {}) {
+export async function revertFromJournal(root, idOrFile, { state, quiet = false, force = false } = {}) {
   const entry = findEntry(root, idOrFile);
   if (!entry) throw new Error(`no journal entry matching "${idOrFile}"`);
+  // A revert restores exact bytes, which is what makes it trustworthy and also
+  // what makes it destructive: if the claim changed after the recorded accept,
+  // those later edits would vanish without a word. Refuse, and say why.
+  const drift = entryDrift(root, entry);
+  if (drift && !force) {
+    throw new Error(
+      `${drift.claim} has changed since ${entry.id} was accepted, so reverting would discard those later edits. ` +
+        `Re-run with --force to overwrite them, or revert the change that came after it.`,
+    );
+  }
   const restored = restoreFromEntry(root, entry);
   let verified = null;
   if (restored.claim) {
@@ -265,6 +275,7 @@ export async function revertFromJournal(root, idOrFile, { state, quiet = false }
     claim: restored.claim,
     changed: restored.changed,
     inboxRestored: restored.inboxRestored ?? null,
+    forcedOverDrift: !!drift && force,
     verified,
     journalId,
   };

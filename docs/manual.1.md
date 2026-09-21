@@ -93,7 +93,10 @@ journal [<id>] [--json]
     proposed, the exact diff, the previous file content and the verify verdict
     that followed. `journal revert <id>` restores the claim byte-for-byte from
     any checkout (no local undo snapshot needed), writes a revert entry
-    pointing at the original, and puts the candidate back in the inbox.
+    pointing at the original, and puts the candidate back in the inbox. If the
+    claim changed after that accept, the revert is refused: a byte-exact
+    restore would discard the later edits. `--force` overwrites them anyway.
+    Reverting cannot un-push; it makes a change traceable, not secret.
 
 ledger [--json]
     The committed record of trust earned across machines (.manual/ledger.jsonl).
@@ -118,7 +121,8 @@ serve [--port N] [--open] [--pidfile <file>]
     GET / (report), GET /api/graph, GET /api/claims, GET /api/inbox,
     GET /api/inbox/preview?file=, GET /health, POST /api/verify (re-runs the
     real checks and rewrites state.json), POST /api/journal/revert
-    ({"id":"..."}) which reverts an accepted change from its journal entry,
+    ({"id":"...", "force": false}) which reverts an accepted change from its
+    journal entry — 409 with the reason when the claim has drifted since,
     POST /api/inbox/accept
     ({"file":"..."}) which applies a proposal and returns the verify verdict,
     and POST /api/inbox/undo ({"token":"..."}) which reverts it. Candidate names are validated

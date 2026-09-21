@@ -56,7 +56,7 @@ Usage:
   manual inbox  [--root <dir>] [accept <file> | preview <file> | undo <token>]
   manual ledger [--root <dir>] [--json]                    # trust earned across machines
   manual journal [--root <dir>] [<id>] [--json]            # why the manual says what it says
-  manual journal revert <id>                               # restore from a journal entry
+  manual journal revert <id> [--force]                     # restore from a journal entry
   manual hooks  [--root <dir>] [install|uninstall|status]
   manual eject  [--root <dir>] [--dry-run]   # vendor the CLI into tools/manual-cli
   manual watch  [--root <dir>] [--debounce N]  # re-verify affected claims on change
@@ -359,10 +359,13 @@ export async function main(argv = []) {
     if (cmd === 'journal') {
       const sub = rest.find((a) => !a.startsWith('--'));
       if (sub === 'revert') {
-        const id = rest[rest.indexOf('revert') + 1];
-        if (!id) { console.error('usage: manual journal revert <id>'); return 2; }
+        const id = rest.filter((a) => !a.startsWith('--'))[rest.filter((a) => !a.startsWith('--')).indexOf('revert') + 1];
+        if (!id) { console.error('usage: manual journal revert <id> [--force]'); return 2; }
         const state = new State(root);
-        const res = await revertFromJournal(root, id, { state });
+        const res = await revertFromJournal(root, id, { state, force: rest.includes('--force') });
+        if (res.forcedOverDrift) {
+          console.log(c.amber('forced over later edits to the claim — they are gone (they are in git) '));
+        }
         state.save();
         if (!res.changed) console.log(c.grey('claim already matches the recorded content — nothing to do'));
         return 0;

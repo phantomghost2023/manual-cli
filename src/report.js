@@ -552,6 +552,14 @@ ${cards}
 
   // Reverting from the page runs the same code path as the CLI journal revert:
   // it restores the bytes the entry recorded and re-verifies the claim.
+  function post(id, force) {
+    return fetch('/api/journal/revert', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: id, force: force })
+    });
+  }
+
   document.querySelectorAll('button.revert').forEach(function (btn) {
     btn.hidden = false;
     btn.addEventListener('click', function () {
@@ -559,13 +567,27 @@ ${cards}
       if (!confirm('Revert ' + id + '?\n\nThe claim goes back to the content recorded before that change, and it will be re-verified.')) return;
       btn.disabled = true;
       btn.textContent = 'reverting\u2026';
-      fetch('/api/journal/revert', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ id: id })
-      }).then(function (r) { return r.json(); }).then(function (j) {
-        if (j.error) { btn.textContent = j.error; return; }
-        location.reload();
+      post(id, false).then(function (r) { return r.json().then(function (j) { return { status: r.status, j: j }; }); }).then(function (out) {
+        if (!out.j.error) { location.reload(); return; }
+        // Drift (409): the claim changed after the recorded accept, so a
+        // byte-exact restore would discard those edits. Offer it explicitly
+        // rather than doing it quietly.
+        btn.hidden = true;
+        var note = document.createElement('span');
+        note.className = 'bad';
+        note.textContent = out.j.error + ' ';
+        var forceBtn = document.createElement('button');
+        forceBtn.textContent = 'revert anyway';
+        forceBtn.addEventListener('click', function () {
+          forceBtn.disabled = true;
+          forceBtn.textContent = 'reverting\u2026';
+          post(id, true).then(function (r2) { return r2.json(); }).then(function (j2) {
+            if (j2.error) { forceBtn.textContent = j2.error; return; }
+            location.reload();
+          });
+        });
+        note.appendChild(forceBtn);
+        btn.parentNode.insertBefore(note, btn);
       }).catch(function () { btn.textContent = 'revert failed'; btn.disabled = false; });
     });
   });

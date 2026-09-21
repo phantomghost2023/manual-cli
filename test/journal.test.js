@@ -140,6 +140,37 @@ test('undoing an accepted proposal is journaled as an undo, not silence', async 
   }
 });
 
+// A byte-exact restore is the only honest revert, and also a destructive one:
+// if the claim moved on after the recorded accept, those later edits would
+// disappear without a word. Found while writing the dashboard button that makes
+// reverting easy enough for someone to do it without reading the entry.
+test('a revert refuses to overwrite edits made after the recorded accept', async () => {
+  const dir = tmpCopy();
+  try {
+    const claimPath = path.join(dir, '.manual', 'claims', 'tests.demo.md');
+    fs.writeFileSync(path.join(dir, '.manual', 'inbox', 'tighten.md'), candidate('tighten.md', 60000));
+    const res = await acceptAndVerify(dir, 'tighten.md', { state: new State(dir), quiet: true });
+    fs.rmSync(path.join(dir, '.manual', 'undo'), { recursive: true, force: true });
+
+    // A later, unrelated change to the same claim.
+    const later = fs.readFileSync(claimPath, 'utf8').replace('priority: high', 'priority: low');
+    fs.writeFileSync(claimPath, later);
+
+    await assert.rejects(
+      () => revertFromJournal(dir, res.journalId, { state: new State(dir), quiet: true }),
+      /has changed since/,
+    );
+    assert.equal(fs.readFileSync(claimPath, 'utf8'), later, 'nothing was overwritten');
+
+    // Forcing is allowed, and says so.
+    const forced = await revertFromJournal(dir, res.journalId, { state: new State(dir), quiet: true, force: true });
+    assert.equal(forced.forcedOverDrift, true);
+    assert.doesNotMatch(fs.readFileSync(claimPath, 'utf8'), /priority: low/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('journal ids resolve by prefix and reject ambiguity', () => {
   const dir = tmpCopy();
   try {

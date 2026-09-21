@@ -155,6 +155,20 @@ function restoreCandidate(root, entry) {
   return name;
 }
 
+// Has the claim moved on since this entry left it? A byte-exact restore is the
+// right semantics for a revert, but it silently discards anything written after
+// the accepted change — so the caller must be able to tell, and a human must
+// decide. Returns null when there is nothing to lose.
+export function entryDrift(root, entry) {
+  if (entry.entry === 'revert' || !entry.claim || !entry.after_hash) return null;
+  const target = path.join(root, '.manual', 'claims', `${entry.claim}.md`);
+  if (!fs.existsSync(target)) return null; // the claim is gone: nothing to overwrite
+  const text = fs.readFileSync(target, 'utf8');
+  const actual = `sha256:${sha256(text).slice(0, 32)}`;
+  if (actual === entry.after_hash) return null;
+  return { claim: entry.claim, expected: entry.after_hash, actual };
+}
+
 export function verifyEntry(root, entry) {
   const target = path.join(root, '.manual', 'claims', `${entry.claim}.md`);
   if (!fs.existsSync(target)) return { ok: false, problems: ['claim file is missing'] };
