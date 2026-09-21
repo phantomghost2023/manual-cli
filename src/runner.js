@@ -12,8 +12,11 @@ export async function runCheck(claim, root, { sandbox, timeoutMs }) {
   const fm = claim.fm;
 
   if (check.expr && !check.run) {
+    const t0 = Date.now();
     const r = evaluateExpr(root, check.expr);
-    return { ...r, ok: r.ok && r.value === true }; // spread first: ok must not be clobbered
+    // Expr checks are measured too: without a runtime there is no trend line
+    // and no flywheel signal for the claims that are cheapest to run.
+    return { ...r, ms: Date.now() - t0, ok: r.ok && r.value === true }; // spread first: ok must not be clobbered
   }
 
   const sb = sandbox || (await new Sandbox(root).enter());

@@ -4,6 +4,7 @@ import { loadManual } from './claims.js';
 import { buildGraph, impactOf } from './graph.js';
 import { doctor } from './doctor.js';
 import { readInbox } from './inbox.js';
+import { buildTimeline, fmtDuration, fmtWhen, sparkline } from './timeline.js';
 import { nowIso } from './util.js';
 
 // A single self-contained HTML artifact: no CDN, no build step, no server
@@ -136,18 +137,48 @@ function linkList(ids) {
 
 function ageText(iso) {
   if (!iso) return 'never';
-  const ms = Date.now() - Date.parse(iso);
-  if (!Number.isFinite(ms)) return esc(iso);
-  const m = Math.round(ms / 60000);
-  if (m < 1) return 'just now';
-  if (m < 60) return `${m}m ago`;
-  const h = Math.round(m / 60);
-  if (h < 48) return `${h}h ago`;
-  return `${Math.round(h / 24)}d ago`;
+  return esc(fmtWhen(iso));
+}
+
+// Inline SVG sparkline: a claim whose runtime is creeping toward its bound is
+// visible at a glance instead of waiting for `observe` to notice.
+function sparklineSvg(series, { width = 160, height = 28 } = {}) {
+  const ms = series.map((s) => s.ms).filter((v) => typeof v === 'number' && Number.isFinite(v));
+  if (ms.length < 2) return '<span class="muted">no runs yet</span>';
+  const min = Math.min(...ms);
+  const max = Math.max(...ms);
+  const span = max - min || 1;
+  const step = ms.length > 1 ? width / (ms.length - 1) : width;
+  const pts = ms.map((v, i) => `${(i * step).toFixed(1)},${(height - 4 - ((v - min) / span) * (height - 8)).toFixed(1)}`);
+  return `<svg class="spark" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="runtime trend">` +
+    `<polyline points="${pts.join(' ')}" fill="none" stroke="#8ab4f8" stroke-width="1.5"/>` +
+    `<circle cx="${pts[pts.length - 1].split(',')[0]}" cy="${pts[pts.length - 1].split(',')[1]}" r="2.5" fill="#8ab4f8"/>` +
+    `</svg>`;
+}
+
+function timelineHtml(timeline) {
+  if (!timeline) return '<p class="muted">no history recorded</p>';
+  const { summary, claims } = timeline;
+  const events = [];
+  for (const t of claims.values()) {
+    for (const tr of t.transitions) events.push({ id: t.id, ...tr });
+  }
+  events.sort((a, b) => String(b.at).localeCompare(String(a.at)));
+  const recent = events.slice(0, 12);
+  const list = recent.length
+    ? `<ul class="events">${recent.map((e) => `<li><span class="when">${esc(fmtWhen(e.at))}</span> <code>${esc(e.id)}</code> ${esc(e.from)} → <b class="to-${esc(e.to)}">${esc(e.to)}</b></li>`).join('')}</ul>`
+    : '<p class="muted">no state transitions recorded on this machine</p>';
+  return `<div class="tl-summary">
+    <span>${esc(summary.events)} verify events</span>
+    <span>${esc(summary.transitions)} transitions</span>
+    <span>${summary.meanTimeToRecoveryMs != null ? `mean time to recovery ${esc(fmtDuration(summary.meanTimeToRecoveryMs))}` : 'no recoveries recorded'}</span>
+    <span>${summary.git ? 'git history joined' : 'no git history (not a repo?)'}</span>
+  </div>
+  ${list}`;
 }
 
 export function renderReport(data) {
-  const { repoName, claims, graph, doctorRes, inbox, generatedAt, served, version } = data;
+  const { repoName, claims, graph, doctorRes, inbox, generatedAt, served, version, timeline } = data;
   const counts = {};
   for (const n of graph.nodes.values()) counts[n.state] = (counts[n.state] || 0) + 1;
   const total = graph.nodes.size;
@@ -169,6 +200,7 @@ export function renderReport(data) {
       const tier = node?.tier || 'bronze';
       const deps = (cl.fm.depends_on || []).map((d) => d.id);
       const impact = impactOf(graph, id);
+      const tl = timeline?.claims?.get(id) || null;
       const searchText = `${id} ${cl.fm.statement} ${cl.fm.kind}`.toLowerCase();
       return `<article class="card" id="card-${esc(id)}" data-state="${esc(state)}" data-kind="${esc(cl.fm.kind)}" data-tier="${esc(tier)}" data-text="${esc(searchText)}">
   <header class="card-h">
@@ -188,6 +220,8 @@ export function renderReport(data) {
     <dt>affects</dt><dd>${linkList(impact)}</dd>
     <dt>ttl</dt><dd>${cl.fm.ttl ? esc(cl.fm.ttl) : '<span class="muted">none</span>'} · verify: ${esc(cl.fm.verify || 'always')} · priority: ${esc(cl.fm.priority || 'normal')}</dd>
     <dt>last verified</dt><dd>${ageText(node?.verified_at)}${node?.measured_ms != null ? ` <span class="muted">(${esc(node.measured_ms)}ms)</span>` : ''}${cl.fm.provenance ? ` · <span class="muted">origin ${esc(cl.fm.provenance.origin || 'written')}, confidence ${esc(cl.fm.provenance.confidence ?? '?')}</span>` : ''}</dd>
+    <dt>runs</dt><dd>${tl ? sparklineSvg(tl.series) : '<span class="muted">—</span>'} ${tl && tl.stats ? `<span class="muted">p50 ${esc(fmtDuration(tl.stats.p50))} · p90 ${esc(fmtDuration(tl.stats.p90))} · n=${esc(tl.stats.n)}</span>` : ''}${tl && tl.brokeCount ? ` <span class="badge warn">${esc(tl.brokeCount)} break(s)</span>` : ''}</dd>
+    <dt>file history</dt><dd>${tl?.files ? `introduced ${esc(fmtWhen(tl.files.introduced.date))} by ${esc(tl.files.introduced.author)} (${esc(tl.files.introduced.hash)}) · ${esc(tl.files.commits)} commit(s), last ${esc(fmtWhen(tl.files.last.date))}` : '<span class="muted">not in git</span>'}</dd>
   </dl>
   ${cl.gotchas ? `<div class="gotchas"><strong>${esc('\u26a0 gotchas')}</strong><div>${esc(cl.gotchas).replace(/\n/g, '<br/>')}</div></div>` : ''}
   <details><summary>full prose</summary><pre class="md">${esc(cl.body)}</pre></details>
@@ -213,7 +247,10 @@ export function renderReport(data) {
       <code>${esc(c.file)}</code>
       <span class="muted">${esc(c.proposes?.update ? `proposes update → ${c.proposes.update}` : c.id ? `new claim → ${c.id}` : 'candidate')}</span>
       ${c.observation?.by ? `<span class="muted">observed by ${esc(c.observation.by)} ${esc(ageText(c.observation.at))}</span>` : ''}
-      <div class="muted small">accept with <code>manual inbox accept ${esc(c.file)}</code></div>
+      <div class="muted small">accept with <code>manual inbox accept ${esc(c.file)}</code>
+        <button class="accept" data-file="${esc(c.file)}" hidden>preview &amp; accept</button>
+      </div>
+      <div class="patch" data-patch="${esc(c.file)}" hidden></div>
     </li>`,
       )
       .join('')
@@ -293,6 +330,17 @@ export function renderReport(data) {
   .issues { margin:0; padding-left:20px; color:var(--stale); }
   .ok { color:var(--fresh); }
   ul.inbox { list-style:none; margin:0; padding:0; }
+  .tl-summary { display:flex; gap:14px; flex-wrap:wrap; color:var(--muted); font-size:12px; margin-bottom:10px; }
+  ul.events { list-style:none; margin:0; padding:0; font-size:12.5px; }
+  ul.events li { padding:3px 0; border-bottom:1px solid #1d222b; }
+  ul.events .when { display:inline-block; min-width:90px; color:var(--muted); }
+  .to-broken { color:var(--broken); } .to-fresh { color:var(--fresh); }
+  .to-stale { color:var(--stale); } .to-blocked { color:var(--blocked); }
+  .spark { vertical-align:middle; }
+  button.accept { margin-left:8px; background:#1b2a1b; border:1px solid #2e5d31; color:#9ccc65; border-radius:6px; padding:3px 9px; cursor:pointer; font-size:11px; }
+  button.accept:hover { background:#223a22; }
+  .patch pre { white-space:pre-wrap; background:#12151b; border:1px solid var(--line); border-radius:8px; padding:10px; font-size:11.5px; margin:6px 0 0; max-height:280px; overflow:auto; }
+  .patch .confirm { background:#1e3a8a; border:1px solid #3b5bdb; color:#fff; border-radius:6px; padding:4px 10px; cursor:pointer; font-size:11.5px; margin-top:6px; }
   .candidate { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 13px; margin-bottom:8px; display:flex; flex-direction:column; gap:4px; }
   footer { padding:18px 26px 40px; color:var(--muted); font-size:12px; border-top:1px solid var(--line); margin-top:14px; }
   .path { color:var(--muted); }
@@ -320,6 +368,11 @@ export function renderReport(data) {
 <section>
   <h2>Attention</h2>
   ${issueHtml}
+</section>
+
+<section>
+  <h2>Timeline</h2>
+  ${timelineHtml(timeline)}
 </section>
 
 <section>
@@ -395,6 +448,43 @@ ${cards}
         .catch(function () { btn.textContent = 'verify failed'; btn.disabled = false; });
     });
   }
+  // Flywheel review: a human accepting a proposal is the one step that
+  // should never be automatic, so it stays a click behind a visible diff.
+  if (location.protocol.indexOf('http') === 0) {
+    Array.prototype.slice.call(document.querySelectorAll('button.accept')).forEach(function (btn) {
+      btn.hidden = false;
+      btn.addEventListener('click', function () {
+        var file = btn.dataset.file;
+        var box = document.querySelector('.patch[data-patch="' + file + '"]');
+        if (box.dataset.loaded === '1') { box.hidden = !box.hidden; return; }
+        btn.disabled = true;
+        btn.textContent = 'loading\u2026';
+        fetch('/api/inbox/preview?file=' + encodeURIComponent(file))
+          .then(function (r) { return r.json(); })
+          .then(function (j) {
+            btn.disabled = false;
+            btn.textContent = 'hide diff';
+            if (j.error) { box.innerHTML = '<div class="muted small">' + j.error + '</div>'; box.hidden = false; box.dataset.loaded = '1'; return; }
+            box.dataset.loaded = '1';
+            box.hidden = false;
+            box.innerHTML = '<div class="small muted">' + j.summary + '</div>' +
+              '<pre>' + j.diff.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</pre>' +
+              '<button class="confirm">accept this proposal</button>';
+            box.querySelector('.confirm').addEventListener('click', function () {
+              this.disabled = true;
+              this.textContent = 'accepting\u2026';
+              fetch('/api/inbox/accept', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ file: file })
+              }).then(function (r) { return r.json(); }).then(function () { location.reload(); });
+            });
+          })
+          .catch(function () { btn.textContent = 'preview failed'; btn.disabled = false; });
+      });
+    });
+  }
+
   if (location.hash) {
     var t = document.querySelector(location.hash);
     if (t) t.scrollIntoView();
@@ -411,6 +501,7 @@ export function buildReportData(root, opts = {}) {
   const state = opts.state || null;
   const graph = buildGraph(claims, state?.data?.stamps || {});
   const doctorRes = opts.skipDoctor ? { rows: [], suspect: [], healthy: claims.length, errors } : doctor(root, state);
+  const timeline = opts.skipTimeline ? null : buildTimeline(root, state, { claimIds: claims.map((cl) => cl.fm.id) });
   return {
     root,
     repoName: path.basename(path.resolve(root)) || root,
@@ -418,6 +509,7 @@ export function buildReportData(root, opts = {}) {
     graph,
     doctorRes,
     inbox: readInbox(root),
+    timeline,
     generatedAt: nowIso(),
     version: opts.version || null,
     served: !!opts.served,

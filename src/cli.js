@@ -16,6 +16,7 @@ import { buildGraph, graphToJson, toDot, toMermaid, printGraphSummary } from './
 import { writeReport } from './report.js';
 import { serveCommand } from './serve.js';
 import { loadManual } from './claims.js';
+import { buildTimeline, describeTimeline, fmtDuration, fmtWhen, sparkline } from './timeline.js';
 import { c } from './color.js';
 
 function usage() {
@@ -32,6 +33,7 @@ Usage:
   manual hooks  [--root <dir>] [install|uninstall|status]
   manual eject  [--root <dir>] [--dry-run]   # vendor the CLI into tools/manual-cli
   manual watch  [--root <dir>] [--debounce N]  # re-verify affected claims on change
+  manual history [--root <dir>] [<claim-id>] [--json]      # transitions, runtimes, git history
   manual graph  [--root <dir>] [--dot|--mermaid|--json]   # dependency graph
   manual report [--root <dir>] [--out <file>] [--open]    # self-contained HTML report
   manual serve  [--root <dir>] [--port N] [--open] [--pidfile <f>]  # live dashboard over the report
@@ -202,6 +204,75 @@ export async function main(argv = []) {
           console.log(`  node ${'tools/manual-cli/bin/manual.js'} verify --diff HEAD~1`);
         }
       }
+      return 0;
+    }
+
+    if (cmd === 'history') {
+      const state = new State(root);
+      const limit = Number(flag(rest, '--limit') || 20);
+      const skip = new Set(['--limit', String(limit)]);
+      const only = rest.find((a) => !a.startsWith('--') && !skip.has(a));
+      let kinds = new Map();
+      try {
+        kinds = new Map(loadManual(root).claims.map((cl) => [cl.fm.id, cl.fm.kind]));
+      } catch { /* claims may be unreadable: git history is still useful */ }
+      const tl = buildTimeline(root, state, { claimIds: [...kinds.keys()] });
+
+      const rows = [...tl.claims.values()]
+        .filter((t) => !only || t.id === only)
+        .sort((a, b) => (b.brokeCount - a.brokeCount)
+          || ((b.stats?.p50 || 0) - (a.stats?.p50 || 0))
+          || a.id.localeCompare(b.id));
+
+      if (json) {
+        console.log(JSON.stringify({
+          summary: tl.summary,
+          claims: rows.map((t) => ({
+            id: t.id,
+            last_state: t.lastState,
+            breaks: t.brokeCount,
+            transitions: t.transitions,
+            stats: t.stats,
+            recoveries: t.recoveries,
+            series: t.series,
+            git: t.files,
+          })),
+        }, null, 2));
+        return 0;
+      }
+
+      if (only) {
+        const t = rows[0];
+        if (!t) {
+          console.log(c.grey(`no history for "${only}" — never verified here and not in git`));
+          return 1;
+        }
+        console.log(c.bold(`${t.id}  [${kinds.get(t.id) || 'unknown'}] ${t.lastState || 'unknown'}`));
+        for (const line of describeTimeline(t)) console.log(`  ${line}`);
+        if (t.series.length) console.log(`  trend (newest last): ${sparkline(t.series.map((s) => s.ms), limit)}`);
+        return t.lastState === 'broken' ? 1 : 0;
+      }
+
+      console.log(c.bold(`manual history — ${path.basename(root)}`));
+      console.log(c.grey(`${tl.summary.claims} claims · ${tl.summary.events} verify events · ${tl.summary.transitions} transitions${tl.summary.meanTimeToRecoveryMs != null ? ` · mean time to recovery ${fmtDuration(tl.summary.meanTimeToRecoveryMs)}` : ''}${tl.summary.git ? '' : ' · no git history'}`));
+      console.log('');
+      if (rows.length === 0) {
+        console.log(c.grey('nothing recorded yet — run `manual verify`'));
+        return 0;
+      }
+      console.log(c.grey(`  ${'claim'.padEnd(30)} ${'last'.padEnd(9)} ${'breaks'.padEnd(7)} ${'p50'.padEnd(8)} trend`));
+      for (const t of rows) {
+        const last = t.lastState || 'unknown';
+        const color = { fresh: c.green, broken: c.red, stale: c.amber, blocked: c.grey, unknown: c.grey }[last] || c.grey;
+        const trend = t.series.length ? sparkline(t.series.map((s) => s.ms), limit) : '';
+        console.log(
+          `  ${t.id.padEnd(30)} ${color(last.padEnd(9))} ${String(t.brokeCount).padEnd(7)} ${fmtDuration(t.stats?.p50).padEnd(8)} ${c.grey(trend)}`,
+        );
+      }
+      if (tl.summary.slowest.length) {
+        console.log(c.grey(`\nslowest by p50: ${tl.summary.slowest.map((s) => `${s.id} ${fmtDuration(s.p50)} (n=${s.n})`).join(', ')}`));
+      }
+      console.log(c.grey('verification history is machine-local (state.json, capped at 500 events); git columns come from commit history'));
       return 0;
     }
 

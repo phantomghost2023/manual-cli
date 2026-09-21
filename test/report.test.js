@@ -94,11 +94,13 @@ test('an empty manual renders without crashing', () => {
   assert.match(html, /No issues/);
 });
 
-test('a populated inbox is rendered with its acceptance command', () => {
+test('a populated inbox is rendered with its acceptance command and a review button', () => {
   const html = renderFixture([fakeClaim('alpha')]);
   assert.match(html, /2026-01-01-tighten\.md/);
   assert.match(html, /proposes update → x/);
   assert.match(html, /manual inbox accept 2026-01-01-tighten\.md/);
+  assert.match(html, /<button class="accept" data-file="2026-01-01-tighten\.md" hidden>/, 'serve wires the button; the static file leaves it hidden');
+  assert.match(html, /class="patch" data-patch="2026-01-01-tighten\.md" hidden/);
 });
 
 test('layout places every node without overlap inside its layer', () => {
@@ -142,6 +144,59 @@ test('check rows mirror the real check schema, not a guess', () => {
   // and never an empty check cell
   assert.doesNotMatch(html, /<code>expr<\/code>/);
   assert.doesNotMatch(html, /<code>run<\/code>/);
+});
+
+test('the timeline section renders transitions and a runtime sparkline', () => {
+  const claims = [fakeClaim('alpha')];
+  const graph = buildGraph(claims);
+  const now = new Date().toISOString();
+  const timeline = {
+    summary: { claims: 1, events: 3, transitions: 1, broken: 0, meanTimeToRecoveryMs: 65000, slowest: [], git: true },
+    claims: new Map([['alpha', {
+      id: 'alpha',
+      events: [],
+      transitions: [{ from: 'fresh', to: 'broken', at: now }],
+      series: [{ at: now, ms: 10 }, { at: now, ms: 40 }],
+      stats: { n: 2, min: 10, p50: 25, p90: 40, max: 40, avg: 25 },
+      recoveries: [],
+      lastState: 'fresh',
+      brokeCount: 1,
+      files: { commits: 2, introduced: { hash: 'abc1234', date: now, author: 'mira' }, last: { hash: 'def5678', date: now } },
+    }]]),
+  };
+  const html = renderReport({
+    root: '/repo', repoName: 'fixture', claims, graph,
+    doctorRes: { rows: [], suspect: [], healthy: 1, errors: [] },
+    inbox: [], timeline, generatedAt: now,
+  });
+  assert.match(html, /mean time to recovery 1m/);
+  assert.match(html, /<code>alpha<\/code> fresh → <b class="to-broken">broken<\/b>/);
+  assert.match(html, /<polyline points=/);
+  assert.match(html, /p50 25ms/);
+  assert.match(html, /1 break\(s\)/);
+  assert.match(html, /introduced .* by mira \(abc1234\)/);
+});
+
+test('a report without a timeline degrades quietly', () => {
+  const html = renderFixture([fakeClaim('alpha')]);
+  assert.match(html, /no history recorded/);
+  assert.match(html, /not in git/);
+  assert.doesNotMatch(html, /<polyline points=/);
+});
+
+test('a claim with too few runs shows a placeholder instead of a fake trend', () => {
+  const claims = [fakeClaim('alpha')];
+  const timeline = {
+    summary: { claims: 1, events: 1, transitions: 0, broken: 0, meanTimeToRecoveryMs: null, slowest: [], git: false },
+    claims: new Map([['alpha', { id: 'alpha', series: [{ at: 'x', ms: 5 }], stats: { n: 1, p50: 5, p90: 5, max: 5, avg: 5 }, transitions: [], brokeCount: 0, files: null, events: [], recoveries: [] }]]),
+  };
+  const html = renderReport({
+    root: '/repo', repoName: 'fixture', claims, graph: buildGraph(claims),
+    doctorRes: { rows: [], suspect: [], healthy: 1, errors: [] },
+    inbox: [], timeline, generatedAt: 'now',
+  });
+  assert.match(html, /no runs yet/);
+  assert.match(html, /no state transitions recorded/);
 });
 
 test('doctor issues appear in the attention section', () => {

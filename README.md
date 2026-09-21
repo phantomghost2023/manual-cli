@@ -13,6 +13,7 @@ manual doctor   # is the manual itself healthy?
 manual init     # discover claims by inspection, scaffold .manual/
 manual inbox    # list/accept candidate claims (humans accept, agents propose)
 manual hooks    # install/uninstall the pre-commit enforce gate
+manual history  # what happened to each claim over time
 manual graph    # the evidence graph: dependencies, cycles, depth
 manual report   # one self-contained HTML page: graph + cards + inbox
 manual serve    # the same page as a live local dashboard
@@ -51,6 +52,7 @@ node bin/manual.js verify --root /path/to/repo --force
 | `mcp [--root dir]` | Speak MCP over stdio: `manual_brief`, `manual_verify`, `manual_doctor`, `manual_inbox` tools. Point your coding agent at `bin/manual.js mcp`. |
 | `eject [--dry-run]` | Vendor the CLI into `tools/manual-cli/` so CI workflows and hooks run fully self-contained. |
 | `watch [--debounce N]` | Editor-loop mode: re-verify claims affected by file changes (evidence globs + bidirectional dependency closure). `affectedClaims()` is exported for editor integrations. |
+| `history [<claim-id>] [--json]` | Claim archaeology: state transitions, per-claim runtime trend (p50/p90/max over recorded runs), break count, mean time to recovery, and the git provenance of the claim file. Joins two records — `state.json` verify history (machine-local) and the commit history of the claim itself. |
 | `graph [--dot\|--mermaid\|--json]` | The evidence graph: nodes are claims, edges are `depends_on` (solid = required, dashed = optional). Reports cycles, dangling edges, isolated claims, and layer depth. Exits 1 on cycles or dangling edges. |
 | `report [--out <file>] [--open]` | Writes `.manual/report.html` — a single self-contained page (no CDN, no build): inline SVG graph, one card per claim, tier/state badges, doctor issues, the flywheel inbox, and live filter controls. |
 | `serve [--port N] [--open] [--pidfile <f>]` | The same page as a live loopback dashboard, regenerated per request, plus `/api/graph`, `/api/claims`, `/api/verify` (POST) and `/health`. Port failover: if N is taken it tries N+1 … N+19. Writes a pidfile so scripts can find and stop it. |
@@ -66,13 +68,26 @@ manual report --open            # static artifact you can commit as a CI artifac
 manual serve --port 4242        # live dashboard; POST /api/verify re-runs the checks
 manual graph --mermaid          # paste into a README or PR description
 manual graph --dot | dot -Tsvg  # if you have graphviz
+manual history                  # per-claim breaks, runtime trend, recovery time
 ```
 
 Nodes are colored by state, edges follow `depends_on`, and clicking a node jumps
-to the claim's card. The report is one file with zero external requests — it
-renders offline, in email, and in an artifact bucket. `POST /api/verify` is what
-makes `serve` different: the page re-runs the real checks in a sandbox and
-then reloads with fresh stamps.
+to the claim's card. Each card carries a runtime sparkline, its break count, and
+where the claim came from in git. The report is one file with zero external
+requests — it renders offline, in email, and in an artifact bucket.
+
+`serve` adds the two things a static file cannot do: **re-verify now**
+(`POST /api/verify`) re-runs the real checks in a sandbox and reloads with fresh
+stamps, and each inbox candidate gets a **preview & accept** button that shows
+the exact frontmatter diff before a human applies it. Accepting a proposal is
+the one step in this system that is deliberately never automatic.
+
+```
+GET  /                the report           POST /api/verify          run the checks
+GET  /api/graph       graph JSON           POST /api/inbox/accept    apply a proposal
+GET  /api/claims      claim JSON           GET  /api/inbox/preview   show a proposal's diff
+GET  /health          liveness             GET  /api/inbox           list candidates
+```
 
 ## Claim file format (manual/v1)
 
@@ -151,7 +166,7 @@ The demo ships a genuine trap discovered while building it: `node --test --test-
 ## Test
 
 ```bash
-npm test        # 76 tests across 26 suites (seeded fuzzing, real-git integration, HTTP end-to-end)
+npm test        # 96 tests across 26 suites (seeded fuzzing, real-git integration, HTTP end-to-end)
 npm run bench   # 500-claim scale benchmark (see numbers below)
 ```
 
@@ -168,3 +183,7 @@ Docs: [docs/TUTORIAL.md](docs/TUTORIAL.md) (5-minute walkthrough) · [docs/manua
 - `docs.commands` depends on `tooling.cli-surface`, so a drifted surface blocks
   the doc claim rather than letting it report a stale pass.
 - `policy.claims-valid` is a real pre-commit gate: a malformed claim cannot be committed.
+
+Its own history is the honest part: `manual history tests.suite` shows it broke
+twice, both times because a check was flaky rather than because the claim was
+wrong — which is exactly the signal a per-claim timeline exists to surface.

@@ -56,6 +56,14 @@ watch [--debounce N]
     match the changed file, plus bidirectional dependency closure. Stop with
     Ctrl+C. Runs until signaled; writes stamps to state.json.
 
+history [<claim-id>] [--limit N] [--json]
+    Claim archaeology. Without an id: a table of every claim with its last
+    state, observed break count, p50 runtime, and a unicode trend of recent
+    runs. With an id: every state transition, runtime p50/p90/max, mean time
+    to recovery, and the git provenance of the claim file. Joins state.json
+    history (machine-local, capped at 500 events) with the commit history of
+    the claim itself. Exits 1 when the named claim is currently broken.
+
 graph [--dot|--mermaid|--json]
     The evidence graph as data: nodes are claims, edges are depends_on
     (solid = required, dashed = optional). Prints claims/edges/layers and any
@@ -70,10 +78,13 @@ report [--out <file>] [--open]
 
 serve [--port N] [--open] [--pidfile <file>]
     Serve the same page as a loopback dashboard, regenerated per request:
-    GET / (report), GET /api/graph, GET /api/claims, GET /health, and
-    POST /api/verify which re-runs the real checks and rewrites state.json.
-    Binds 127.0.0.1 only. If the port is taken it tries N+1 ... N+19.
-    --pidfile lets scripts and editors find (and stop) the server.
+    GET / (report), GET /api/graph, GET /api/claims, GET /api/inbox,
+    GET /api/inbox/preview?file=, GET /health, POST /api/verify (re-runs the
+    real checks and rewrites state.json), and POST /api/inbox/accept
+    ({"file":"..."}) which applies a proposal. Candidate names are validated
+    to stay inside .manual/inbox/. Binds 127.0.0.1 only; if the port is taken
+    it tries N+1 ... N+19. --pidfile lets scripts and editors find (and stop)
+    the server.
 
 help
     Show usage.
@@ -95,6 +106,15 @@ Kinds: `fact`, `command`, `trap` (broken = gotcha fixed → retire), `policy`, `
 
 0 all fresh/passed · 1 something broken, a blocked gate, a graph cycle, or a
 suspect doctor report · 2 usage errors, load errors, or an unrunnable command.
+
+## TIMELINE
+
+`state.json` history records one event per executed check ({id, state, at, ms}),
+so `history` can answer questions the current stamp cannot: which claims flip
+most, whether a claim's runtime is creeping toward its bound, and how long a
+claim stayed wrong after it broke. It is an operational record on one machine,
+not an audit log; the git columns (`introduced`, `commits`, `last`) come from
+the claim file's own commit history and are shared by everyone.
 
 ## PERFORMANCE
 

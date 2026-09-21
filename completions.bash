@@ -6,8 +6,8 @@ _manual_cli() {
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
-  commands="verify brief enforce observe doctor init inbox hooks eject watch graph report serve mcp help"
-  flags="--root --force --diff --json --budget --at --stage --dry-run --port --open --pidfile --out --dot --mermaid -h --help"
+  commands="verify brief enforce observe doctor init inbox hooks eject watch history graph report serve mcp help"
+  flags="--root --force --diff --json --budget --at --stage --dry-run --port --open --pidfile --out --dot --mermaid --limit -h --help"
 
   if [ "$COMP_CWORD" -eq 1 ]; then
     COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
@@ -47,6 +47,13 @@ _manual_cli() {
       ;;
     watch)
       COMPREPLY=( $(compgen -W "--debounce --root" -- "$cur") )
+      ;;
+    history)
+      if [[ "$cur" == --* ]]; then
+        COMPREPLY=( $(compgen -W "--limit --json --root" -- "$cur") )
+      else
+        COMPREPLY=( $(compgen -W "$(ls .manual/claims/*.md 2>/dev/null | xargs -n1 basename 2>/dev/null | sed 's/\.md$//')" -- "$cur") )
+      fi
       ;;
     graph)
       COMPREPLY=( $(compgen -W "--dot --mermaid --json --root" -- "$cur") )

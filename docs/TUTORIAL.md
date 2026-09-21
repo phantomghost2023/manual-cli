@@ -85,6 +85,16 @@ manual serve --port 4242        # http://127.0.0.1:4242/
 
 Nodes are colored by state and arrows point from a claim to what it depends on; click a node to jump to its card. The page has state/kind filters, the flywheel inbox, and whatever `doctor` is worried about. On the served dashboard there's also a **re-verify now** button: it re-runs the real checks in a sandbox and reloads with fresh stamps.
 
+Once the manual has run for a while, ask what has been happening to it:
+
+```bash
+manual history                  # every claim: breaks, runtime trend, recovery time
+manual history tests.suite      # one claim: transitions, p50/p90, git provenance
+```
+
+The dashboard shows the same timeline, and lets a human review a flywheel
+proposal (its exact frontmatter diff) and accept it from the browser.
+
 When you want the graph somewhere else, it exports:
 
 ```bash

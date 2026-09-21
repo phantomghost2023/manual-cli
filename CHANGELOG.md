@@ -2,6 +2,20 @@
 
 All notable changes to manual-cli are documented here. Format: Keep a Changelog; versioning: SemVer.
 
+## [0.4.0] - 2026-09-21
+
+### Added
+- `history [<claim-id>] [--limit N] [--json]` — claim archaeology: state transitions, per-claim runtime trend (p50/p90/max), observed break count, mean time to recovery, and the git provenance of the claim file. Joins `state.json` verify history with the claim's own commit history; degrades gracefully on a root that is not a git repo.
+- Timeline section in `report`/`serve`: verify-event and transition counts, mean time to recovery, and the most recent state flips across the manual.
+- Per-claim runtime sparklines (inline SVG) plus break counts and file provenance on every card.
+- Flywheel review in the dashboard: `GET /api/inbox/preview?file=` returns the exact frontmatter change a candidate proposes, and `POST /api/inbox/accept` applies it — so a human reviews a diff instead of accepting blind. The static report keeps the buttons hidden.
+- Expr checks now record a runtime, so the cheapest claims are no longer invisible to the trend lines and the flywheel.
+- Candidate filenames are validated (`safeInboxName`) so the HTTP surface cannot reach outside `.manual/inbox/`.
+
+### Fixed
+- `describeTimeline` crashed for any claim without git history (`files` was initialized to a truthy `[]`), which would break `manual history <id>` on an uncommitted claim.
+- A claim that was already broken when the history window opened now reports that break instead of showing a `broken → fresh` transition beside "0 breaks".
+
 ## [0.3.0] - 2026-09-21
 
 ### Added

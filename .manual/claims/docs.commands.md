@@ -15,7 +15,7 @@ evidence:
     - "README.md"
     - "src/cli.js"
 check:
-  expr: "[\"verify\",\"brief\",\"enforce\",\"observe\",\"doctor\",\"init\",\"inbox\",\"hooks\",\"eject\",\"watch\",\"graph\",\"report\",\"serve\"].every(c => read(\"README.md\").includes(c))"
+  expr: "[\"verify\",\"brief\",\"enforce\",\"observe\",\"doctor\",\"init\",\"inbox\",\"hooks\",\"eject\",\"watch\",\"history\",\"graph\",\"report\",\"serve\"].every(c => read(\"README.md\").includes(c))"
 verify: on_change
 provenance:
   author: agent:manual-cli

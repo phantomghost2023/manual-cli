@@ -2,7 +2,7 @@
 schema: manual/v1
 id: tooling.cli-surface
 kind: fact
-statement: The CLI dispatcher handles verify, brief, enforce, observe, doctor, init, inbox, hooks, eject, watch, graph, report, and serve.
+statement: The CLI dispatcher handles verify, brief, enforce, observe, doctor, init, inbox, hooks, eject, watch, history, graph, report, and serve.
 priority: high
 applies_to:
   - "src/**"
@@ -12,7 +12,7 @@ evidence:
     - "src/cli.js"
     - "bin/manual.js"
 check:
-  expr: "[\"verify\",\"brief\",\"enforce\",\"observe\",\"doctor\",\"init\",\"inbox\",\"hooks\",\"eject\",\"watch\",\"graph\",\"report\",\"serve\"].every(c => read(\"src/cli.js\").includes(\"cmd === '\" + c + \"'\"))"
+  expr: "[\"verify\",\"brief\",\"enforce\",\"observe\",\"doctor\",\"init\",\"inbox\",\"hooks\",\"eject\",\"watch\",\"history\",\"graph\",\"report\",\"serve\"].every(c => read(\"src/cli.js\").includes(\"cmd === '\" + c + \"'\"))"
 verify: on_change
 provenance:
   author: agent:manual-cli

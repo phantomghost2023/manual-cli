@@ -5,6 +5,7 @@ import { State } from './state.js';
 import { verify } from './verify.js';
 import { buildReportData, renderReport } from './report.js';
 import { graphToJson } from './graph.js';
+import { previewInbox, acceptInbox, readInbox } from './inbox.js';
 import { c } from './color.js';
 
 // `manual serve` — a local dashboard over the same artifact `manual report`
@@ -86,6 +87,37 @@ export function createHandler(root, opts = {}) {
         });
       } catch (e) {
         return json(res, 500, { error: e.message });
+      }
+    }
+
+    if (route === '/api/inbox') {
+      return json(res, 200, { candidates: readInbox(root) });
+    }
+
+    if (route === '/api/inbox/preview') {
+      try {
+        return json(res, 200, previewInbox(root, url.searchParams.get('file')));
+      } catch (e) {
+        return json(res, 400, { error: e.message });
+      }
+    }
+
+    if (route === '/api/inbox/accept') {
+      if (req.method !== 'POST') return json(res, 405, { error: 'POST required' });
+      let body = '';
+      for await (const chunk of req) {
+        body += chunk;
+        if (body.length > 64 * 1024) return json(res, 413, { error: 'body too large' });
+      }
+      let file = url.searchParams.get('file');
+      if (!file && body) {
+        try { file = JSON.parse(body).file; } catch { /* fall through to the error below */ }
+      }
+      try {
+        const dest = acceptInbox(root, file);
+        return json(res, 200, { accepted: true, file, dest });
+      } catch (e) {
+        return json(res, 400, { error: e.message });
       }
     }
 

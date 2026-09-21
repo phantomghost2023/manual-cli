@@ -54,6 +54,26 @@ export function listInbox(root) {
   return candidates.map((x) => x.file);
 }
 
+// Reject anything that is not a plain filename inside the inbox: the accept
+// and preview paths take a filename from HTTP, and it must not be able to
+// reach outside .manual/inbox/.
+export function safeInboxName(file) {
+  if (typeof file !== 'string' || file.length === 0) throw new Error('missing candidate filename');
+  if (file !== path.basename(file) || file.includes('..') || file.includes('/') || file.includes('\\')) {
+    throw new Error(`unsafe candidate name: ${file}`);
+  }
+  return file;
+}
+
+function getDotted(obj, keyPath) {
+  let o = obj;
+  for (const part of keyPath.split('.')) {
+    if (o == null || typeof o !== 'object') return undefined;
+    o = o[part];
+  }
+  return o;
+}
+
 // Set a dotted path (e.g. "check.expect.max_ms") inside a parsed frontmatter object.
 function setDotted(obj, keyPath, value) {
   const parts = keyPath.split('.');
@@ -90,7 +110,53 @@ function stringifyFm(obj, indent = 0) {
   return out;
 }
 
+// What would accepting this candidate do? Returned as data so a human can
+// review the change before it lands (the CLI prints the result; the dashboard
+// renders it behind a button). Never mutates anything.
+export function previewInbox(root, file) {
+  safeInboxName(file);
+  const src = path.join(root, '.manual', 'inbox', file);
+  if (!fs.existsSync(src)) throw new Error(`no such inbox candidate: ${file}`);
+  const text = fs.readFileSync(src, 'utf8');
+  const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/);
+  const fm = m ? parseYaml(m[1]) : {};
+  const targetId = fm.proposes?.update;
+  const patch = fm.proposes?.patch;
+
+  if (targetId && patch && typeof patch === 'object') {
+    const dest = path.join(root, '.manual', 'claims', `${targetId}.md`);
+    if (!fs.existsSync(dest)) throw new Error(`target claim not found: claims/${targetId}.md`);
+    const cm = fs.readFileSync(dest, 'utf8').match(/^---\r?\n([\s\S]*?)\r?\n---/);
+    const before = cm ? parseYaml(cm[1]) : {};
+    const changes = Object.entries(patch).map(([k, v]) => {
+      const old = getDotted(before, k);
+      return `- ${k}: ${JSON.stringify(old)}\n+ ${k}: ${JSON.stringify(v)}`;
+    });
+    return {
+      file,
+      mode: 'patch',
+      target: `claims/${targetId}.md`,
+      summary: `patches ${Object.keys(patch).join(', ')} in claims/${targetId}.md`,
+      changes,
+      diff: changes.join('\n'),
+    };
+  }
+
+  const id = fm.id && fm.id !== 'candidate' ? fm.id : null;
+  return {
+    file,
+    mode: 'whole',
+    target: id ? `claims/${id}.md` : null,
+    summary: id
+      ? `moves inbox/${file} → claims/${id}.md (still needs a real check before it can verify)`
+      : 'candidate has no id — cannot be accepted until it names one',
+    changes: [],
+    diff: text.split('\n').map((l) => `+ ${l}`).join('\n'),
+  };
+}
+
 export function acceptInbox(root, file) {
+  safeInboxName(file);
   const dir = path.join(root, '.manual', 'inbox');
   const src = path.join(dir, file);
   if (!fs.existsSync(src)) throw new Error(`no such inbox candidate: ${file}`);
