@@ -44,7 +44,7 @@ node bin/manual.js verify --root /path/to/repo --force
 | Command | What it does |
 |---|---|
 | `verify [--force] [--diff [base]] [--only <ids>] [--no-setup] [--setup-force]` | Run checks (skipping claims whose evidence digests are unchanged and within TTL), stamp `state.json`, exit 1 if anything is broken or held back by an unmet prerequisite. `--diff` verifies only claims relevant to changed files, plus all policies and dependency closure. `--only` restricts the run to named claims plus their transitive dependencies — a claim whose deps are unstamped would otherwise report `blocked`, which says nothing about the claim. `--no-setup` trusts the environment (CI installs its own dependencies); `--setup-force` re-runs a prerequisite the cache considers done. |
-| `setup [--force] [--claim <id>] [--json]` | What the manual needs installed before it can say anything: every claim's `check.setup`, deduplicated by command, with whether this machine has satisfied it and when it last ran. `--force` runs them (the plumbing `init`/`verify` do automatically). Exits 1 if an install fails. |
+| `setup [--force] [--all] [--claim <id>] [--json]` | What the manual needs installed before it can say anything: every prerequisite declared in `manual.yaml`, deduplicated by command, with the claims that reference it and whether this machine has satisfied it. `--force` runs what claims need, `--all` includes declared steps no claim references, `--claim` narrows to one claim. Listing installs nothing. Exits 1 on a failed install or a prerequisite some claim requires but nobody declares. |
 | `brief [--budget N] [files...]` | Token-budgeted briefing: claims relevant to the files in play, weighted by priority × glob specificity × trust tier; traps score double; `when: true` claims always included. |
 | `enforce [--stage pre-commit\|pr]` | Runs every policy claim's check as a gate. The claim's check IS the gate — enforcement and documentation are the same object and cannot drift. |
 | `observe` | Reads verify history in `state.json`, writes inbox candidates when measurements diverge from claim bounds: *tighten* (the bound sits far above what runs cost) or *relax* (the bound itself broke the claim). Proposed bounds respect the tail — at least 3× the median, 1.5× p90, and 1.1× the worst run seen — and it refuses to propose a tightening the observed tail would violate. Every proposal carries a *diagnosis* of why the series is spiky (cold start, trend, outlier, two clusters, correlated with free memory or machine load, cold-cache after an evidence change, or a single test dominating the suite), because naming the cause changes the right action. It also reports candidates that have gone *stale* (evidence moved since they were written). |
@@ -143,10 +143,7 @@ evidence:
 depends_on:
   - { id: tooling.modules, required: true }   # dep not fresh ⇒ blocked
 check:
-  setup:                       # optional prerequisite, run once per command+evidence
-    run: npm ci
-    evidence: ["package.json", "package-lock.json"]
-    cache: ["node_modules"]
+  requires: node               # prerequisite declared once in manual.yaml
   run: node --test
   expect: { exit: 0, max_ms: 30000 }
 verify: on_change              # on_change | on_demand | always
@@ -177,34 +174,67 @@ Claims earn trust by being executed, not by being written: `ghost` (imported, ne
 - `expr` — sandboxed predicate over a tiny read-only API: `exists()`, `read()`, `manifest()`, `env()`, `nodeMajor()`, `codeowners()`, `lockActive(owner, {withinDays})` (true when a branch named for that owner has recent commits or is checked out in a worktree — the coordination signal behind ownership claims).
 - `enforce` — policy claims reuse the same check as a pre-commit/PR gate.
 
-### Prerequisites: `check.setup`
+### Prerequisites: declared once, referenced by name
 
 A command check that needs installed dependencies or a build step cannot prove
 anything on its own. On a fresh clone `npm test` exits 127, and the claim used
 to read **broken** — which blamed the repository for the checkout.
 
+A repository does not have *one* prerequisite, it has an install per ecosystem
+plus whatever build or codegen step the commands sit on. Those belong to the
+repository, not to each claim, so they are declared once in
+`.manual/manual.yaml`:
+
 ```yaml
-check:
-  setup:
+# .manual/manual.yaml
+setup:
+  node:
     run: npm ci                  # or a build step: "make deps"
     evidence:                    # what decides whether the install is still valid
       - package.json
       - package-lock.json
     cache: ["node_modules"]      # the directories its success is measured by
+  python:
+    run: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+    evidence: ["requirements.txt"]
+    cache: [".venv"]
     timeout_s: 900
-  run: npm test
 ```
 
-- **`blocked`, not `broken`.** A claim whose setup did not complete is
+```yaml
+# .manual/claims/tests.suite.md
+check:
+  requires: [node, python]       # or one name, or a per-claim inline `setup:`
+  run: pytest && npm test
+```
+
+- **Deduplication follows the command, not the claim.** A named prerequisite
+  runs once per `(command, evidence)` pair no matter how many claims reference
+  it, so ten claims requiring `node` pay for one install; a claim requiring
+  `node` and `python` pays for two, once each, in the order it lists them (its
+  own inline `setup:` runs last — the specific step on top of the installs).
+- **A name nobody declares is a load error, not a skipped step.** The claim is
+  reported `blocked` with `unknown prerequisite "nodejs"` and `verify`/`doctor`
+  exit non-zero, because a check that runs without its install reports its own
+  failure as the repository's truth.
+- **`manual setup` is the inventory**: every declared prerequisite, the claims
+  that reference it, and whether this machine has satisfied it. Declared but
+  unreferenced is a fact about the repo, not a request to run it (`--force`
+  warms what claims need; `--all` runs the rest). `init` writes the detected
+  ecosystems here and points candidates at them by name.
+- Per-claim `check.setup` still works, for the one claim with the one awkward
+  step that is nobody else's business.
+- **`blocked`, not `broken`.** A claim whose prerequisite did not complete is
   *untested*: it reports `blocked`, keeps the tier it had earned, and fails CI
   with the reason instead of the claim's name. "Untested is not disproven."
 - **Once per (command, evidence) pair, not per verify.** The key is the command
   plus the *content* of its evidence, so bumping a lockfile re-installs and
-  re-verifying untouched code does not. Twelve claims needing `npm ci` need it
-  once. The cache lives in `.manual/cache/` (gitignored — it describes a machine,
-  not the truth), and it is only trusted while the directories it declares still
-  exist: delete `node_modules` by hand and the next verify reinstalls.
-- **Install cost is not suite cost.** The setup runs before the clock starts, so
+  re-verifying untouched code does not; twelve claims requiring `node` need one
+  install. The cache lives in `.manual/cache/` (gitignored — it describes a
+  machine, not the truth), and it is only trusted while the directories it
+  declares still exist: delete `node_modules` by hand and the next verify
+  reinstalls it.
+- **Install cost is not suite cost.** Prerequisites run before the clock starts, so
   `measured_ms` stays the check's own runtime and the flywheel's bounds keep
   meaning something.
 - **Installs are not sandboxed.** They run in the checkout, exactly as a
@@ -257,7 +287,7 @@ it. The diagnosis is recorded in the candidate, in the journal entry, and in
 
 ```
 .manual/
-  manual.yaml        # brief budget, verify timeouts, CI-required claim globs
+  manual.yaml        # brief budget, verify timeouts, CI globs, declared prerequisites
   claims/*.md        # accepted claims
   inbox/*.md         # candidates proposed by sessions / init / observe
   journal/*.md       # committed audit trail: each accepted change + its reason
@@ -275,7 +305,7 @@ The demo ships a genuine trap discovered while building it: `node --test --test-
 ## Test
 
 ```bash
-npm test        # 181 tests across 34 suites (seeded fuzzing, real-git integration, HTTP end-to-end)
+npm test        # 192 tests across 36 suites (seeded fuzzing, real-git integration, HTTP end-to-end)
 npm run bench   # 500-claim scale benchmark (see numbers below)
 ```
 

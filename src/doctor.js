@@ -1,8 +1,8 @@
-import { loadManual } from './claims.js';
+import { loadConfig, loadManual } from './claims.js';
 import { evidenceDigest } from './hash.js';
 import { parseTtl } from './util.js';
 import { staleProposals } from './observe.js';
-import { setupStatus } from './setup.js';
+import { resolvePrereqs, setupStatus } from './setup.js';
 import { c } from './color.js';
 
 // Doctor: a health report for the manual itself. Recomputes digests, checks
@@ -10,6 +10,7 @@ import { c } from './color.js';
 
 export function doctor(root, state) {
   const { claims, errors } = loadManual(root);
+  const config = loadConfig(root);
   const rows = [];
   const digestCache = new Map();
 
@@ -19,16 +20,27 @@ export function doctor(root, state) {
     const d = evidenceDigest(root, cl.fm.evidence || {}, state.salt, digestCache);
     const row = { id, state: 'unverified', tier: stamp?.tier || null, issues: [] };
 
-    // A declared prerequisite is part of the claim's health: if it isn't
+    // Declared prerequisites are part of the claim's health: if one isn't
     // satisfied here, the next verify can only say "blocked", and the human
     // reading this report is the one who can install it.
-    if (cl.setup) {
-      const su = setupStatus(root, cl.setup);
-      row.setup = { run: su.run, cached: su.cached, missing: su.missing, last: su.entry?.at || null };
-      if (stamp?.state === 'blocked' && stamp.setup) {
-        row.issues.push(`prerequisite not satisfied: ${su.run} — untested, not false (fix with \`manual setup --force\`)`);
-      } else if (!su.cached && !stamp) {
-        row.issues.push(`declares a prerequisite (${su.run}) that has not been satisfied here yet`);
+    const { specs, unknown } = resolvePrereqs(cl, config);
+    for (const n of unknown) {
+      row.issues.push(`requires unknown prerequisite "${n}" — not declared in .manual/manual.yaml`);
+    }
+    if (specs.length) {
+      row.setups = specs.map(({ name, spec }) => {
+        const su = setupStatus(root, spec);
+        return { name, run: su.run, cached: su.cached, missing: su.missing, last: su.entry?.at || null };
+      });
+      const label = (s) => (s.name ? `${s.name} (${s.run})` : s.run);
+      const failed = (stamp?.setups || []).filter((s) => ['failed', 'timeout', 'skipped', 'unknown'].includes(s.status));
+      const unsatisfied = row.setups.filter((s) => !s.cached);
+      if (stamp?.state === 'blocked' && failed.length) {
+        row.issues.push(
+          `prerequisite not satisfied: ${failed.map((s) => (s.name ? `${s.name} (${s.run})` : s.run)).join(', ')} — untested, not false (fix with \`manual setup --force\`)`,
+        );
+      } else if (!stamp && unsatisfied.length) {
+        row.issues.push(`declares a prerequisite (${unsatisfied.map(label).join(', ')}) that has not been satisfied here yet`);
       }
     }
 
@@ -53,7 +65,10 @@ export function doctor(root, state) {
   // state is optional here: stale-candidate analysis needs history and stamps,
   // and a caller without one simply has no proposals to compare against.
   const stale = state ? staleProposals(root, state) : [];
-  return { rows, suspect, healthy, errors, staleCandidates: stale };
+  // `errors` already carries the config problems: loadManual merges a malformed
+  // setup block and any claim that requires a name nobody declares, so a typo in
+  // check.requires is reported rather than silently skipping the install.
+  return { rows, suspect, healthy, errors, staleCandidates: stale, config };
 }
 
 export function printDoctor(res) {
@@ -64,8 +79,9 @@ export function printDoctor(res) {
       console.log(`${c.amber('▲')} ${r.id.padEnd(36)} ${r.state}`);
       for (const i of r.issues) console.log(c.amber(`    - ${i}`));
     }
-    if (r.setup) {
-      console.log(c.grey(`    ⚙ setup${r.setup.cached ? '' : ' (unsatisfied)'}: ${r.setup.run}${r.setup.missing.length ? ` — missing ${r.setup.missing.join(', ')}` : ''}`));
+    for (const s of r.setups || []) {
+      const label = s.name ? `${s.name} → ${s.run}` : s.run;
+      console.log(c.grey(`    ⚙ setup${s.cached ? '' : ' (unsatisfied)'}: ${label}${s.missing.length ? ` — missing ${s.missing.join(', ')}` : ''}`));
     }
   }
   for (const e of res.errors) console.log(c.red(`✖ load error: ${e}`));

@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { splitFrontmatter, splitSections } from './md.js';
 import { parseYaml } from './yaml.js';
-import { normalizeSetup } from './setup.js';
+import { normalizeSetup, normalizeSetupMap, requiredNames } from './setup.js';
 
 export const KINDS = new Set(['fact', 'command', 'trap', 'policy', 'ownership']);
 const CHECK_SHAPES = new Set(['run', 'expr', 'enforce']);
@@ -49,6 +49,18 @@ export function parseClaim(text, file) {
   }
   if (fm.kind === 'policy' && !check.enforce && !fm.enforce) {
     throw new ClaimError(file, 'policy claims must define enforce { stage, paths, severity } (in check or at top level)');
+  }
+
+  // check.requires names a prerequisite declared once in .manual/manual.yaml;
+  // checking the names exist needs the config, so it happens in loadManual.
+  if (check.requires !== undefined && check.requires !== null) {
+    const names = Array.isArray(check.requires) ? check.requires : [check.requires];
+    if (names.length === 0 || names.some((n) => typeof n !== 'string' || !n.trim())) {
+      throw new ClaimError(file, 'check.requires must be a prerequisite name or a list of names');
+    }
+    if (!check.run) {
+      throw new ClaimError(file, 'check.requires only applies to command claims (needs check.run)');
+    }
   }
 
   // check.setup declares the prerequisite an install/build must satisfy before
@@ -125,7 +137,10 @@ export function loadManual(root) {
   // run `init` and not yet accepted anything is in exactly that state, and
   // every read-only command used to die on it (found on a real repo, right
   // after reverting the only claim). Callers decide what to say about it.
-  if (files.length === 0) return { claims: [], errors: [], empty: true };
+  if (files.length === 0) {
+    const empty = loadConfig(root);
+    return { claims: [], errors: [...(empty.setupErrors || [])], empty: true, config: empty };
+  }
 
   const claims = [];
   const errors = [];
@@ -147,7 +162,23 @@ export function loadManual(root) {
       if (!d.id || !seen.has(d.id)) errors.push(`${path.basename(c.file)}: depends_on unknown claim "${d.id}"`);
     }
   }
-  return { claims, errors };
+  // validate prerequisite references. A named prerequisite that does not exist
+  // would otherwise be silently skipped, and the claim would run unprepared and
+  // report its check's failure as truth.
+  const config = loadConfigCached(root);
+  errors.push(...(config.setupErrors || []));
+  for (const c of claims) {
+    for (const name of requiredNames(c)) {
+      if (!config.setup[name]) {
+        const known = Object.keys(config.setup);
+        errors.push(
+          `${path.basename(c.file)}: requires unknown prerequisite "${name}"` +
+            (known.length ? ` (declared in .manual/manual.yaml: ${known.join(', ')})` : ' (nothing is declared in .manual/manual.yaml)'),
+        );
+      }
+    }
+  }
+  return { claims, errors, config };
 }
 
 export function loadConfig(root) {
@@ -155,9 +186,20 @@ export function loadConfig(root) {
   const defaults = {
     brief: { budget_tokens: 2000 },
     verify: { default_timeout_s: 60, ci: { required: [], diff_base: 'origin/main' } },
+    setup: {},
   };
-  if (!fs.existsSync(p)) return defaults;
-  const cfg = parseYaml(fs.readFileSync(p, 'utf8'));
+  if (!fs.existsSync(p)) return { ...defaults, setupErrors: [] };
+  let cfg = {};
+  const setupErrors = [];
+  try {
+    cfg = parseYaml(fs.readFileSync(p, 'utf8'));
+  } catch (e) {
+    // A broken config must not take the whole manual down with it: the errors
+    // travel with the config so verify and doctor can print them.
+    return { ...defaults, setupErrors: [`manual.yaml: ${e.message}`] };
+  }
+  const { specs, errors } = normalizeSetupMap(cfg.setup);
+  setupErrors.push(...errors);
   return {
     brief: { ...defaults.brief, ...(cfg.brief || {}) },
     verify: {
@@ -165,5 +207,28 @@ export function loadConfig(root) {
       ...cfg.verify,
       ci: { ...defaults.verify.ci, ...((cfg.verify || {}).ci || {}) },
     },
+    setup: specs,
+    setupErrors,
   };
+}
+
+// Same object per root unless the file changed (statSync mtime+size). `verify`
+// loads it once, but a per-claim runCheck in a 500-claim manual would otherwise
+// re-read and re-parse it 500 times.
+const configCache = new Map();
+
+export function loadConfigCached(root) {
+  const p = path.join(root, '.manual', 'manual.yaml');
+  let st;
+  try {
+    st = fs.statSync(p);
+  } catch {
+    configCache.delete(root);
+    return loadConfig(root);
+  }
+  const hit = configCache.get(root);
+  if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.config;
+  const config = loadConfig(root);
+  configCache.set(root, { mtimeMs: st.mtimeMs, size: st.size, config });
+  return config;
 }

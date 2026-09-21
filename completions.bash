@@ -31,7 +31,7 @@ _manual_cli() {
       ;;
     setup)
       if [[ "$cur" == --* ]]; then
-        COMPREPLY=( $(compgen -W "--force --claim --json --root" -- "$cur") )
+        COMPREPLY=( $(compgen -W "--force --all --claim --json --root" -- "$cur") )
       else
         COMPREPLY=( $(compgen -W "$(ls .manual/claims/*.md 2>/dev/null | xargs -n1 basename 2>/dev/null | sed 's/\.md$//')" -- "$cur") )
       fi

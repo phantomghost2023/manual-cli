@@ -4,12 +4,13 @@ import { evaluateExpr } from './expr.js';
 import { Sandbox } from './sandbox.js';
 import { nowIso } from './util.js';
 import { ledgerStats, mergeTrust, machineName } from './ledger.js';
-import { ensureSetup, normalizeSetup, setupStatus } from './setup.js';
+import { ensureSetup, resolvePrereqs, setupStatus } from './setup.js';
+import { loadConfigCached } from './claims.js';
 
 // Executes a claim's check and interprets the result by kind.
 // States: fresh | stale | broken | blocked | unknown.
 
-export async function runCheck(claim, root, { sandbox, timeoutMs, noSetup = false, setupForce = false, quiet = false } = {}) {
+export async function runCheck(claim, root, { sandbox, timeoutMs, noSetup = false, setupForce = false, quiet = false, config = null } = {}) {
   const { check } = claim;
   const fm = claim.fm;
 
@@ -26,35 +27,52 @@ export async function runCheck(claim, root, { sandbox, timeoutMs, noSetup = fals
   try {
     if (!check.run) return { ok: false, error: 'no executable check' };
 
-    // Prerequisite first. A check that needs installed dependencies cannot
-    // report on the repository until they exist, so the setup's own outcome is
-    // part of the result — and its failure is `blocked`, not `broken`.
-    const spec = claim.setup || normalizeSetup(check);
-    let setup = null;
-    if (spec) {
+    // Prerequisites first: the installs the claim requires by name, then its own
+    // inline step. A check that needs installed dependencies cannot report on
+    // the repository until they exist, so each prerequisite's outcome is part of
+    // the result — and a failure is `blocked`, not `broken`.
+    const resolved = resolvePrereqs(claim, config || loadConfigCached(root));
+    const setups = [];
+    if (resolved.unknown.length) {
+      const name = resolved.unknown[0];
+      return {
+        ok: false,
+        blocked: true,
+        setups,
+        setupError: { name, run: null, status: 'unknown', note: 'not declared in .manual/manual.yaml' },
+        error: `unknown prerequisite "${name}" — nothing declares it, so the claim cannot be prepared (add it to .manual/manual.yaml or drop check.requires)`,
+      };
+    }
+    for (const { name, spec } of resolved.specs) {
+      const label = name ? `${name} (${spec.run})` : spec.run;
       if (noSetup) {
         const st = setupStatus(root, spec);
+        const record = { name, ...st, status: 'skipped' };
+        setups.push(record);
         if (st.missing.length) {
           return {
             ok: false,
             blocked: true,
-            setup: { ...st, status: 'skipped' },
+            setups,
+            setupError: record,
             error: `setup skipped and ${st.missing.join(', ')} is missing — the claim is untested, not false`,
           };
         }
-        setup = { ...st, status: 'skipped' };
-      } else {
-        setup = await ensureSetup(root, spec, { force: setupForce, quiet });
-        // An install may create the very directory the check needs to see.
-        if (setup.status === 'ran' || setup.status === 'cached') sb.addDeps(spec.cache);
-        if (setup.status === 'failed' || setup.status === 'timeout') {
-          return {
-            ok: false,
-            blocked: true,
-            setup,
-            error: `setup failed: ${setup.run} (${setup.timedOut ? 'timed out' : `exit ${setup.exit}`}) — the claim is untested, not false`,
-          };
-        }
+        continue;
+      }
+      const setup = await ensureSetup(root, spec, { force: setupForce, quiet });
+      setups.push({ name, ...setup });
+      // An install may create the very directory the check needs to see, and a
+      // second prerequisite may need the first one's artifacts on PATH.
+      if (setup.status === 'ran' || setup.status === 'cached') sb.addDeps(spec.cache);
+      if (setup.status === 'failed' || setup.status === 'timeout') {
+        return {
+          ok: false,
+          blocked: true,
+          setups,
+          setupError: { name, ...setup },
+          error: `setup failed: ${label} (${setup.timedOut ? 'timed out' : `exit ${setup.exit}`}) — the claim is untested, not false`,
+        };
       }
     }
 
@@ -81,7 +99,7 @@ export async function runCheck(claim, root, { sandbox, timeoutMs, noSetup = fals
       value: r.exit,
       exit: r.exit,
       ms,
-      setup,
+      setups,
       stdout: out.slice(0, 4000),
       // Parsed from the *untruncated* output: the slowest test is exactly the
       // line most likely to be past the 4000-char cut.
@@ -125,6 +143,19 @@ export function parseTestTimings(out) {
   return { slowest, total: Math.round(total), count: found.length };
 }
 
+// The setup columns for one history event, or nothing at all when the claim
+// declares no prerequisites (absent keys keep old entries honest).
+function setupHistory(setups) {
+  if (!setups || setups.length === 0) return {};
+  const ran = setups.filter((s) => s.status === 'ran');
+  const status = ran.length ? 'ran' : setups[0].status;
+  return {
+    setup_status: status,
+    setups: setups.length,
+    ...(ran.length ? { setup_ms: ran.reduce((n, s) => n + (s.ms || 0), 0) } : {}),
+  };
+}
+
 // Pure promotion/demotion rule, exported for tests.
 export function promoteTier(tier, passes, distinctMachines) {
   if (tier === 'ghost' || tier === 'unknown') return 'bronze';
@@ -141,10 +172,15 @@ export function interpret(claim, result) {
     // already means "this run says nothing about the claim"; using `broken` here
     // would blame the repository for the environment and drop its trust tier.
     if (result.blocked) {
-      const s = result.setup;
-      const note = s && s.status === 'skipped'
+      const e = result.setupError;
+      // The name matters: a claim can require several, and "setup failed" is not
+      // actionable when the repo installs with npm *and* python.
+      const label = e?.name ? `${e.name}: ${e.run || 'prerequisite'}` : (e?.run || 'setup');
+      const note = e?.status === 'skipped'
         ? 'setup skipped — dependencies missing'
-        : `setup failed (${s?.run || 'setup'})`;
+        : e?.status === 'unknown'
+          ? `unknown prerequisite "${e.name}"`
+          : `setup failed (${label})`;
       return { state: 'blocked', note };
     }
     if (kind === 'trap') return { state: 'broken', note: 'gotcha no longer reproduces' };
@@ -199,11 +235,16 @@ export async function verifyOne(claim, root, state, { sandbox, timeoutMs, noSetu
     measured_ms: result.ms ?? null,
     note,
     env,
-    // Null, not omitted: a claim whose setup declaration was removed must stop
-    // reporting the prerequisites of the version before it.
-    setup: result.setup
-      ? { key: result.setup.key, status: result.setup.status, run: result.setup.run, ms: result.setup.ms ?? null }
-      : null,
+    // Always a list, empty when the claim has no prerequisites: a claim whose
+    // declaration was removed must stop reporting the steps of the version
+    // before it, and a claim with two must not report only the last one.
+    setups: (result.setups || []).map((s) => ({
+      name: s.name ?? null,
+      key: s.key ?? null,
+      status: s.status,
+      run: s.run ?? null,
+      ms: s.ms ?? null,
+    })),
     origin: claim.fm.provenance?.origin || 'authored',
     author: claim.fm.provenance?.author || null,
   });
@@ -218,7 +259,8 @@ export async function verifyOne(claim, root, state, { sandbox, timeoutMs, noSetu
     // available explanation for a spike.
     digest_changed: prev && prev.digest !== claim.digest ? 1 : 0,
     // Install cost, kept out of `ms`: the trend line is the check's runtime.
-    ...(result.setup?.ms != null ? { setup_ms: result.setup.ms, setup_status: result.setup.status } : {}),
+    // Summed across prerequisites, since two installs are still not the suite.
+    ...setupHistory(result.setups),
     // Only when the runner actually reported per-test timings; absent keys
     // keep old history entries and non-test commands honest.
     ...(result.timings

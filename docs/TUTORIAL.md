@@ -61,18 +61,29 @@ Each check runs in a throwaway git worktree; stamps land in `.manual/state.json`
 
 Every real repository has this problem: on a fresh clone, `npm test` exits 127,
 and the first claim about the suite is false before anyone has typed anything.
-`init` sees it (no `node_modules`, dependencies declared) and ships the
-candidate with the prerequisite attached:
+`init` sees it (no `node_modules`, dependencies declared), writes the install
+into `manual.yaml` once, and points the candidate at it by name:
 
 ```yaml
-check:
-  setup:
+# .manual/manual.yaml
+setup:
+  node:
     run: npm install
     evidence: ["package.json"]
     cache: ["node_modules"]
+```
+
+```yaml
+# .manual/claims/tests.suite.md
+check:
+  requires: node
   run: npm test          # not the raw script: mocha needs node_modules/.bin on PATH
   expect: { exit: 0, max_ms: 120000 }
 ```
+
+One install per ecosystem, however many claims need it — a second claim that
+needs npm says `requires: node` and costs nothing; a claim that needs npm *and*
+a Python virtualenv lists both and pays for two, once each, in that order.
 
 The probe runs the setup, then probes again, and reports what it actually found:
 
@@ -86,8 +97,9 @@ probing discovered candidates before proposing them…
 From then on the install is part of the claim's premise, not a surprise:
 
 ```bash
-manual setup                  # what is declared, and whether this machine has it
-manual setup --force           # install it now instead of waiting for verify
+manual setup                  # declared prerequisites, who needs them, what this machine has
+manual setup --force           # install what claims need, now instead of waiting for verify
+manual setup --all             # also run declared steps no claim references
 manual verify --no-setup       # trust the environment (CI already installed)
 ```
 

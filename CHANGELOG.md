@@ -2,6 +2,18 @@
 
 All notable changes to manual-cli are documented here. Format: Keep a Changelog; versioning: SemVer.
 
+## [0.8.0] - 2026-09-21
+
+### Added
+- **Prerequisites are declared once, in `.manual/manual.yaml`, and referenced by name.** A repository does not have one prerequisite — it has an install per ecosystem (npm and a Python venv), a build, a codegen step — and every command claim that touched them had to restate the same command. The same command written twice is two chances to disagree, so `setup.<name>` now holds the definition and `check.requires: node` (or a list) holds the reference. Inline `check.setup` still works for the one claim with the one awkward step that is nobody else's business.
+- **Deduplication follows the command, not the claim.** A named prerequisite runs once per (command, evidence) pair however many claims reference it, so ten claims requiring `node` pay for one install; two names for the same command, or a claim listing a name and the identical inline step, are also one. A claim requiring two ecosystems pays for two, once each, in the order it lists them, with its own inline step last — the specific build that sits on top of the installs.
+- `stamp.setups[]` and `history.setups` / `setup_ms` / `setup_status`: each claim records every prerequisite it used, by name, with the status each ended in — so a failure says *which* step (`node: npm ci`) rather than "setup failed", and two installs are still not the suite's runtime.
+- `manual setup` is the inventory: declared prerequisites, the claims that reference each, whether this machine has satisfied it, when it last ran and how long it took. `--force` runs what claims require; `--all` also runs declared steps no claim references (a declared install is a fact about the repo, not a request to run it); `--claim` narrows to one claim. `--json` carries name, claims, `declared` and `cached`.
+- `init` writes the detected ecosystems into `manual.yaml` (`node`; `python` when a virtualenv is present; `make deps` when the Makefile declares that target) and points candidates at them by name. An existing `setup:` block is never rewritten — the detected name is reported as not written instead, so a human's file keeps its comments and ordering.
+- A claim that requires a name nothing declares is a **load error** (`verify` exits 2, `doctor` reports it) *and* blocks the claim: a check that runs without its install reports its own failure as the repository's truth. `manual setup` exits 1 and names the typo.
+- Config hygiene: `manual.yaml` is stat-cached per process (a phase-2 per-claim runCheck no longer re-reads it for every claim), its `setup:` block is validated (names, shapes, timeouts) and a malformed one is reported alongside the claims' load errors rather than crashing the manual.
+- `doctor`, `brief` (`⚙ needs: node: npm ci (missing node_modules)`) and the report/dashboard all show every prerequisite of a claim, by name, with whether this machine has it.
+
 ## [0.7.0] - 2026-09-21
 
 ### Added

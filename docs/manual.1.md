@@ -26,13 +26,16 @@ verify [--force] [--diff [base]] [--only <ids>] [--no-setup] [--setup-force]
     refuses to call a claim broken when the prerequisite it declares is
     visibly absent; --setup-force re-runs an install the cache considers done.
 
-setup [--force] [--claim <id>] [--json]
-    What the manual needs installed before it can say anything: each claim's
-    check.setup, deduplicated by (command, evidence), with whether this machine
-    has satisfied it, when it last ran, and how long it took. Listing is free —
-    nothing is installed. --force runs the commands (the same plumbing init and
-    verify use), --claim restricts it to one claim's prerequisite. Exit 1 if an
-    install fails or times out.
+setup [--force] [--all] [--claim <id>] [--json]
+    What the manual needs installed before it can say anything: every
+    prerequisite declared under `setup:` in .manual/manual.yaml, deduplicated by
+    (command, evidence), plus any inline check.setup a claim carries — with the
+    claims that reference each one, whether this machine has satisfied it, when
+    it last ran, and how long it took. Listing is free — nothing is installed.
+    --force runs what claims require (the same plumbing init and verify use),
+    --all also runs declared steps no claim references, --claim narrows to one
+    claim's prerequisites. Exit 1 if an install fails or times out, or if a
+    claim requires a name nothing declares.
 
 brief [--budget N] [--at <ref>] [--json] [files...]
     Token-budgeted briefing for the files in play. Weighted by priority x
@@ -155,15 +158,40 @@ help
 
 Claim file `.manual/claims/<id>.md` — YAML frontmatter (schema, id, kind, statement, priority, applies_to, evidence, depends_on, check, verify, ttl, provenance, lifecycle) + prose body. `check` is one of `run` (shell + expect{exit,stdout_matches,stderr_matches,max_ms}), `expr` (sandboxed predicate over exists/read/manifest/env/nodeMajor/codeowners/lockActive), or `enforce` (policy gate: stage, paths, severity).
 
-A command check may declare `setup` — the prerequisite that has to exist before
-`run` can mean anything (`setup: npm ci`, or a map with `run`, `evidence` (files
-whose content invalidates the install, default: the repo's lockfiles), `cache`
-(the directories its success is measured by, default node_modules) and
-`timeout_s`, default 900). It runs once per (command, evidence) pair rather than
-once per verify, in the checkout rather than the sandbox, before the clock
-starts — so `measured_ms` stays the check's own runtime. A claim whose setup did
-not complete is `blocked`, not `broken`: it keeps the trust it earned, fails CI,
-and says why. Setup is rejected on `expr` checks, which have nothing to install.
+Prerequisites that have to exist before `run` can mean anything are declared
+once, in `.manual/manual.yaml`, and referenced by name:
+
+    setup:
+      node:
+        run: npm ci
+        evidence: ["package.json", "package-lock.json"]
+        cache: ["node_modules"]
+        timeout_s: 900
+
+    check:
+      requires: [node, python]     # names from manual.yaml, in order
+      setup:                       # optional per-claim step, runs last
+        run: make build
+        cache: ["dist"]
+      run: npm test
+
+Each prerequisite takes `run` (required), `evidence` (files whose *content*
+invalidates the install; default: the repo's lockfiles), `cache` (the directories
+its success is measured by; default node_modules) and `timeout_s` (default 900);
+the shorthand `node: npm ci` is also accepted. Deduplication is by (command,
+evidence) — a name, a second name for the same command, and an identical inline
+step are one install — so ten claims requiring `node` pay for it once, and a
+claim requiring two ecosystems pays for two, once each. Prerequisites run in the
+order the claim lists them, then the claim's own inline step, once per (command,
+evidence) pair rather than once per verify, in the checkout rather than the
+sandbox, before the clock starts — so `measured_ms` stays the check's own
+runtime and `setup_ms` records the install separately in `history`.
+
+A claim whose prerequisite did not complete is `blocked`, not `broken`: it keeps
+the trust it earned, fails CI, and says which step failed. A `requires` name that
+nothing declares is a load error (exit 2) and blocks the claim, because a check
+that runs without its install reports its own failure as the repository's truth.
+`requires` is rejected on `expr` checks, which have nothing to install.
 
 Kinds: `fact`, `command`, `trap` (broken = gotcha fixed → retire), `policy`, `ownership`. Trust tiers: ghost → bronze → silver (≥1 pass) → gold (≥5 passes across ≥2 machines); broken demotes and resets the ledger.
 
@@ -221,6 +249,17 @@ not an error: read-only commands report it, count what is waiting in the inbox,
 and exit 0, so a repo between `init` and its first accepted claim is usable.
 `verify --json` persists stamps and history before printing, because CI reads
 that output and a report that is not written down is not a verification.
+
+## CONFIGURATION
+
+`.manual/manual.yaml`: `brief.budget_tokens`, `verify.default_timeout_s`,
+`verify.ci.required` / `verify.ci.diff_base`, and `setup.<name>` prerequisites.
+The config is stat-cached per process, and a malformed block is reported with
+the claims' load errors rather than taking the manual down. `init` writes the
+detected ecosystems (`node`, `python` when a virtualenv is present, `make` when
+the Makefile declares a `deps:` target) into this file and points candidates at
+them by name; an existing `setup:` block is never rewritten — the detected name
+is reported instead, so a human's file keeps its comments.
 
 ## PERFORMANCE
 

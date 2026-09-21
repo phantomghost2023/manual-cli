@@ -113,6 +113,7 @@ export async function verify(root, opts = {}) {
       noSetup,
       setupForce,
       quiet,
+      config,
     });
     results.push(r);
   }
@@ -153,9 +154,13 @@ export function printVerifyReport(res) {
   // it is not a verified one either — CI must not pass on it.
   const stalled = res.results.filter((r) => r.result?.blocked);
   if (stalled.length) {
-    console.log(c.amber(`\n${stalled.length} claim(s) could not be tested: their declared setup did not complete.`));
-    for (const r of stalled) console.log(c.amber(`  - ${r.claim.fm.id}: ${r.result.setup?.run}${r.result.setup?.note ? ` — ${r.result.setup.note}` : ''}`));
-    console.log(c.grey('    fix the prerequisite (or pass --no-setup when the environment already has it), then re-run.'));
+    console.log(c.amber(`\n${stalled.length} claim(s) could not be tested: a declared prerequisite is not satisfied.`));
+    for (const r of stalled) {
+      const e = r.result.setupError || {};
+      const label = e.name ? `${e.name}: ${e.run || 'declared in manual.yaml'}` : (e.run || 'setup');
+      console.log(c.amber(`  - ${r.claim.fm.id}: ${label}${e.note ? ` — ${e.note}` : ''}`));
+    }
+    console.log(c.grey('    fix it (manual setup --force), or pass --no-setup when the environment already has it.'));
   }
   return counts.broken || stalled.length ? 1 : 0;
 }

@@ -30,6 +30,112 @@ import { nowIso, short } from './util.js';
 const DEFAULT_CACHE = ['node_modules'];
 const DEFAULT_TIMEOUT_S = 900;
 
+// ---------------------------------------------------------------------------
+// Named prerequisites (declared once, in .manual/manual.yaml)
+//
+// Per-claim `check.setup` covers the case of one claim with one awkward step,
+// but a repository does not have one prerequisite: it has an install (or two,
+// one per ecosystem), a build, a codegen step — and every command claim that
+// touches them would otherwise restate the same command. The same command
+// written twice is two chances to disagree, so the repository declares its
+// prerequisites once and claims reference them by name:
+//
+//   # .manual/manual.yaml
+//   setup:
+//     node:
+//       run: npm ci
+//       evidence: ["package.json", "package-lock.json"]
+//       cache: ["node_modules"]
+//
+//   # .manual/claims/tests.suite.md
+//   check:
+//     requires: node
+//     run: npm test
+//
+// Resolution is by name, then by inline setup, and deduplication is by
+// (command, evidence) as before — so ten claims requiring `node` pay for one
+// install, and a claim requiring both `node` and `python` pays for two, once
+// each, whatever order the claims run in.
+// ---------------------------------------------------------------------------
+
+const NAME_RE = /^[a-z0-9][a-z0-9.-]*$/;
+
+// A named prerequisite keeps the claim's name for it, so a failure can say
+// *which* step could not be established (`python: .venv/bin/pip install …`).
+export function normalizeSetupMap(raw, file = '.manual/manual.yaml') {
+  const specs = {};
+  const errors = [];
+  if (raw === undefined || raw === null) return { specs, errors };
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    return { specs, errors: [`${file}: setup must be a map of name -> run/build step`] };
+  }
+  for (const [name, value] of Object.entries(raw)) {
+    if (!NAME_RE.test(name)) {
+      errors.push(`${file}: prerequisite name "${name}" must be lowercase letters, digits, dots or dashes`);
+      continue;
+    }
+    const spec = typeof value === 'string' ? { run: value } : value;
+    if (!spec || typeof spec !== 'object' || typeof spec.run !== 'string' || !spec.run) {
+      errors.push(`${file}: prerequisite "${name}" needs a run command`);
+      continue;
+    }
+    if (spec.evidence !== undefined && !Array.isArray(spec.evidence)) {
+      errors.push(`${file}: prerequisite "${name}".evidence must be a list of files/globs`);
+      continue;
+    }
+    if (spec.cache !== undefined && !Array.isArray(spec.cache)) {
+      errors.push(`${file}: prerequisite "${name}".cache must be a list of directories`);
+      continue;
+    }
+    if (spec.timeout_s !== undefined && !(Number(spec.timeout_s) > 0)) {
+      errors.push(`${file}: prerequisite "${name}".timeout_s must be a positive number of seconds`);
+      continue;
+    }
+    specs[name] = normalizeSetup({ setup: spec });
+  }
+  return { specs, errors };
+}
+
+export function declaredPrereqs(config) {
+  return Object.entries(config?.setup || {}).map(([name, spec]) => ({ name, spec }));
+}
+
+// The names a claim requires, in the order it lists them.
+export function requiredNames(claim) {
+  const raw = claim?.check?.requires ?? claim?.fm?.check?.requires;
+  if (raw === undefined || raw === null || raw === '') return [];
+  return (Array.isArray(raw) ? raw : [raw]).map(String);
+}
+
+// A claim's prerequisites, in the order they must run: the named installs it
+// requires, then its own inline setup — the specific step that builds on them.
+export function resolvePrereqs(claim, config = {}) {
+  const specs = [];
+  const unknown = [];
+  const seen = new Set();
+  const push = (name, raw) => {
+    if (!raw) return;
+    // Normalizing here keeps the caller's shapes interchangeable: a spec from
+    // manual.yaml is already normalized, a shorthand string is not, and neither
+    // should decide whether deduplication works.
+    const spec = normalizeSetup({ setup: raw });
+    const key = `${spec.run}\0${spec.evidence.join(',')}\0${spec.cache.join(',')}`;
+    if (seen.has(key)) return; // one claim listing the same step twice, or two names for it
+    seen.add(key);
+    specs.push({ name, spec });
+  };
+  for (const name of requiredNames(claim)) {
+    const spec = config?.setup?.[name];
+    // A name with no definition is not a skipped step, it is a typo — the
+    // caller reports it rather than letting the check run unprepared.
+    if (!spec) unknown.push(name);
+    else push(name, spec);
+  }
+  const inline = claim?.setup || normalizeSetup(claim?.check);
+  if (inline) push(null, inline);
+  return { specs, unknown };
+}
+
 export function normalizeSetup(check) {
   const raw = check?.setup;
   if (!raw) return null;
@@ -209,17 +315,17 @@ export async function ensureSetup(root, spec, { force = false, quiet = false, on
 // most once. Returns nothing: this exists to warm the memo and the disk cache
 // *before* the sandbox is created, so that directories the install creates can
 // still be linked into the worktree.
-export async function warmSetups(root, claims, { force = false, quiet = false, onRun = null } = {}) {
+export async function warmSetups(root, claims, { force = false, quiet = false, onRun = null, config = {} } = {}) {
   const seen = new Set();
   const results = [];
   for (const cl of claims) {
-    const spec = cl.setup || normalizeSetup(cl.check);
-    if (!spec) continue;
-    const key = setupKey(root, spec);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const r = await ensureSetup(root, spec, { force, quiet, onRun });
-    results.push({ ...r, id: cl.fm?.id });
+    for (const { name, spec } of resolvePrereqs(cl, config).specs) {
+      const key = setupKey(root, spec);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const r = await ensureSetup(root, spec, { force, quiet, onRun });
+      results.push({ ...r, name, id: cl.fm?.id });
+    }
   }
   return results;
 }

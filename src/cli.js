@@ -19,7 +19,7 @@ import { buildGraph, graphToJson, toDot, toMermaid, printGraphSummary } from './
 import { writeReport } from './report.js';
 import { serveCommand } from './serve.js';
 import { loadManual } from './claims.js';
-import { ensureSetup, normalizeSetup, setupKey, setupStatus } from './setup.js';
+import { declaredPrereqs, ensureSetup, requiredNames, resolvePrereqs, setupKey, setupStatus } from './setup.js';
 import { short } from './util.js';
 import { buildTimeline, describeTimeline, fmtDuration, fmtWhen, sparkline } from './timeline.js';
 import { diagnoseSeries, seriesEvents } from './observe.js';
@@ -52,7 +52,7 @@ Usage:
                 [--setup-force] [--json]   # prerequisites: see the setup command
   manual brief  [--root <dir>] [--budget N] [--json] [files...]
   manual enforce [--root <dir>] [--stage pre-commit|pr]
-  manual setup  [--root <dir>] [--force] [--claim <id>] [--json]  # declared prerequisites
+  manual setup  [--root <dir>] [--force] [--all] [--claim <id>] [--json]  # declared prerequisites
   manual observe [--root <dir>]          # flywheel: measurements -> inbox candidates
   manual doctor [--root <dir>]           # manual health report
   manual init   [--root <dir>] [--dry-run] [--no-probe]   # discover + scaffold .manual/
@@ -140,9 +140,12 @@ export async function main(argv = []) {
             measured_ms: r.stamp.measured_ms ?? null,
             // So CI can tell "the code is wrong" from "the environment isn't
             // ready" without parsing prose.
-            setup: r.result?.setup
-              ? { run: r.result.setup.run, status: r.result.setup.status, ms: r.result.setup.ms ?? null }
-              : (r.stamp.setup ?? null),
+            setups: (r.result?.setups || r.stamp.setups || []).map((s) => ({
+              name: s.name ?? null,
+              run: s.run ?? null,
+              status: s.status,
+              ms: s.ms ?? null,
+            })),
           })),
         }, null, 2));
         const code = res.errors.length
@@ -238,44 +241,74 @@ export async function main(argv = []) {
           ? `would create ${res.created.length} file(s), discovered ${res.findings} claim candidates`
           : `created ${res.created.length} file(s), discovered ${res.findings} claim candidates:`);
         for (const f of res.created) console.log(`  + ${f}`);
+        if (res.declared.length) {
+          const written = res.declared.filter((d) => !/\(not written/.test(d));
+          const skipped = res.declared.filter((d) => /\(not written/.test(d));
+          if (written.length) console.log(c.grey(`prerequisites declared in .manual/manual.yaml: ${written.join(', ')} (claims reference them by name)`));
+          for (const s of skipped) console.log(c.amber(`prerequisite ${s} — add it by hand if you want the detected command`));
+        }
         console.log(c.yellow('\nCandidates are in .manual/inbox/ — review, then `manual inbox accept <file>`.'));
       }
       return 0;
     }
 
     if (cmd === 'setup') {
-      // Prerequisites are declared per claim (`check.setup`) but they are a
-      // property of the repository, so they are reported and run per *distinct*
-      // command: twelve claims that need `npm ci` need it once.
-      const { claims, errors } = loadManual(root);
+      // Prerequisites are a property of the repository — declared once in
+      // .manual/manual.yaml and referenced by name — but they are reported and
+      // run per *distinct* command: twelve claims that need `npm ci` need it
+      // once, and a claim with an inline step keeps it.
+      const { claims, errors, config } = loadManual(root);
       for (const e of errors) console.error(c.red(`load error: ${e}`));
       const onlyClaim = flag(rest, '--claim');
       const groups = new Map();
+      const note = (name, spec, claimId) => {
+        const key = setupKey(root, spec);
+        if (!groups.has(key)) groups.set(key, { name, spec, key, claims: [], declared: Boolean(name) });
+        const g = groups.get(key);
+        // A declared prerequisite keeps its name even when an inline step in a
+        // claim happens to be identical: the name is what the failure reports.
+        if (name && !g.name) g.name = name;
+        if (claimId && !g.claims.includes(claimId)) g.claims.push(claimId);
+        return g;
+      };
+      // Declared first, so an unreferenced install still shows up as a declared
+      // fact about the repo rather than disappearing until someone uses it.
+      for (const { name, spec } of declaredPrereqs(config)) note(name, spec, null);
       for (const cl of claims) {
         if (onlyClaim && cl.fm.id !== onlyClaim) continue;
-        const spec = cl.setup || normalizeSetup(cl.check);
-        if (!spec) continue;
-        const key = setupKey(root, spec);
-        if (!groups.has(key)) groups.set(key, { spec, key, claims: [] });
-        groups.get(key).claims.push(cl.fm.id);
+        for (const { name, spec } of resolvePrereqs(cl, config).specs) note(name, spec, cl.fm.id);
       }
-      if (groups.size === 0) {
-        if (json) console.log(JSON.stringify({ setups: [] }, null, 2));
+      const unknown = new Map();
+      for (const cl of claims) {
+        if (onlyClaim && cl.fm.id !== onlyClaim) continue;
+        for (const name of requiredNames(cl)) if (!config.setup?.[name]) unknown.set(name, [...(unknown.get(name) || []), cl.fm.id]);
+      }
+      if (groups.size === 0 && unknown.size === 0) {
+        if (json) console.log(JSON.stringify({ setups: [], unknown: [] }, null, 2));
         else console.log(c.grey(onlyClaim
-          ? `claim ${onlyClaim} declares no setup`
-          : 'no claim declares a check.setup prerequisite — nothing to install'));
+          ? `claim ${onlyClaim} declares no prerequisite`
+          : 'no prerequisites declared — add a setup: block to .manual/manual.yaml, or check.setup to a claim'));
         return onlyClaim ? 1 : 0;
       }
       const shouldRun = force || rest.includes('--run');
+      // --force warms what claims need. A declared install no claim references
+      // is a fact about the repo, not a request to run it: `--all` says so.
+      const all = rest.includes('--all');
       const out = [];
       let failed = 0;
       for (const g of groups.values()) {
         const st = setupStatus(root, g.spec);
+        const label = g.name ? `${g.name} → ${st.run}` : st.run;
+        if (shouldRun && !all && g.claims.length === 0) {
+          if (json) out.push({ name: g.name, run: st.run, key: st.key, claims: [], declared: true, skipped: true, cached: st.cached });
+          else console.log(c.grey(`• ${label}  declared, no claim requires it — skipped (--all to run it)`));
+          continue;
+        }
         if (!shouldRun) {
           if (json) {
-            out.push({ run: st.run, key: st.key, claims: g.claims, cached: st.cached, missing: st.missing, last: st.entry || null });
+            out.push({ name: g.name, run: st.run, key: st.key, claims: g.claims, declared: g.declared, cached: st.cached, missing: st.missing, last: st.entry || null });
           } else {
-            console.log(`${st.cached ? c.green('✔') : c.amber('▲')} ${st.run}  ${c.grey(g.claims.join(', '))}`);
+            console.log(`${st.cached ? c.green('✔') : c.amber('▲')} ${label}  ${c.grey(g.claims.length ? g.claims.join(', ') : 'declared, unreferenced')}`);
             console.log(c.grey(`    ${st.key} · ${st.cached
               ? `cached — ran ${st.entry.at} (${st.entry.ms}ms)`
               : st.entry
@@ -285,13 +318,18 @@ export async function main(argv = []) {
           continue;
         }
         const r = await ensureSetup(root, g.spec, { force: true });
-        out.push({ run: r.run, key: r.key, claims: g.claims, status: r.status, ms: r.ms ?? null, note: r.note || null });
+        out.push({ name: g.name, run: r.run, key: r.key, claims: g.claims, status: r.status, ms: r.ms ?? null, note: r.note || null });
         if (r.status === 'failed' || r.status === 'timeout') failed += 1;
         if (!json) {
-          console.log(`${r.status === 'ran' || r.status === 'cached' ? c.green('✔') : c.red('✖')} ${r.run}  ${short(r.note || r.status, 120)}`);
+          console.log(`${r.status === 'ran' || r.status === 'cached' ? c.green('✔') : c.red('✖')} ${label}  ${short(r.note || r.status, 120)}`);
         }
       }
-      if (json) console.log(JSON.stringify({ setups: out, ran: shouldRun }, null, 2));
+      for (const [name, ids] of unknown) {
+        failed += 1;
+        if (json) out.push({ name, unknown: true, claims: ids });
+        else console.log(c.red(`✖ ${name}  required by ${ids.join(', ')}, but nothing declares it in .manual/manual.yaml`));
+      }
+      if (json) console.log(JSON.stringify({ setups: out, unknown: [...unknown.keys()], ran: shouldRun }, null, 2));
       else if (!shouldRun) console.log(c.grey('\nrun them with `manual setup --force` (or let verify run what it needs)'));
       return failed ? 1 : 0;
     }

@@ -271,6 +271,18 @@ a read-only-looking command. Two verifies in a row in the test suite surfaced it
 sandbox now removes the links it created before the worktree is deleted, and a
 test asserts the installed tree survives a verify.
 
+Re-run with prerequisites promoted to the repository (one `node` step in
+`manual.yaml`, candidates saying `requires: node`), the same clone behaves the
+same way and says more: `manual setup` prints `✔ node → npm install  tests.suite`
+with the run it is reusing, `verify --force` after deleting `node_modules` prints
+`⚙ setup: npm install (node_modules missing) → ok (17440ms)` and then measures
+the suite at **20228ms** (the install excluded), and `--no-setup` names the step
+in the failure — `node: npm install` — rather than "setup failed". Two named
+prerequisites in one claim (an install per ecosystem, ordered, deduped, inline
+step last) are proven by fixture rather than by a second real clone: two real
+installs is minutes of network per run, and the ordering rule is not what a
+second download would test.
+
 **I. A gate that passed a policy it never ran.** `enforce` treated only
 `broken` as a failure, so a policy that reported `blocked` — an unfresh
 dependency, and now a prerequisite that could not be installed — passed the
@@ -280,9 +292,12 @@ right, and nothing was checked. Every non-fresh state fails a gate now.
 
 ### Still open
 
-- **Prerequisites** are now first-class (`check.setup`), but they are still
-  *per claim*: two claims with different ecosystems (npm and a Python venv) each
-  declare their own step, and nothing dedupes a shared build step across globs.
+- **Prerequisites** are first-class and now belong to the repository rather than
+  to each claim (`setup:` in `manual.yaml`, referenced with `check.requires`), so
+  two ecosystems cost two installs once, not one per claim. What is still open is
+  *scheduling* them: they run at most once per verify, but a 30s install and a
+  1ms `exists()` check still share one window, and nothing can say "install this
+  hourly, run that on every commit".
 - **Scheduling** (finding 7): no per-claim schedule, so a minutes-long suite and
   a 1ms `exists()` check compete in the same verify. An install that takes 30s
   now sits inside that same window, which makes the case stronger, not weaker.

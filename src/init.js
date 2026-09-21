@@ -46,6 +46,42 @@ export function installCommand(root, pkg = null) {
   return null;
 }
 
+// The prerequisite each detected ecosystem needs, named so that claims can
+// reference it instead of restating the command.
+//
+// A repository rarely has one install: a JS frontend and a Python service have
+// two, and every command claim that touches either would otherwise carry its own
+// copy of the same command — the same command written twice is two chances to
+// disagree. Discovery writes them here once; claims say `requires: node`.
+export function ecosystemPrereqs(root, pkg = null) {
+  const p = pkg || readJson(path.join(root, 'package.json')) || {};
+  const has = (f) => fs.existsSync(path.join(root, f));
+  const out = {};
+  const node = installCommand(root, p);
+  if (node && depCount(p) > 0) out.node = node;
+  // A virtualenv is project-local, so an install into one is a step a verifier
+  // may take; a global `pip install` is not, and is not proposed.
+  if (has('requirements.txt') && (has('.venv') || has('venv') || (has('pyproject.toml') && has('poetry.lock')))) {
+    out.python = has('poetry.lock')
+      ? { run: 'poetry install', evidence: ['pyproject.toml', 'poetry.lock'], cache: ['.venv'] }
+      : { run: 'python3 -m venv .venv && .venv/bin/pip install -r requirements.txt', evidence: ['requirements.txt'], cache: ['.venv'] };
+  }
+  // A Makefile that declares a dependency target is the repo telling us its own
+  // install story; `cache` is empty because the target decides where it lands.
+  if (has('Makefile') && /^deps:/m.test(safeRead(path.join(root, 'Makefile')))) {
+    out.make = { run: 'make deps', evidence: ['Makefile'], cache: [] };
+  }
+  return out;
+}
+
+function safeRead(p) {
+  try {
+    return fs.readFileSync(p, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
 // Commands that a shell can run without the package manager's PATH injection.
 const SYSTEM_BINS = /^(node|nodejs|deno|bun|python|python3|pytest|go|cargo|make|cmake|bash|sh|zsh|ruby|rake|php|dotnet|java|mvn|gradle|ant|npm|pnpm|yarn)$/;
 
@@ -148,12 +184,13 @@ export function detect(root) {
     const checkRun = throughPm || testScript;
     const runner = throughPm || firstWord || testScript.trim();
     // A command claim whose dependencies are not installed is false about the
-    // checkout, not about the repo. Declaring the prerequisite here — from the
-    // package manager and the lockfile, without running anything — means the
-    // candidate carries the reason it will fail and the fix.
-    const install = depCount(pkg) > 0 && !fs.existsSync(path.join(root, 'node_modules'))
-      ? installCommand(root, pkg)
-      : null;
+    // checkout, not about the repo. When the checkout is missing them the claim
+    // references the prerequisite declared in manual.yaml by name — discovery
+    // does not restate the command it just wrote down.
+    const missingDeps = depCount(pkg) > 0 && !fs.existsSync(path.join(root, 'node_modules'));
+    const declared = ecosystemPrereqs(root, pkg);
+    const named = missingDeps && declared.node ? 'node' : null;
+    const install = missingDeps && !named ? installCommand(root, pkg) : null;
     findings.push({
       kind: 'command',
       id: 'tests.suite',
@@ -167,14 +204,17 @@ export function detect(root) {
       evidence: { files: ['package.json', 'src/**', 'test/**'] },
       check: { run: checkRun, expect: { exit: 0, max_ms: 120000 } },
       setup: install,
+      requires: named,
       note: [
         `Discovered from package.json scripts.test = "${testScript}".`,
         throughPm
           ? `The script calls a local binary (${firstWord}), so the check runs it through \`${throughPm}\` — the way node_modules/.bin reaches PATH.`
           : null,
-        install
-          ? `Dependencies are not installed in this checkout, so the candidate declares a setup (${install.run}); verify runs it before the check.`
-          : null,
+        named
+          ? `Dependencies are not installed in this checkout, so the candidate requires the \`${named}\` prerequisite declared in .manual/manual.yaml (${declared.node.run}); verify runs it before the check.`
+          : install
+            ? `Dependencies are not installed in this checkout, so the candidate declares a setup (${install.run}); verify runs it before the check.`
+            : null,
       ].filter(Boolean).join(' '),
     });
   }
@@ -206,16 +246,21 @@ export function detect(root) {
     });
   }
 
-  return { pkg, findings };
+  return { pkg, findings, prereqs: ecosystemPrereqs(root, pkg) };
 }
 
 // The check block, including the prerequisite when one was discovered.
 function checkBlock(f) {
   if (f.check.expr) return `  expr: ${JSON.stringify(f.check.expr)}`;
+  const requires = f.requires
+    ? Array.isArray(f.requires)
+      ? `  requires:\n${f.requires.map((n) => `    - ${n}`).join('\n')}\n`
+      : `  requires: ${f.requires}\n`
+    : '';
   const setup = f.setup
     ? `  setup:\n    run: ${JSON.stringify(f.setup.run)}\n    evidence:\n${(f.setup.evidence || []).map((p) => `      - "${p}"`).join('\n')}\n    cache:\n${(f.setup.cache || []).map((p) => `      - ${p}`).join('\n')}\n`
     : '';
-  return `${setup}  run: ${JSON.stringify(f.check.run)}\n  expect:\n    exit: ${f.check.expect?.exit ?? 0}\n    max_ms: ${f.check.expect?.max_ms ?? 120000}`;
+  return `${requires}${setup}  run: ${JSON.stringify(f.check.run)}\n  expect:\n    exit: ${f.check.expect?.exit ?? 0}\n    max_ms: ${f.check.expect?.max_ms ?? 120000}`;
 }
 
 function claimFile(f) {
@@ -299,10 +344,20 @@ export async function probeCandidates(root, { timeoutMs = 20000, quiet = false, 
       // manager, declare it in the candidate, and probe again — the second
       // probe is the one that says something about the repository.
       let declared = null;
-      if (!r.ok && !r.blocked && setup && !fm.check.setup) {
+      let declaredName = null;
+      if (!r.ok && !r.blocked && setup && !fm.check.setup && !fm.check.requires) {
         const install = inferInstall(root);
         if (install && looksLikeMissingDeps(`${r.stdout || ''}\n${r.error || ''}`)) {
-          fm.check.setup = { run: install.run, evidence: install.evidence, cache: install.cache };
+          // One declared prerequisite for this repo means the install it names
+          // is the one the failure is about, so the candidate references it
+          // rather than copying the command into its own frontmatter.
+          const names = Object.keys(ecosystemPrereqs(root));
+          if (names.length === 1) {
+            fm.check.requires = names[0];
+            declaredName = names[0];
+          } else {
+            fm.check.setup = { run: install.run, evidence: install.evidence, cache: install.cache };
+          }
           declared = install;
           r = await attempt();
         }
@@ -317,16 +372,27 @@ export async function probeCandidates(root, { timeoutMs = 20000, quiet = false, 
         observation: {
           ...(fm.observation || {}),
           ...{ at: nowIso(), by: 'agent:manual-cli', probe_state: probe.state, probe_note: probe.note },
-          ...(declared ? { setup: declared.run, setup_state: r.setup?.status || 'unknown' } : {}),
+          ...(declared
+            ? {
+                setup: declared.run,
+                setup_status: (r.setups || []).map((s) => s.status).join(', ') || 'unknown',
+                ...(declaredName ? { requires: declaredName } : {}),
+              }
+            : {}),
         },
       };
       const noteLine = probe.state === 'fresh'
-        ? `Probed before proposing: the check passes on this checkout (${probe.note})${declared ? `, after declaring its prerequisite (${declared.run})` : ''}.`
+        ? `Probed before proposing: the check passes on this checkout (${probe.note})${declared ? `, after declaring its prerequisite (${declaredName ? `requires: ${declaredName} — ` : ''}${declared.run})` : ''}.`
         : probe.state === 'blocked'
           ? `Probed before proposing: **the prerequisite could not be established here** (${probe.note}). The claim is untested — install it, then re-run \`manual verify\`. It is not a false claim, and it will report \`blocked\` rather than \`broken\` until then.`
           : `Probed before proposing: **the check does not pass here** (${probe.note}). It may need dependencies installed, a build step, or a different command. Do not accept it as-is.`;
       fs.writeFileSync(full, `---\n${stringifyYaml(next)}---\n${body.trim()}\n\n${noteLine}\n`);
-      results.push({ file: f, ...probe, setup: declared ? declared.run : (normalizeSetup(fm.check)?.run || null) });
+      results.push({
+        file: f,
+        ...probe,
+        requires: declaredName || fm.check.requires || null,
+        setup: declared ? declared.run : (normalizeSetup(fm.check)?.run || null),
+      });
       if (!quiet) {
         const icon = probe.state === 'fresh' ? '✔' : '✖';
         console.log(`${icon} probed ${f}: ${probe.state} (${probe.note})`);
@@ -338,6 +404,19 @@ export async function probeCandidates(root, { timeoutMs = 20000, quiet = false, 
   return results;
 }
 
+// The `setup:` block as YAML, indented for manual.yaml.
+function setupBlock(prereqs) {
+  if (Object.keys(prereqs).length === 0) return '';
+  let out = 'setup:\n';
+  for (const [name, spec] of Object.entries(prereqs)) {
+    out += `  ${name}:\n    run: ${JSON.stringify(spec.run)}\n`;
+    if (spec.evidence?.length) out += `    evidence:\n${spec.evidence.map((e) => `      - "${e}"`).join('\n')}\n`;
+    if (spec.cache?.length) out += `    cache:\n${spec.cache.map((c) => `      - ${c}`).join('\n')}\n`;
+    else out += '    cache: []\n';
+  }
+  return out;
+}
+
 export function init(root, { dryRun = false } = {}) {
   const dir = path.join(root, '.manual');
   const claimsDir = path.join(dir, 'claims');
@@ -345,16 +424,41 @@ export function init(root, { dryRun = false } = {}) {
   const created = [];
   const existed = fs.existsSync(claimsDir);
 
-  const { pkg, findings } = detect(root);
+  const { pkg, findings, prereqs } = detect(root);
+  const cfgPath = path.join(dir, 'manual.yaml');
+  const declared = [];
 
   if (!dryRun) {
     fs.mkdirSync(claimsDir, { recursive: true });
     fs.mkdirSync(inboxDir, { recursive: true });
-    if (!fs.existsSync(path.join(dir, 'manual.yaml'))) {
+    const block = setupBlock(prereqs);
+    if (!fs.existsSync(cfgPath)) {
       fs.writeFileSync(
-        path.join(dir, 'manual.yaml'),
-        `schema: manual/v1\nbrief:\n  budget_tokens: 2000\nverify:\n  default_timeout_s: 120\n  ci:\n    required:\n      - policy.*\n    diff_base: origin/main\n`,
+        cfgPath,
+        `schema: manual/v1\nbrief:\n  budget_tokens: 2000\nverify:\n  default_timeout_s: 120\n  ci:\n    required:\n      - policy.*\n    diff_base: origin/main\n${block}`,
       );
+      declared.push(...Object.keys(prereqs));
+    } else if (block) {
+      // An existing manual.yaml is the human's file. It is extended only when it
+      // has no setup block at all; merging into one would mean rewriting YAML
+      // this tool did not write, losing comments and ordering to add a line.
+      const text = fs.readFileSync(cfgPath, 'utf8');
+      let existing = {};
+      try {
+        existing = parseYaml(text) || {};
+      } catch {
+        existing = {};
+      }
+      const known = Object.keys(existing.setup || {});
+      const missing = Object.keys(prereqs).filter((n) => !known.includes(n));
+      if (!existing.setup) {
+        fs.appendFileSync(cfgPath, `\n${block}`);
+        declared.push(...missing);
+      } else if (missing.length) {
+        // Say what was found instead of editing: the detected commands are
+        // printed so a human can paste them, and nothing is lost if they don't.
+        declared.push(...missing.map((n) => `${n} (not written — manual.yaml already declares: ${known.join(', ')})`));
+      }
     }
     if (!fs.existsSync(path.join(root, '.gitignore')) ||
         !fs.readFileSync(path.join(root, '.gitignore'), 'utf8').includes('.manual/state.json')) {
@@ -387,5 +491,13 @@ export function init(root, { dryRun = false } = {}) {
     }
   }
 
-  return { created, existed, scripts: pkg.scripts || {}, findings: findings.length, dryRun };
+  return {
+    created,
+    existed,
+    scripts: pkg.scripts || {},
+    findings: findings.length,
+    prereqs,
+    declared,
+    dryRun,
+  };
 }

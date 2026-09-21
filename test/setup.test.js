@@ -9,10 +9,11 @@ import {
   normalizeSetup,
   readSetupCache,
   resetSetupMemo,
+  resolvePrereqs,
   setupKey,
   setupStatus,
 } from '../src/setup.js';
-import { loadManual, parseClaim } from '../src/claims.js';
+import { loadConfig, loadManual, parseClaim } from '../src/claims.js';
 import { verify, printVerifyReport } from '../src/verify.js';
 import { State } from '../src/state.js';
 import { detect, init, installCommand, looksLikeMissingDeps, probeCandidates } from '../src/init.js';
@@ -53,7 +54,7 @@ function makeDepRepo({ git = false, claim = null, lockfile = '{"lockfileVersion"
     "const fs = require('node:fs');\n" +
       "fs.mkdirSync('node_modules/fake-dep', { recursive: true });\n" +
       "fs.writeFileSync('node_modules/fake-dep/ok.txt', 'ok');\n" +
-      `fs.appendFileSync(${JSON.stringify(counter)}, 'install\\n');\n`,
+      `fs.appendFileSync(${JSON.stringify(counter)}, (process.argv[3] || 'install') + '\\n');\n`,
   );
   fs.writeFileSync(path.join(root, '.gitignore'), 'node_modules/\n.manual/state.json\n.manual/cache/\n');
   if (claim) {
@@ -312,7 +313,8 @@ describe('verify: a claim whose prerequisite is missing', () => {
     const res = await verify(root, { state, force: true });
     const r = res.results[0];
     assert.equal(r.stamp.state, 'fresh');
-    assert.equal(r.stamp.setup.status, 'ran');
+    assert.equal(r.stamp.setups.length, 1);
+    assert.equal(r.stamp.setups[0].status, 'ran');
     assert.equal(countInstalls(counter), 1);
     // The install's cost is not the suite's runtime: folding it into the
     // measurement would corrupt every bound the flywheel later proposes.
@@ -324,7 +326,7 @@ describe('verify: a claim whose prerequisite is missing', () => {
     const again = await verify(root, { state, force: true });
     assert.equal(again.results[0].stamp.state, 'fresh');
     assert.equal(countInstalls(counter), 1);
-    assert.equal(again.results[0].stamp.setup.status, 'cached');
+    assert.equal(again.results[0].stamp.setups[0].status, 'cached');
     assert.deepEqual(fs.readdirSync(path.join(root, 'node_modules')), ['fake-dep']);
   });
 
@@ -377,7 +379,7 @@ describe('verify: a claim whose prerequisite is missing', () => {
     // a machine that cannot install dependencies.
     assert.equal(r.stamp.tier, 'gold');
     assert.equal(r.stamp.passes, 9);
-    assert.equal(r.stamp.setup.status, 'failed');
+    assert.equal(r.stamp.setups[0].status, 'failed');
 
     // ...but it must not pass CI either.
     const { value: code } = captureLogs(() => printVerifyReport(res));
@@ -391,7 +393,7 @@ describe('verify: a claim whose prerequisite is missing', () => {
     const r = res.results[0];
     assert.equal(r.stamp.state, 'blocked');
     assert.match(r.stamp.note, /setup skipped/);
-    assert.equal(r.stamp.setup.status, 'skipped');
+    assert.equal(r.stamp.setups[0].status, 'skipped');
 
     // When the environment really does have them, --no-setup is a normal green
     // verify with no install at all (this is the CI path).
@@ -400,7 +402,232 @@ describe('verify: a claim whose prerequisite is missing', () => {
     resetSetupMemo();
     const ok = await verify(root, { state, force: true, noSetup: true });
     assert.equal(ok.results[0].stamp.state, 'fresh');
-    assert.equal(ok.results[0].stamp.setup.status, 'skipped');
+    assert.equal(ok.results[0].stamp.setups[0].status, 'skipped');
+  });
+});
+
+describe('repo-level prerequisites: declared once in manual.yaml', () => {
+  const writeConfig = (root, text) => fs.writeFileSync(path.join(root, '.manual', 'manual.yaml'), text);
+  const configPath = (root) => path.join(root, '.manual', 'manual.yaml');
+
+  // A claim whose check needs the artifact both prerequisites produce, so the
+  // check only passes once they have run.
+  const claimRequiring = (id, requires, extra = '') => `---
+schema: manual/v1
+id: ${id}
+kind: command
+statement: The suite passes once its dependencies exist.
+priority: high
+applies_to: ["**"]
+evidence:
+  files:
+    - "package.json"
+check:
+  requires: ${Array.isArray(requires) ? `[${requires.join(', ')}]` : requires}
+${extra}  run: "node test/run.js"
+  expect:
+    exit: 0
+verify: on_change
+provenance:
+  author: test
+  origin: authored
+  evidence: "repo-level prerequisites"
+lifecycle: accepted
+---
+
+The suite passes once its dependencies exist.
+`;
+
+  test('one named install serves every claim that requires it', async () => {
+    const { root, counter } = makeDepRepo();
+    writeConfig(
+      root,
+      `schema: manual/v1\nsetup:\n  node:\n    run: "node fake-install.js ${counter} node"\n    evidence: ["package.json", "package-lock.json"]\n    cache: ["node_modules"]\n`,
+    );
+    for (const id of ['tests.a', 'tests.b', 'tests.c']) {
+      fs.writeFileSync(path.join(root, '.manual', 'claims', `${id}.md`), claimRequiring(id, 'node'));
+    }
+    // And one claim that declares the very same step inline: same command and
+    // evidence, so the same key, so it is still one install.
+    fs.writeFileSync(
+      path.join(root, '.manual', 'claims', 'tests.d.md'),
+      claimRequiring('tests.d', 'node', `  setup:\n    run: "node fake-install.js ${counter} node"\n    evidence: ["package.json", "package-lock.json"]\n    cache: ["node_modules"]\n`),
+    );
+    const state = new State(root);
+    const res = await verify(root, { state, force: true });
+    assert.deepEqual(res.results.map((r) => r.stamp.state), ['fresh', 'fresh', 'fresh', 'fresh']);
+    assert.deepEqual(fs.readFileSync(counter, 'utf8').split('\n').filter(Boolean), ['node']);
+    // The stamp names the prerequisite, so a failure downstream says which step.
+    assert.deepEqual(res.results[0].stamp.setups.map((s) => s.name), ['node']);
+  });
+
+  test('two ecosystems install once each, in the order the claim lists them', async () => {
+    const { root, counter } = makeDepRepo();
+    fs.writeFileSync(path.join(root, 'requirements.txt'), 'requests==2.0.0\n');
+    writeConfig(
+      root,
+      `schema: manual/v1\nsetup:\n  node:\n    run: "node fake-install.js ${counter} node"\n    evidence: ["package.json"]\n    cache: ["node_modules"]\n  python:\n    run: "node fake-install.js ${counter} python"\n    evidence: ["requirements.txt"]\n    cache: ["node_modules"]\n  build:\n    run: "node fake-install.js ${counter} build"\n    evidence: ["package.json"]\n    cache: ["node_modules"]\n`,
+    );
+    fs.writeFileSync(
+      path.join(root, '.manual', 'claims', 'tests.suite.md'),
+      claimRequiring('tests.suite', ['node', 'python'], `  setup:\n    run: "node fake-install.js ${counter} build"\n    evidence: ["package.json"]\n    cache: ["node_modules"]\n`),
+    );
+    const state = new State(root);
+    const res = await verify(root, { state, force: true });
+    assert.equal(res.results[0].stamp.state, 'fresh');
+    // Named prerequisites in the order written, then the claim's own step — the
+    // inline one is the specific build that sits on top of the installs.
+    assert.deepEqual(fs.readFileSync(counter, 'utf8').split('\n').filter(Boolean), ['node', 'python', 'build']);
+    assert.deepEqual(res.results[0].stamp.setups.map((s) => [s.name, s.status]), [
+      ['node', 'ran'],
+      ['python', 'ran'],
+      [null, 'ran'],
+    ]);
+    const hist = state.data.history.at(-1);
+    assert.equal(hist.setups, 3);
+    assert.ok(hist.setup_ms > 0);
+  });
+
+  test('a name nobody declares is a load error, not a skipped step', async () => {
+    const { root } = makeDepRepo();
+    writeConfig(root, 'schema: manual/v1\nsetup:\n  node:\n    run: "node fake-install.js"\n');
+    fs.writeFileSync(path.join(root, '.manual', 'claims', 'tests.suite.md'), claimRequiring('tests.suite', 'nodejs'));
+    const state = new State(root);
+    const res = await verify(root, { state, force: true });
+    assert.equal(res.errors.length, 1);
+    assert.match(res.errors[0], /requires unknown prerequisite "nodejs"/);
+    assert.match(res.errors[0], /node/); // and it names what *is* declared
+    // The claim is blocked rather than run unprepared, because a check that runs
+    // without its install reports its own failure as the repository's truth.
+    assert.equal(res.results[0].stamp.state, 'blocked');
+    assert.match(res.results[0].stamp.note, /unknown prerequisite/);
+  });
+
+  test('a malformed setup block is reported instead of crashing the manual', async () => {
+    const { root } = makeDepRepo();
+    writeConfig(
+      root,
+      'schema: manual/v1\nsetup:\n  Node_Install:\n    run: npm ci\n  broken:\n    evidence: ["package.json"]\n  bad-cache:\n    run: npm ci\n    cache: node_modules\n',
+    );
+    const cfg = loadConfig(root);
+    assert.deepEqual(Object.keys(cfg.setup), []);
+    assert.equal(cfg.setupErrors.length, 3);
+    assert.match(cfg.setupErrors.join('\n'), /must be lowercase/);
+    assert.match(cfg.setupErrors.join('\n'), /"broken" needs a run command/);
+    assert.match(cfg.setupErrors.join('\n'), /cache must be a list/);
+    const res = await verify(root, { state: new State(root), force: true });
+    assert.deepEqual(res.errors, cfg.setupErrors.map((e) => e));
+  });
+
+  test('resolvePrereqs dedupes identical steps and puts the inline one last', () => {
+    const spec = { run: 'npm ci', evidence: ['package.json'], cache: ['node_modules'] };
+    const config = { setup: { node: spec, aliases: spec } };
+    const { specs, unknown } = resolvePrereqs({ check: { requires: ['aliases', 'node'] } }, config);
+    assert.deepEqual(specs.map((s) => s.name), ['aliases']);
+    assert.deepEqual(unknown, []);
+    const inline = resolvePrereqs({ check: { requires: 'node' }, setup: { run: 'make build' } }, config);
+    assert.deepEqual(inline.specs.map((s) => [s.name, s.spec.run]), [['node', 'npm ci'], [null, 'make build']]);
+    assert.deepEqual(resolvePrereqs({ check: {} }, config).specs, []);
+  });
+
+  test('manual setup shows declared, referenced and unknown prerequisites', async () => {
+    const { root, counter } = makeDepRepo();
+    const bin = path.resolve('bin/manual.js');
+    writeConfig(
+      root,
+      `schema: manual/v1\nsetup:\n  node:\n    run: "node fake-install.js ${counter} node"\n    evidence: ["package.json"]\n    cache: ["node_modules"]\n  unused:\n    run: "make things"\n    cache: []\n`,
+    );
+    fs.writeFileSync(path.join(root, '.manual', 'claims', 'tests.suite.md'), claimRequiring('tests.suite', 'node'));
+    const listed = JSON.parse(execSync(`node "${bin}" setup --json`, { cwd: root, encoding: 'utf8' }));
+    const byName = Object.fromEntries(listed.setups.map((s) => [s.name, s]));
+    assert.deepEqual(byName.node.claims, ['tests.suite']);
+    assert.equal(byName.node.cached, false);
+    assert.equal(byName.unused.declared, true);
+    assert.deepEqual(byName.unused.claims, [], 'a declared install is a fact about the repo, referenced or not');
+    assert.equal(countInstalls(counter), 0);
+
+    // --force warms what claims need, not every declaration: an unreferenced
+    // install is a fact about the repo, and running it is opt-in (--all).
+    const ran = execSync(`node "${bin}" setup --force`, { cwd: root, encoding: 'utf8' });
+    assert.match(ran, /declared, no claim requires it — skipped/);
+    assert.deepEqual(fs.readFileSync(counter, 'utf8').split('\n').filter(Boolean), ['node']);
+
+    // A typo shows up as a failing listing, not as a missing install.
+    fs.writeFileSync(path.join(root, '.manual', 'claims', 'tests.typo.md'), claimRequiring('tests.typo', 'nope'));
+    const failed = (() => {
+      try {
+        execSync(`node "${bin}" setup`, { cwd: root, encoding: 'utf8' });
+        return 0;
+      } catch (e) {
+        return Number(e.status);
+      }
+    })();
+    assert.equal(failed, 1);
+  });
+});
+
+describe('init: repo-level prerequisites', () => {
+  test('the detected ecosystem is declared in manual.yaml and referenced by name', () => {
+    const { root } = makeDepRepo();
+    const res = init(root);
+    assert.deepEqual(res.declared, ['node']);
+    const cfg = loadConfig(root);
+    assert.equal(cfg.setup.node.run, 'npm ci');
+    assert.deepEqual(cfg.setup.node.cache, ['node_modules']);
+    const candidate = fs.readFileSync(path.join(root, '.manual', 'inbox', 'init-tests.suite.md'), 'utf8');
+    assert.match(candidate, /requires: node/);
+    assert.ok(!/setup:/.test(candidate), 'the command is written once, in manual.yaml');
+    // And the candidate resolves, as a claim, to that declared install.
+    const parsed = parseClaim(candidate, path.join(root, '.manual', 'claims', 'tests.suite.md'));
+    const { specs } = resolvePrereqs(parsed, cfg);
+    assert.equal(specs[0].spec.run, 'npm ci');
+  });
+
+  test('an existing setup block is never rewritten — the gap is reported instead', () => {
+    const { root } = makeDepRepo();
+    fs.mkdirSync(path.join(root, '.manual', 'inbox'), { recursive: true });
+    fs.writeFileSync(
+      path.join(root, '.manual', 'manual.yaml'),
+      'schema: manual/v1\nbrief:\n  budget_tokens: 600\nsetup:\n  custom:\n    run: "my own thing"\n',
+    );
+    const before = fs.readFileSync(path.join(root, '.manual', 'manual.yaml'), 'utf8');
+    const res = init(root);
+    assert.equal(fs.readFileSync(path.join(root, '.manual', 'manual.yaml'), 'utf8'), before, 'a human file is not merged into');
+    assert.match(res.declared.join(' '), /node \(not written/);
+    assert.equal(loadConfig(root).setup.node, undefined);
+  });
+
+  test('a config without a setup block gains one, keeping what was there', () => {
+    const { root } = makeDepRepo();
+    fs.writeFileSync(path.join(root, '.manual', 'manual.yaml'), 'schema: manual/v1\nbrief:\n  budget_tokens: 600\n');
+    init(root);
+    const cfg = loadConfig(root);
+    assert.equal(cfg.brief.budget_tokens, 600);
+    assert.equal(cfg.setup.node.run, 'npm ci');
+  });
+
+  test('a Makefile that names its own dependency target is declared too', () => {
+    const { root } = makeDepRepo();
+    fs.writeFileSync(path.join(root, 'Makefile'), 'test:\n\tgo test ./...\n\ndeps:\n\tgo mod download\n');
+    const { prereqs } = detect(root);
+    assert.equal(prereqs.make.run, 'make deps');
+    // `cache: []` because the target decides where it lands: the marker is the
+    // only evidence of success available, and a made-up directory would be
+    // worse (it would re-run forever, or never).
+    assert.deepEqual(prereqs.make.cache, []);
+    assert.deepEqual(prereqs.make.evidence, ['Makefile']);
+  });
+
+  test('a second ecosystem is declared alongside the first', () => {
+    const { root } = makeDepRepo();
+    fs.writeFileSync(path.join(root, 'requirements.txt'), 'requests==2.0.0\n');
+    fs.mkdirSync(path.join(root, '.venv'), { recursive: true });
+    const { prereqs } = detect(root);
+    assert.deepEqual(Object.keys(prereqs).sort(), ['node', 'python']);
+    assert.match(prereqs.python.run, /venv/);
+    assert.deepEqual(prereqs.python.cache, ['.venv']);
+    init(root);
+    assert.deepEqual(Object.keys(loadConfig(root).setup).sort(), ['node', 'python']);
   });
 });
 
@@ -413,8 +640,9 @@ describe('setup: surfaced where a human and an agent will see it', () => {
 
     const res = doctor(root, state);
     const row = res.rows.find((r) => r.id === 'tests.suite');
-    assert.equal(row.setup.cached, false);
-    assert.deepEqual(row.setup.missing, ['node_modules']);
+    assert.equal(row.setups.length, 1);
+    assert.equal(row.setups[0].cached, false);
+    assert.deepEqual(row.setups[0].missing, ['node_modules']);
     assert.match(row.issues.join(' '), /prerequisite not satisfied/);
     assert.match(row.issues.join(' '), /manual setup --force/);
     const { value: code, logs } = captureLogs(() => printDoctor(res));
@@ -482,20 +710,28 @@ The suite policy is gated on its dependencies being installed.
 });
 
 describe('init: discovering a prerequisite', () => {
-  test('a command candidate on a checkout without dependencies declares one', () => {
+  test('a command candidate on a checkout without dependencies requires the named one', () => {
     const { root } = makeDepRepo();
-    const { findings } = detect(root);
+    const { findings, prereqs } = detect(root);
+    // The command is written down once, in manual.yaml, and the claim refers to
+    // it by name — so ten claims that need an install say ten words, not ten
+    // copies of the same command.
+    assert.equal(prereqs.node.run, 'npm ci');
+    assert.deepEqual(prereqs.node.cache, ['node_modules']);
+    assert.deepEqual(prereqs.node.evidence, ['package.json', 'package-lock.json']);
     const suite = findings.find((f) => f.id === 'tests.suite');
-    assert.equal(suite.setup.run, 'npm ci');
-    assert.deepEqual(suite.setup.cache, ['node_modules']);
-    assert.deepEqual(suite.setup.evidence, ['package.json', 'package-lock.json']);
+    assert.equal(suite.requires, 'node');
+    assert.equal(suite.setup, null);
   });
 
-  test('an installed checkout gets no setup — nothing to declare', () => {
+  test('an installed checkout gets no requirement — nothing to declare', () => {
     const { root } = makeDepRepo();
     fs.mkdirSync(path.join(root, 'node_modules'), { recursive: true });
-    const { findings } = detect(root);
-    assert.equal(findings.find((f) => f.id === 'tests.suite').setup, null);
+    const { findings, prereqs } = detect(root);
+    assert.equal(findings.find((f) => f.id === 'tests.suite').requires, null);
+    // The prerequisite is still a fact about the repo: `manual setup` shows it
+    // whether or not a claim needed it today.
+    assert.equal(prereqs.node.run, 'npm ci');
   });
 
   test('the install command follows the repo, not a default', () => {
@@ -536,7 +772,7 @@ describe('init: discovering a prerequisite', () => {
     const text = fs.readFileSync(path.join(root, '.manual', 'inbox', 'init-tests.suite.md'), 'utf8');
     assert.match(text, /setup:/);
     assert.match(text, /fake-install\.js/);
-    assert.match(text, /setup_state: ran/);
+    assert.match(text, /setup_status: ran/);
     // The candidate now parses as a real claim with a prerequisite, so
     // accepting it does not require a human to hand-edit the frontmatter.
     const parsed = parseClaim(text, path.join(root, '.manual', 'claims', 'tests.suite.md'));
@@ -581,6 +817,6 @@ describe('manual setup: the command', () => {
 
     // Nothing declares a setup: a clean exit, not a failure.
     fs.rmSync(path.join(root, '.manual', 'claims', 'tests.suite.md'));
-    assert.match(execSync(`node "${bin}" setup`, { cwd: root, encoding: 'utf8' }), /nothing to install/);
+    assert.match(execSync(`node "${bin}" setup`, { cwd: root, encoding: 'utf8' }), /no prerequisites declared/);
   });
 });

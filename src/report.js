@@ -118,15 +118,22 @@ function checkHtml(claim) {
   return '<span class="muted">no check (ownership claim)</span>';
 }
 
-// The prerequisite, when a claim declares one. "satisfied here" and "will run"
-// are different enough to the person reading the dashboard that they get
-// different colours: one is a fact about this machine, the other is a promise.
-function setupHtml(setup) {
-  if (!setup) return '<span class="muted">—</span>';
-  const badge = setup.cached
-    ? '<span class="badge" title="this machine already has the result">✔ satisfied here</span>'
-    : `<span class="badge warn" title="verify will run this before the check">⚙ runs on next verify${setup.missing?.length ? ` · missing ${esc(setup.missing.join(', '))}` : ''}</span>`;
-  return `<code>${esc(setup.run)}</code> ${badge}`;
+// The prerequisites a claim needs. "satisfied here" and "will run" are
+// different enough to the person reading the dashboard that they get different
+// colours: one is a fact about this machine, the other is a promise. A claim
+// can require several (an install per ecosystem, plus its own build step), so
+// each is shown with the name the claim referred to it by.
+function setupHtml(setups) {
+  if (!setups || setups.length === 0) return '<span class="muted">—</span>';
+  return setups
+    .map((s) => {
+      const name = s.name ? `<span class="muted">${esc(s.name)} → </span>` : '';
+      const badge = s.cached
+        ? '<span class="badge" title="this machine already has the result">✔ satisfied here</span>'
+        : `<span class="badge warn" title="verify will run this before the check">⚙ runs on next verify${s.missing?.length ? ` · missing ${esc(s.missing.join(', '))}` : ''}</span>`;
+      return `${name}<code>${esc(s.run)}</code> ${badge}`;
+    })
+    .join('<br/>');
 }
 
 function evidenceHtml(claim) {
@@ -224,7 +231,7 @@ export function renderReport(data) {
   const suspectIds = new Set(doctorRes?.suspect.map((r) => r.id) || []);
   // Prerequisite state comes from doctor: it has the root and already answers
   // "is this satisfied here" for every claim.
-  const setupById = new Map((doctorRes?.rows || []).filter((r) => r.setup).map((r) => [r.id, r.setup]));
+  const setupById = new Map((doctorRes?.rows || []).filter((r) => r.setups?.length).map((r) => [r.id, r.setups]));
 
   const stat = (label, value, cls = '') =>
     `<div class="stat ${cls}"><div class="stat-v">${esc(value)}</div><div class="stat-l">${esc(label)}</div></div>`;
@@ -254,7 +261,7 @@ export function renderReport(data) {
   <dl class="meta">
     <dt>check</dt><dd>${checkHtml(cl)}</dd>
     <dt>applies_to</dt><dd>${(cl.fm.applies_to || []).length ? [].concat(cl.fm.applies_to).map((p) => `<span class="chip">${esc(p)}</span>`).join(' ') : '<span class="muted">—</span>'}</dd>
-    <dt>setup</dt><dd>${setupHtml(setupById.get(id))}</dd>
+    <dt>prerequisites</dt><dd>${setupHtml(setupById.get(id))}</dd>
     <dt>evidence</dt><dd>${evidenceHtml(cl)}</dd>
     <dt>depends on</dt><dd>${linkList(deps)}</dd>
     <dt>affects</dt><dd>${linkList(impact)}</dd>
