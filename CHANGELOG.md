@@ -2,6 +2,22 @@
 
 All notable changes to manual-cli are documented here. Format: Keep a Changelog; versioning: SemVer.
 
+## [0.3.0] - 2026-09-21
+
+### Added
+- `graph [--dot|--mermaid|--json]` — the evidence graph as data: layers by depth, cycle detection, dangling-edge and isolated-claim reporting; exits 1 on cycles or dangling edges.
+- `report [--out <file>] [--open]` — one self-contained HTML page (inline SVG graph, claim cards, doctor issues, inbox, live filters). No CDN, no network requests, safe as a CI artifact.
+- `serve [--port N] [--open] [--pidfile <f>]` — loopback dashboard regenerated per request, with `GET /api/graph`, `GET /api/claims`, `GET /health`, and `POST /api/verify` that re-runs the real checks; port failover N+1…N+19; pidfile for scripting.
+- `readInbox(root)` — structured inbox contents (listInbox now renders it), shared by the report, the dashboard, and the MCP server.
+- This repo's manual now documents the tool's own surface: `tooling.cli-surface`, `docs.commands` (fails if the README stops mentioning a command the CLI exposes), and `policy.claims-valid` (a real pre-commit gate against malformed claims).
+- Tests: graph model/cycles/exporters, report rendering and escaping, HTTP end-to-end including pidfile and real CLI boot.
+
+### Fixed
+- The report's `check` row invented a schema (`check.run.expect`, `code`, `contains`). It now mirrors `runner.runCheck`: `run`/`expr` strings with `expect` as a sibling (`exit`, `stdout_matches`, `stderr_matches`, `max_ms`) — caught by looking at the served dashboard, where every check rendered empty.
+- Policy `enforce` metadata was unreachable behind the `run` branch; the gate (stage, severity, paths) is now always shown.
+- `serve.test.js` raced the pidfile against the stdout URL line (flaky ~1 in 3 under load). Caught by the dashboard's own `POST /api/verify` reporting `tests.suite` broken.
+- Removed a dead placeholder (`globFiles`) left in `expr.js`.
+
 ## [0.2.0] - 2026-09-21
 
 ### Added

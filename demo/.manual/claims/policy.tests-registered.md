@@ -6,6 +6,9 @@ statement: Every file under src/ named *.test.js must import its tests from node
 priority: high
 applies_to:
   - src/**
+depends_on:
+  - id: tests.demo
+    required: true
 evidence:
   files:
     - src/**

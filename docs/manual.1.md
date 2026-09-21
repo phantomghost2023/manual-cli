@@ -56,6 +56,25 @@ watch [--debounce N]
     match the changed file, plus bidirectional dependency closure. Stop with
     Ctrl+C. Runs until signaled; writes stamps to state.json.
 
+graph [--dot|--mermaid|--json]
+    The evidence graph as data: nodes are claims, edges are depends_on
+    (solid = required, dashed = optional). Prints claims/edges/layers and any
+    cycles, dangling edges, or isolated claims. --dot and --mermaid emit
+    diagram source for embedding. Exit 1 if a cycle or dangling edge exists.
+
+report [--out <file>] [--open]
+    Write a single self-contained HTML page (default .manual/report.html):
+    inline SVG evidence graph, one card per claim with state/tier badges,
+    doctor issues, the flywheel inbox, and live filters. No CDN, no build
+    step, no network requests — safe to attach to CI or email.
+
+serve [--port N] [--open] [--pidfile <file>]
+    Serve the same page as a loopback dashboard, regenerated per request:
+    GET / (report), GET /api/graph, GET /api/claims, GET /health, and
+    POST /api/verify which re-runs the real checks and rewrites state.json.
+    Binds 127.0.0.1 only. If the port is taken it tries N+1 ... N+19.
+    --pidfile lets scripts and editors find (and stop) the server.
+
 help
     Show usage.
 ```
@@ -74,7 +93,8 @@ Kinds: `fact`, `command`, `trap` (broken = gotcha fixed → retire), `policy`, `
 
 ## EXIT CODES
 
-0 all fresh/passed · 1 something broken or doctor suspects · 2 usage/load errors
+0 all fresh/passed · 1 something broken, a blocked gate, a graph cycle, or a
+suspect doctor report · 2 usage errors, load errors, or an unrunnable command.
 
 ## PERFORMANCE
 

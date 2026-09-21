@@ -5,11 +5,6 @@ import { spawnSync } from 'node:child_process';
 // Sandboxed expression checks (`check.expr`). A tiny, explicit API is exposed
 // to the claim expression; nothing else from the process is reachable.
 
-function globFiles(root, pattern) {
-  // local lazy import avoided to keep dependency graph simple; reuse glob.js
-  return null; // placeholder replaced below
-}
-
 function gitLines(root, args) {
   const r = spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' });
   if (r.status !== 0) return [];

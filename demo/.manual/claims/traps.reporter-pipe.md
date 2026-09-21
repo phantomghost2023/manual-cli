@@ -7,6 +7,9 @@ priority: critical
 applies_to:
   - src/**
   - package.json
+depends_on:
+  - id: tests.demo
+    required: true
 evidence:
   files:
     - src/**

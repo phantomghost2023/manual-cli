@@ -74,6 +74,25 @@ manual observe
 
 If runs consistently take 2s while a claim allows 30s, observe writes a *tighten* candidate. If a bound itself broke a claim, it proposes a *relax*. You review, accept or delete — the manual drifts toward truth as a side effect of work, not because anyone maintains it.
 
+## 5b. See it
+
+The manual is a graph of claims that depend on each other. `report` renders that graph as one self-contained HTML page, and `serve` exposes the same page as a live dashboard:
+
+```bash
+manual report --open            # writes .manual/report.html and opens it
+manual serve --port 4242        # http://127.0.0.1:4242/
+```
+
+Nodes are colored by state and arrows point from a claim to what it depends on; click a node to jump to its card. The page has state/kind filters, the flywheel inbox, and whatever `doctor` is worried about. On the served dashboard there's also a **re-verify now** button: it re-runs the real checks in a sandbox and reloads with fresh stamps.
+
+When you want the graph somewhere else, it exports:
+
+```bash
+manual graph                    # text summary (cycles, dangling edges, layers)
+manual graph --mermaid          # paste into a PR or README
+manual graph --dot | dot -Tsvg  # if graphviz is installed
+```
+
 ## 6. For agent sessions
 
 Point your coding agent at the MCP server so it starts every session with verified context instead of exploration:

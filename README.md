@@ -13,6 +13,9 @@ manual doctor   # is the manual itself healthy?
 manual init     # discover claims by inspection, scaffold .manual/
 manual inbox    # list/accept candidate claims (humans accept, agents propose)
 manual hooks    # install/uninstall the pre-commit enforce gate
+manual graph    # the evidence graph: dependencies, cycles, depth
+manual report   # one self-contained HTML page: graph + cards + inbox
+manual serve    # the same page as a live local dashboard
 manual mcp      # MCP server: agents pull verified briefs over JSON-RPC
 ```
 
@@ -48,7 +51,28 @@ node bin/manual.js verify --root /path/to/repo --force
 | `mcp [--root dir]` | Speak MCP over stdio: `manual_brief`, `manual_verify`, `manual_doctor`, `manual_inbox` tools. Point your coding agent at `bin/manual.js mcp`. |
 | `eject [--dry-run]` | Vendor the CLI into `tools/manual-cli/` so CI workflows and hooks run fully self-contained. |
 | `watch [--debounce N]` | Editor-loop mode: re-verify claims affected by file changes (evidence globs + bidirectional dependency closure). `affectedClaims()` is exported for editor integrations. |
+| `graph [--dot\|--mermaid\|--json]` | The evidence graph: nodes are claims, edges are `depends_on` (solid = required, dashed = optional). Reports cycles, dangling edges, isolated claims, and layer depth. Exits 1 on cycles or dangling edges. |
+| `report [--out <file>] [--open]` | Writes `.manual/report.html` — a single self-contained page (no CDN, no build): inline SVG graph, one card per claim, tier/state badges, doctor issues, the flywheel inbox, and live filter controls. |
+| `serve [--port N] [--open] [--pidfile <f>]` | The same page as a live loopback dashboard, regenerated per request, plus `/api/graph`, `/api/claims`, `/api/verify` (POST) and `/health`. Port failover: if N is taken it tries N+1 … N+19. Writes a pidfile so scripts can find and stop it. |
 | `brief --at <ref>` | Historical brief: the manual as of a past commit, for debugging old releases. |
+
+## Seeing the manual
+
+The evidence graph has been a data structure since the first version; `report` and
+`serve` make it something you can look at.
+
+```bash
+manual report --open            # static artifact you can commit as a CI artifact
+manual serve --port 4242        # live dashboard; POST /api/verify re-runs the checks
+manual graph --mermaid          # paste into a README or PR description
+manual graph --dot | dot -Tsvg  # if you have graphviz
+```
+
+Nodes are colored by state, edges follow `depends_on`, and clicking a node jumps
+to the claim's card. The report is one file with zero external requests — it
+renders offline, in email, and in an artifact bucket. `POST /api/verify` is what
+makes `serve` different: the page re-runs the real checks in a sandbox and
+then reloads with fresh stamps.
 
 ## Claim file format (manual/v1)
 
@@ -127,10 +151,20 @@ The demo ships a genuine trap discovered while building it: `node --test --test-
 ## Test
 
 ```bash
-npm test        # 56 tests across 14 suites (includes seeded fuzzing of the parser/loader)
+npm test        # 76 tests across 26 suites (seeded fuzzing, real-git integration, HTTP end-to-end)
 npm run bench   # 500-claim scale benchmark (see numbers below)
 ```
 
 Scale (500 claims, Windows, cold process): verify --force 0.8s · warm verify 0.3s · doctor 0.1s · brief 0.1s — evidence digests are deduped per spec and parsed claims are stat-cached per process.
 
 Docs: [docs/TUTORIAL.md](docs/TUTORIAL.md) (5-minute walkthrough) · [docs/manual.1.md](docs/manual.1.md) (reference) · [completions.bash](completions.bash)
+
+## This repo's own manual
+
+`manual-cli` documents itself, and the documentation is enforced:
+
+- `docs.commands` fails if the README stops mentioning a command the CLI exposes.
+- `tooling.cli-surface` fails if `src/cli.js` loses a command handler.
+- `docs.commands` depends on `tooling.cli-surface`, so a drifted surface blocks
+  the doc claim rather than letting it report a stale pass.
+- `policy.claims-valid` is a real pre-commit gate: a malformed claim cannot be committed.

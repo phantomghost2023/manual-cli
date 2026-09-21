@@ -8,29 +8,50 @@ import { c } from './color.js';
 // If the candidate carries a `proposes.patch` (dotted key -> value), the patch
 // is merged into the target claim's frontmatter instead of clobbering it.
 
+// Structured inbox contents (no printing) — used by the report, the dashboard,
+// and the MCP server. listInbox renders this.
+export function readInbox(root) {
+  const dir = path.join(root, '.manual', 'inbox');
+  if (!fs.existsSync(dir)) return [];
+  return fs
+    .readdirSync(dir)
+    .filter((f) => f.endsWith('.md'))
+    .sort()
+    .map((f) => {
+      const text = fs.readFileSync(path.join(dir, f), 'utf8');
+      const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+      const fm = m ? parseYaml(m[1]) : {};
+      return {
+        file: f,
+        id: fm.id && fm.id !== 'candidate' ? fm.id : null,
+        kind: fm.kind || null,
+        proposes: fm.proposes || null,
+        observation: fm.observation || null,
+      };
+    });
+}
+
 export function listInbox(root) {
   const dir = path.join(root, '.manual', 'inbox');
   if (!fs.existsSync(dir)) {
     console.log(c.grey('no inbox (nothing proposed yet)'));
     return [];
   }
-  const files = fs.readdirSync(dir).filter((f) => f.endsWith('.md')).sort();
-  if (files.length === 0) {
+  const candidates = readInbox(root);
+  if (candidates.length === 0) {
     console.log(c.grey('inbox empty'));
     return [];
   }
-  for (const f of files) {
-    const full = path.join(dir, f);
-    const text = fs.readFileSync(full, 'utf8');
-    const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-    const fm = m ? parseYaml(m[1]) : {};
-    console.log(`📥 ${f}`);
-    if (fm.proposes?.update) console.log(c.grey(`   proposes: update ${fm.proposes.update}`));
-    if (fm.observation?.by) console.log(c.grey(`   observed by ${fm.observation.by} at ${fm.observation.at || '?'}`));
-    const ev = (fm.observation?.evidence || '').toString();
+  for (const cand of candidates) {
+    console.log(`📥 ${cand.file}`);
+    if (cand.proposes?.update) console.log(c.grey(`   proposes: update ${cand.proposes.update}`));
+    if (cand.observation?.by) {
+      console.log(c.grey(`   observed by ${cand.observation.by} at ${cand.observation.at || '?'}`));
+    }
+    const ev = (cand.observation?.evidence || '').toString();
     if (ev) console.log(c.grey(`   ${ev.slice(0, 120)}`));
   }
-  return files;
+  return candidates.map((x) => x.file);
 }
 
 // Set a dotted path (e.g. "check.expect.max_ms") inside a parsed frontmatter object.

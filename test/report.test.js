@@ -1,0 +1,187 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { buildGraph } from '../src/graph.js';
+import { layout, renderReport, writeReport, buildReportData } from '../src/report.js';
+import { startServer } from '../src/serve.js';
+import { State } from '../src/state.js';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const demo = path.join(here, '..', 'demo');
+
+function fakeClaim(id, extra = {}) {
+  return {
+    file: path.join('/x/.manual/claims', `${id}.md`),
+    fm: {
+      schema: 'manual/v1',
+      id,
+      kind: extra.kind || 'fact',
+      statement: extra.statement || `statement for ${id}`,
+      applies_to: extra.applies_to || ['src/**'],
+      evidence: extra.evidence || { files: ['package.json'] },
+      depends_on: extra.depends_on || [],
+      priority: 'normal',
+      ...extra.fm,
+    },
+    intro: extra.intro || `Explanation for ${id}.`,
+    gotchas: extra.gotchas || null,
+    body: extra.body || `Explanation for ${id}.\n\n## Details\nmore`,
+    check: extra.check || { run: { cmd: 'echo hi', expect: { code: 0 } } },
+  };
+}
+
+function renderFixture(claims, stamps = {}, inbox) {
+  const graph = buildGraph(claims, stamps);
+  return renderReport({
+    root: '/repo',
+    repoName: 'fixture',
+    claims,
+    graph,
+    doctorRes: { rows: [], suspect: [], healthy: claims.length, errors: [] },
+    inbox: inbox ?? [
+      { file: '2026-01-01-tighten.md', id: 'x', kind: 'fact', proposes: { update: 'x' }, observation: { by: 'session', at: new Date().toISOString(), evidence: 'p50 4000ms' } },
+    ],
+    generatedAt: '2026-01-01T00:00:00.000Z',
+    version: '0.1.0',
+  });
+}
+
+test('report is a complete standalone document with no external references', () => {
+  const html = renderFixture([fakeClaim('alpha', { depends_on: [{ id: 'beta' }] }), fakeClaim('beta')]);
+  assert.match(html, /^<!doctype html>/i);
+  assert.match(html, /<\/html>\s*$/);
+  assert.match(html, /id="card-alpha"/);
+  assert.match(html, /id="card-beta"/);
+  assert.match(html, /<svg class="graph"/);
+  assert.doesNotMatch(html, /src="https?:/);
+  assert.doesNotMatch(html, /href="https?:\/\/(?!localhost)/);
+  assert.doesNotMatch(html, /<link[^>]+stylesheet/);
+  assert.match(html, /alpha depends on beta/);
+});
+
+test('untrusted claim text is escaped, never interpolated as markup', () => {
+  const evil = fakeClaim('evil', {
+    statement: '</h3><img src=x onerror="alert(1)"><svg onload=alert(2)>',
+    intro: 'intro with <script>alert("x")</script> inside',
+  });
+  const html = renderFixture([evil]);
+  assert.doesNotMatch(html, /<img src=x/);
+  assert.doesNotMatch(html, /<script>alert\("x"\)/);
+  assert.match(html, /&lt;img src=x/);
+  assert.match(html, /&lt;script&gt;alert\(&quot;x&quot;\)&lt;\/script&gt;/);
+});
+
+test('cards carry filter metadata and state badges', () => {
+  const html = renderFixture(
+    [fakeClaim('alpha', { kind: 'trap' }), fakeClaim('beta')],
+    { alpha: { state: 'broken', tier: 'gold', verified_at: '2026-01-01T00:00:00Z' } },
+  );
+  assert.match(html, /data-state="broken"/);
+  assert.match(html, /data-kind="trap"/);
+  assert.match(html, /data-tier="gold"/);
+  assert.match(html, /class="badge state-broken"/);
+  assert.match(html, /class="badge tier-gold"/);
+  assert.match(html, /data-filter="broken"/);
+});
+
+test('an empty manual renders without crashing', () => {
+  const html = renderFixture([], {}, []);
+  assert.match(html, /no claims/);
+  assert.match(html, /inbox empty/);
+  assert.match(html, /No issues/);
+});
+
+test('a populated inbox is rendered with its acceptance command', () => {
+  const html = renderFixture([fakeClaim('alpha')]);
+  assert.match(html, /2026-01-01-tighten\.md/);
+  assert.match(html, /proposes update → x/);
+  assert.match(html, /manual inbox accept 2026-01-01-tighten\.md/);
+});
+
+test('layout places every node without overlap inside its layer', () => {
+  const claims = [];
+  for (let i = 0; i < 12; i++) claims.push(fakeClaim(`n${i}`));
+  const graph = buildGraph(claims);
+  const { pos, width, height } = layout(graph);
+  assert.equal(pos.size, 12);
+  const ys = [...pos.values()].map((p) => p.y);
+  assert.equal(new Set(ys).size, 12);
+  assert.ok(width > 0 && height > 12 * 40);
+});
+
+test('check rows mirror the real check schema, not a guess', () => {
+  const html = renderReport(buildReportData(demo, { skipDoctor: true }));
+  // command claim: run string + sibling expect keys from the runner
+  assert.match(html, /run node --test/);
+  assert.match(html, /expects exit 0, ≤ 30000ms/);
+  // expr claim: the expression itself, escaped
+  assert.match(html, /expr manifest\(&quot;package.json&quot;\)\.type === &quot;module&quot;/);
+  // policy claim: its enforce block
+  assert.match(html, /enforce pre-commit · block/);
+  // and never an empty check cell
+  assert.doesNotMatch(html, /<code>expr<\/code>/);
+  assert.doesNotMatch(html, /<code>run<\/code>/);
+});
+
+test('doctor issues appear in the attention section', () => {
+  const claims = [fakeClaim('alpha')];
+  const graph = buildGraph(claims);
+  const html = renderReport({
+    root: '/repo',
+    repoName: 'fixture',
+    claims,
+    graph,
+    doctorRes: { rows: [{ id: 'alpha', state: 'fresh', issues: ['TTL 30d expired 2d ago'] }], suspect: [{ id: 'alpha', state: 'fresh', issues: ['TTL 30d expired 2d ago'] }], healthy: 0, errors: [] },
+    inbox: [],
+    generatedAt: '2026-01-01T00:00:00.000Z',
+  });
+  assert.match(html, /TTL 30d expired 2d ago/);
+});
+
+test('writeReport writes the artifact and buildReportData reads the demo manual', () => {
+  const out = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'manual-report-')), 'report.html');
+  const res = writeReport(demo, { out, state: new State(demo), skipDoctor: true });
+  assert.equal(res.out, out);
+  assert.ok(fs.statSync(out).size > 2000);
+  const data = buildReportData(demo, { skipDoctor: true });
+  assert.ok(data.claims.length >= 5);
+  assert.ok(data.graph.nodes.size >= 5);
+  // The demo manual is the reference shape: a real multi-layer evidence graph,
+  // not a flat list. If this drops, the demo stopped demonstrating.
+  assert.ok(data.graph.edges.length >= 3, `expected >=3 edges, got ${data.graph.edges.length}`);
+  assert.ok(data.graph.width >= 3, `expected >=3 layers, got ${data.graph.width}`);
+  assert.deepEqual(data.graph.cycles, []);
+  assert.deepEqual(data.graph.missing, []);
+  assert.equal(data.repoName, 'demo');
+});
+
+test('serve responds with the report, JSON APIs, and 404s', async () => {
+  const s = await startServer(demo, { port: 0 });
+  try {
+    assert.ok(s.port > 0);
+    const home = await fetch(s.url);
+    assert.equal(home.status, 200);
+    const html = await home.text();
+    assert.match(html, /<svg class="graph"/);
+    assert.match(html, /tooling\.node-esm/);
+    assert.match(html, /id="reverify"/);
+
+    const graph = await (await fetch(s.url + 'api/graph')).json();
+    assert.ok(Array.isArray(graph.nodes));
+    assert.ok(graph.nodes.length >= 5);
+
+    const claims = await (await fetch(s.url + 'api/claims')).json();
+    assert.ok(claims.claims.every((c) => typeof c.id === 'string' && typeof c.state === 'string'));
+
+    const health = await (await fetch(s.url + 'health')).json();
+    assert.equal(health.ok, true);
+
+    const missing = await fetch(s.url + 'nope');
+    assert.equal(missing.status, 404);
+  } finally {
+    await s.close();
+  }
+});

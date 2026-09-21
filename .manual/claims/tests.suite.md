@@ -8,6 +8,9 @@ applies_to:
   - "src/**"
   - "test/**"
   - "lib/**"
+depends_on:
+  - id: tooling.modules
+    required: true
 evidence:
   files:
     - "package.json"

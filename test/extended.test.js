@@ -51,12 +51,15 @@ describe('diff selection', () => {
     assert.deepEqual(picked, ['c.policy', 'e.always']);
   });
 
-  test('verify --diff on non-git root runs policies only', async () => {
+  test('verify --diff on non-git root runs policies plus their dependency closure', async () => {
     const dir = tmp('manual-diff-');
     const state = new State(dir);
     const res = await verify(dir, { state, force: true, diff: true });
     const ids = res.results.map((r) => r.claim.fm.id).sort();
-    assert.deepEqual(ids, ['policy.tests-registered']);
+    // The policy gate rides along on every diff (changed files are unknown
+    // without git), and so do the claims it depends on — a gate whose
+    // dependencies are unverified cannot be trusted to mean anything.
+    assert.deepEqual(ids, ['policy.tests-registered', 'tests.demo', 'tooling.node-esm']);
     cleanup(dir);
   });
 });

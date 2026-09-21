@@ -4,3 +4,7 @@ node_modules/
 
 # manual verify stamps are machine state, not truth
 .manual/state.json
+
+# generated artifacts
+.manual/report.html
+.manual/serve.pid

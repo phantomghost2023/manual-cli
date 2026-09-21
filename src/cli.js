@@ -12,6 +12,10 @@ import { writeProposals } from './observe.js';
 import { installHook, uninstallHook, hookStatus } from './hooks.js';
 import { eject } from './eject.js';
 import { startWatch } from './watch.js';
+import { buildGraph, graphToJson, toDot, toMermaid, printGraphSummary } from './graph.js';
+import { writeReport } from './report.js';
+import { serveCommand } from './serve.js';
+import { loadManual } from './claims.js';
 import { c } from './color.js';
 
 function usage() {
@@ -28,6 +32,9 @@ Usage:
   manual hooks  [--root <dir>] [install|uninstall|status]
   manual eject  [--root <dir>] [--dry-run]   # vendor the CLI into tools/manual-cli
   manual watch  [--root <dir>] [--debounce N]  # re-verify affected claims on change
+  manual graph  [--root <dir>] [--dot|--mermaid|--json]   # dependency graph
+  manual report [--root <dir>] [--out <file>] [--open]    # self-contained HTML report
+  manual serve  [--root <dir>] [--port N] [--open] [--pidfile <f>]  # live dashboard over the report
   manual brief  --at <ref> [files...]     # manual as it was at a past ref
 
 Verify runs each claim's check in a sandbox (git worktree when possible),
@@ -195,6 +202,47 @@ export async function main(argv = []) {
           console.log(`  node ${'tools/manual-cli/bin/manual.js'} verify --diff HEAD~1`);
         }
       }
+      return 0;
+    }
+
+    if (cmd === 'graph') {
+      const state = new State(root);
+      const { claims, errors } = loadManual(root);
+      const graph = buildGraph(claims, state.data.stamps);
+      if (rest.includes('--dot')) { process.stdout.write(toDot(graph)); return 0; }
+      if (rest.includes('--mermaid')) { process.stdout.write(toMermaid(graph)); return 0; }
+      if (json) { console.log(JSON.stringify(graphToJson(graph), null, 2)); return 0; }
+      for (const line of printGraphSummary(graph)) console.log(line);
+      for (const e of errors) console.log(c.red(`load error: ${e}`));
+      return graph.cycles.length || graph.missing.length || errors.length ? 1 : 0;
+    }
+
+    if (cmd === 'report') {
+      const state = new State(root);
+      const out = flag(rest, '--out') || undefined;
+      const res = writeReport(root, { state, out });
+      if (json) {
+        console.log(JSON.stringify({ out: res.out, claims: res.data.claims.length, inbox: res.data.inbox.length }, null, 2));
+        return 0;
+      }
+      console.log(`${c.green('✔')} report written: ${res.out}`);
+      console.log(c.grey(`  ${res.data.claims.length} claims · ${res.data.graph.edges.length} edges · ${res.data.inbox.length} inbox candidate(s)`));
+      if (rest.includes('--open')) {
+        const { spawn } = await import('node:child_process');
+        const pair = process.platform === 'win32' ? ['cmd', ['/c', 'start', '', res.out]]
+          : process.platform === 'darwin' ? ['open', [res.out]]
+            : ['xdg-open', [res.out]];
+        try { spawn(pair[0], pair[1], { detached: true, stdio: 'ignore' }).unref(); } catch { /* best effort */ }
+      }
+      return 0;
+    }
+
+    if (cmd === 'serve') {
+      await serveCommand(root, {
+        port: Number(flag(rest, '--port') || 4242),
+        open: rest.includes('--open'),
+        pidfile: flag(rest, '--pidfile') || null,
+      });
       return 0;
     }
 
