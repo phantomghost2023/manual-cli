@@ -176,6 +176,40 @@ describe('verifiers: npm', () => {
     assert.match(reason, /no package-lock\.json or npm-shrinkwrap\.json/);
     assert.match(reason, /pnpm-lock\.yaml is present/);
   });
+
+  test('a package built for another platform is skipped, never counted missing', () => {
+    // Measured on npm/cli: 20 of 1181 lockfile entries were other-OS native
+    // binaries (`@typescript/typescript-<aix|darwin|freebsd>-…`) that a
+    // satisfied Windows install never materializes. Same rule as pnpm/bun.
+    const root = tmp('manual-npm-');
+    write(root, 'package-lock.json', JSON.stringify({
+      lockfileVersion: 3,
+      packages: {
+        '': { name: 'x', dependencies: { esbuild: '^0.28.0' } },
+        'node_modules/esbuild': { version: '0.28.2' },
+        'node_modules/@esbuild/aix-ppc64': { version: '0.28.2', cpu: ['ppc64'], os: ['aix'] },
+      },
+    }));
+    mkdir(root, 'node_modules/esbuild');
+    const v = runBuiltinVerifier(root, spec({ builtin: 'npm' }));
+    assert.equal(v.ok, true);
+    assert.match(v.note, /1 package\(s\) present/);
+    assert.match(v.note, /1 platform-specific package\(s\) skipped/);
+
+    // The same constraint pointing at *this* platform makes the package
+    // expected, so its absence is exactly the damage the verifier exists to
+    // report. Platform-neutral by construction.
+    const damaged = tmp('manual-npm-');
+    write(damaged, 'package-lock.json', JSON.stringify({
+      lockfileVersion: 3,
+      packages: {
+        'node_modules/@esbuild/here': { version: '0.28.2', cpu: [process.arch], os: [process.platform] },
+      },
+    }));
+    const d = runBuiltinVerifier(damaged, spec({ builtin: 'npm' }));
+    assert.equal(d.ok, false);
+    assert.match(d.note, /1\/1 installed package\(s\) missing/);
+  });
 });
 
 describe('verifiers: pnpm', () => {
@@ -637,6 +671,41 @@ describe('verifiers: bun', () => {
     assert.equal(gone.ok, null, 'bun does not rebuild a missing store directory');
     assert.match(gone.note, /have no directory in node_modules\/\.bun, e\.g\. node_modules\/\.bun\/is-odd@3\.0\.1/);
     assert.match(gone.note, /not a verdict/);
+  });
+
+  test('bun: a peer-resolved store directory carries a +hash suffix', () => {
+    // The real case (oven-sh/bun, bun 1.2, isolated linker): the directory on
+    // disk is `@types+react-dom@18.3.7+52f32cb6c6aeed77` while bun.lock names
+    // `@types+react-dom@18.3.7` — exact matching reported a freshly installed
+    // healthy store as 3/23 missing. The suffix is a peer-resolution hash,
+    // so matching folds it off; the raw name still wins when it exists.
+    const root = tmp('manual-bun-peers-');
+    write(root, 'package.json', pkgJson('probe', '0.0.0'));
+    write(root, 'bun.lock', [
+      '{',
+      '  "lockfileVersion": 1,',
+      '  "workspaces": {',
+      '    "": { "name": "probe", "dependencies": { "@types/react-dom": "18.3.7", "typescript": "6.0.2" } },',
+      '  },',
+      '  "packages": {',
+      '    "@types/react-dom": ["@types/react-dom@18.3.7", "", {}, "sha512-aaa"],',
+      '    "typescript": ["typescript@6.0.2", "", {}, "sha512-bbb"],',
+      '  },',
+      '}',
+    ].join('\n'));
+    write(root, 'node_modules/.bun/@types+react-dom@18.3.7+52f32cb6c6aeed77/package.json', pkgJson('@types/react-dom', '18.3.7'));
+    write(root, 'node_modules/.bun/typescript@6.0.2/package.json', pkgJson('typescript', '6.0.2'));
+
+    const v = runBuiltinVerifier(root, spec({ builtin: 'bun' }));
+    assert.equal(v.ok, true, 'a suffixed peer directory IS the install');
+    assert.match(v.note, /2 package\(s\) present, matching bun\.lock \(isolated store\)/);
+
+    // Folding the suffix off is not a license to match loosely: remove the
+    // suffixed directory and the package is reported missing again.
+    fs.rmSync(path.join(root, 'node_modules/.bun/@types+react-dom@18.3.7+52f32cb6c6aeed77'), { recursive: true });
+    const gone = runBuiltinVerifier(root, spec({ builtin: 'bun' }));
+    assert.equal(gone.ok, null, 'a missing store directory is reported, never judged');
+    assert.match(gone.note, /e\.g\. node_modules\/\.bun\/@types\+react-dom@18\.3\.7/);
   });
 
   test('bun: a scoped package in the isolated store is spelled @scope+name', () => {

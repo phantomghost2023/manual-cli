@@ -487,7 +487,7 @@ The demo ships a genuine trap discovered while building it: `node --test --test-
 ## Test
 
 ```bash
-npm test        # 259 tests across 50 suites (seeded fuzzing, real-git integration, HTTP end-to-end)
+npm test        # 266 tests across 50 suites (seeded fuzzing, real-git integration, HTTP end-to-end)
 npm run bench   # 500-claim scale benchmark (see numbers below)
 ```
 

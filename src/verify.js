@@ -7,6 +7,15 @@ import { c } from './color.js';
 import { changedFiles, findBase, selectForDiff } from './diff.js';
 import { recordLedger } from './ledger.js';
 
+// How long verify waits for one claim: its own bound when it declares one —
+// init calibrates max_ms from a measured run, and killing at the config
+// default first would make every calibrated bound decorative (runCheck
+// prefers an explicit timeoutMs). The config default is for claims that
+// declare no bound.
+export function checkTimeoutMs(cl, config) {
+  return cl.fm?.check?.expect?.max_ms ?? (config.verify?.default_timeout_s || 60) * 1000;
+}
+
 // Verify orchestrator: dependency resolution, digest gating, TTL, execution order.
 
 function topoOrder(claims) {
@@ -109,7 +118,8 @@ export async function verify(root, opts = {}) {
     if (!sharedSandbox) sharedSandbox = await new Sandbox(root).enter();
     const r = await verifyOne(cl, root, state, {
       sandbox: sharedSandbox,
-      timeoutMs: (config.verify.default_timeout_s || 60) * 1000,
+      // See checkTimeoutMs: the claim's own bound is the wait.
+      timeoutMs: checkTimeoutMs(cl, config),
       noSetup,
       setupForce,
       quiet,

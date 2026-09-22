@@ -196,6 +196,27 @@ function npmPaths(lock) {
   return out;
 }
 
+// npm lockfiles list every platform variant of platform-specific packages
+// (esbuild, rollup natives, the TypeScript native preview); a satisfied
+// install never materializes the variants built for other operating systems
+// or CPUs. Same rule as the pnpm and bun verifiers: a package not expected on
+// this machine is not missing. Measured on npm/cli, where 20 of 1181 lockfile
+// entries were other-OS native binaries. `libc` is skipped as unverifiable,
+// matching pnpm.
+function npmPlatformSkip(entry) {
+  if (!entry) return false;
+  const here = (v) => v === process.platform || v === process.arch;
+  for (const field of ['os', 'cpu', 'libc']) {
+    const list = entry[field];
+    if (!Array.isArray(list) || !list.length) continue;
+    if (field === 'libc') return true;
+    // npm allows negation: `os: [!win32]` means "everything but win32".
+    if (list.some((v) => typeof v === 'string' && v.startsWith('!') && here(v.slice(1)))) return true;
+    if (!list.includes(process.platform) && !list.includes(process.arch)) return true;
+  }
+  return false;
+}
+
 const npm = {
   name: 'npm',
   unit: 'package',
@@ -213,20 +234,27 @@ const npm = {
     if (!lockName) return { ok: null, ms: 0, note: 'no package lockfile to compare the install against' };
     const lock = readJson(path.join(root, lockName));
     if (!lock) return { ok: null, ms: 0, note: `unreadable ${lockName}` };
-    const declared = npmPaths(lock).map((p) => ({ name: p }));
+    // Lockfile entries carry their own os/cpu constraints (v3+); the tree
+    // shape of a v1 lockfile has none, and npmPlatformSkip(undefined) is
+    // false, so those count exactly as before.
+    const metaOf = (p) => (lock.packages && typeof lock.packages === 'object' ? lock.packages[p] : undefined);
+    const declared = npmPaths(lock).map((p) => ({ name: p, meta: metaOf(p) }));
     if (!declared.length) return { ok: null, ms: 0, note: `${lockName} declares no installed packages to compare against` };
+    const expected = declared.filter((d) => !npmPlatformSkip(d.meta));
+    const skipped = declared.length - expected.length;
     const t0 = Date.now();
-    const missing = declared.filter((d) => !exists(path.join(root, d.name)));
+    const missing = expected.filter((d) => !exists(path.join(root, d.name)));
     const ms = Date.now() - t0;
+    const skipNote = skipped ? ` (${skipped} platform-specific package(s) skipped)` : '';
     if (missing.length) {
       return {
         ok: false,
         ms,
-        note: `${missing.length}/${declared.length} installed package(s) missing, e.g. ${missing[0].name}`,
+        note: `${missing.length}/${expected.length} installed package(s) missing, e.g. ${missing[0].name}${skipNote}`,
         missing: missing.slice(0, 5).map((d) => d.name),
       };
     }
-    return { ok: true, ms, note: `${declared.length} package(s) present, matching ${lockName}` };
+    return { ok: true, ms, note: `${expected.length} package(s) present, matching ${lockName}${skipNote}` };
   },
 };
 
@@ -1327,13 +1355,32 @@ const bun = {
     //
     // isolated: there is no top-level entry for a transitive package at all
     // (only the workspace's own dependencies are linked at the root), so the
-    // store directory `node_modules/.bun/<name>@<version>` is the install, and
-    // a name with two versions has one farm link but two store directories.
+    // store directory `node_modules/.bun/<name>@<version>` is the install (a
+    // peer-resolved one carrying `+<hex>` after the version, measured on
+    // oven-sh/bun), and a name with two versions has one farm link but two
+    // store directories.
     // Measured: a deleted store directory is *not* rebuilt — `bun install
     // --frozen-lockfile` answered "Checked 6 installs across 32 packages (no
     // changes)" and left it gone — which is why its absence is reported rather
     // than judged, exactly like pnpm.
     const isolated = exists(path.join(root, 'node_modules', '.bun'));
+    // bun 1.2 suffixes a store directory with `+<hex>` when the package
+    // resolves peers (measured on oven-sh/bun: the directory is
+    // `@types+react-dom@18.3.7+52f32cb6c6aeed77` while bun.lock names
+    // `@types+react-dom@18.3.7`), so the bare `name@version` the lockfile
+    // names is often not the directory's literal name — exact matching called
+    // a freshly installed healthy store 3/23 missing. Index the store both raw
+    // and with a trailing suffix folded off; raw is consulted first, so a
+    // version carrying semver build metadata (`1.0.0+exp.sha…`) still matches
+    // only its own directory.
+    const storeNames = isolated ? new Set(list(path.join(root, 'node_modules', '.bun')) || []) : null;
+    const storeBases = isolated ? new Set() : null;
+    if (storeBases) {
+      for (const d of storeNames) {
+        const base = d.replace(/\+[0-9a-f]{8,32}$/, '');
+        if (base !== d) storeBases.add(base);
+      }
+    }
     const t0 = Date.now();
     const missing = [];
     const wrong = [];
@@ -1358,7 +1405,10 @@ const bun = {
       // with forward slashes — because they are meant to be pasted into a
       // message or a shell, not resolved by this process.
       const rel = isolated ? `node_modules/.bun/${name.replace(/\//g, '+')}@${version}` : bunEntryPath(key);
-      if (!exists(path.join(root, rel))) {
+      const present = isolated
+        ? storeNames.has(rel.slice('node_modules/.bun/'.length)) || storeBases.has(rel.slice('node_modules/.bun/'.length))
+        : exists(path.join(root, rel));
+      if (!present) {
         missing.push(rel);
         continue;
       }

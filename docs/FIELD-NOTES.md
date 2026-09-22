@@ -746,3 +746,77 @@ and the built-in pnpm verdict went from `ok: null, 36/518 missing` on a freshly
 synced tree to `ok: true, 489 present, 17ms`, with damage detection re-proven
 after the fix (deleted `vite@8.3.0` → flagged; `pnpm install --frozen-lockfile`
 → restored, 16ms, `ok: true`).
+
+## Ninth pass: three ecosystems, three false-positive classes, and a bound
+## that measures itself
+
+The pnpm drill earned a rule: every fixture is tuned on the repo it grew up
+with, so only a wild repo can find a verifier's noise rate. This pass ran the
+remaining Node builtins against wild repos the same way — install, probe,
+damage, repair — and then the question vuejs/core's timeout had been asking
+for three passes: who chose 120000?
+
+### npm on npm/cli: presence is not completeness
+
+npm/cli ships 1367 files of `node_modules` committed to git — no `.bin`, no
+dev deps — so discovery's presence gate saw a tree, wired no prerequisite,
+and the suite claim ran against an install that was never made (`tap` absent,
+122 of 1181 packages on disk). Two fixes came out of it. The builtin gets the
+last word when a tree exists — a definitive `ok: false` wires `requires`,
+`ok: null` leaves discovery alone (only definitive evidence moves a claim).
+And the npm verifier learned the platform rule pnpm and bun already had: its
+20 "missing" packages were all `@typescript/typescript-<aix|darwin|freebsd|…>`
+— entries every lockfile carries and no Windows machine ever materializes.
+After: `ok: true, 1161 present, 20 platform skipped`; deleting
+`node_modules/tap` named the package and its subtree; `npm ci` (305s, 761
+packages) restored `ok: true`. The partial tree was never the tool's fault —
+it was the repo's shape, which is exactly the kind of thing a presence gate
+cannot see.
+
+### yarn 1 held up; bun did not
+
+yarn-wild: healthy tree zero false positives; `rm -rf node_modules/react`
+reported `6/103 missing` rather than judging (transitive integrity gaps like
+`invariant` stay disk-damage's documented job); `--check-files` (123s)
+restored `ok: true`.
+
+oven-sh/bun told a different story: with deps installed (6.6s), the isolated
+verifier still read `3/23 missing` on a *healthy* store. All three existed —
+as `@types+react-dom@18.3.7+52f32cb6c6aeed77`. bun 1.2 appends `+<hex>` to a
+store directory when the package resolves peers, and exact `name@version`
+matching can never hit a suffixed name. Matching now folds the suffix off —
+raw name first, so a version carrying semver build metadata still matches
+only itself. The verdict had honestly been `ok: null` the whole time —
+report-not-judge contained the damage — but the *evidence* was false, and
+false evidence still costs a reader trust. After: `ok: true` in 6ms; deleted
+`typescript@6.0.2` → named, never judged; fresh `bun install` → `ok: true`.
+False-positive rates across the three drills: npm 20/1181 → 0; yarn 1 0 → 0
+(its known gap stayed a documented report, not a false yes); bun 3/23 → 0.
+
+### The bound that measures itself
+
+`blocked — no exit within 120s` had been asking who chose that number. Nobody
+measured anything: init hardcoded it, and verify's config default (60s)
+silently overrode it anyway — runCheck prefers an explicit timeoutMs, so a
+claim's max_ms was decorative at stamp time and five-minute suites could only
+ever block. The calibration loop closes both ends. Discovery writes no bound
+for a command check; the probe waits up to 600s for an unmeasured one, and a
+fresh run writes `max(120000, measured × 3)` rounded to seconds with
+`observation.measured_ms` as provenance — fast suites keep the floor that
+observe later tightens on evidence, slow suites get a bound that can hold
+them. A run that never finishes gets the floor and says so; a run that exits
+with failures gets the floor and says that. The probe also stopped
+contradicting verify: a check stopped by its bound is `blocked` — untested,
+not false — where the probe had been filing `broken`, and the probe's note
+printed `120000s`, max_ms read as if it were seconds. verify now waits for
+the claim's own bound (`checkTimeoutMs`), config default only when the claim
+declares none.
+
+Measured both ways: on vuejs/core the suite exits 1 on this machine (109
+failed / 3758 passed — the repo's real Windows story), so the probe ran all
+~293s inside the calibration window and correctly kept the floor: a failing
+run never measured a healthy duration, and the note says exactly that. On a
+passing slow fixture the same probe writes the real number and accept+verify
+run inside it. What the window costs: a genuinely hanging check stalls init
+600s instead of 120s — one honest cost paid once, against a lifetime of
+blocked stamps.

@@ -7,7 +7,7 @@ import { runCheck } from './runner.js';
 import { Sandbox } from './sandbox.js';
 import { normalizeSetup } from './setup.js';
 import { VENDORED_CLI } from './eject.js';
-import { yarnKind } from './verifiers.js';
+import { yarnKind, runBuiltinVerifier } from './verifiers.js';
 
 // Init: discover facts about a repo by inspection and scaffold a .manual/
 // with confident, executable claims. Only emits claims it can back with
@@ -261,7 +261,31 @@ export function detect(root) {
     // checkout, not about the repo. When the checkout is missing them the claim
     // references the prerequisite declared in manual.yaml by name — discovery
     // does not restate the command it just wrote down.
-    const missingDeps = depCount(pkg) > 0 && !fs.existsSync(path.join(root, 'node_modules'));
+    //
+    // Presence of node_modules is not the question — completeness is. Found on
+    // a real repo (npm/cli): the checkout ships a *partial* node_modules in
+    // git (no dev deps, no .bin), so the presence gate wired no prerequisite
+    // and the proposed check ran against an install that was never made. When
+    // the tree exists, the lockfile builtin — the thing that exists to answer
+    // exactly this — gets the last word; its "no" or "not a verdict" wires
+    // the prerequisite just like an absent tree.
+    let missingDeps = depCount(pkg) > 0 && !fs.existsSync(path.join(root, 'node_modules'));
+    let partialNote = null;
+    if (!missingDeps && depCount(pkg) > 0 && fs.existsSync(path.join(root, 'node_modules'))) {
+      // Let the resolver pick the builtin from the one lockfile in the
+      // checkout: `auto` reads the checkout, naming every possible lockfile as
+      // evidence would instead make it refuse with "cannot tell which
+      // ecosystem".
+      const v = runBuiltinVerifier(root, { verifyBuiltin: 'auto' });
+      // Only a definitive "no" rewires the claim. "Cannot tell" (no lockfile,
+      // a lockfile that lists nothing) is not evidence of a partial install,
+      // and wiring a prerequisite on it would force installs onto checkouts
+      // the verifier has no opinion about.
+      if (v && v.ok === false) {
+        missingDeps = true;
+        partialNote = `node_modules exists but the install does not match ${v.note.split(';')[0].trim()} — the claim requires the prerequisite so verify installs before it checks`;
+      }
+    }
     const declared = ecosystemPrereqs(root, pkg);
     const named = missingDeps && declared.node ? 'node' : null;
     const install = missingDeps && !named ? installCommand(root, pkg) : null;
@@ -276,7 +300,10 @@ export function detect(root) {
       priority: 'high',
       applies_to: ['src/**', 'test/**', 'lib/**'],
       evidence: { files: ['package.json', 'src/**', 'test/**'] },
-      check: { run: checkRun, expect: { exit: 0, max_ms: 120000 } },
+      // No max_ms here on purpose: discovery has not measured this suite, and
+      // a made-up number would be indistinguishable from an evidenced one.
+      // The probe measures it once and writes the bound — see probeCandidates.
+      check: { run: checkRun, expect: { exit: 0 } },
       setup: install,
       requires: named,
       note: [
@@ -285,7 +312,7 @@ export function detect(root) {
           ? `The script calls a local binary (${firstWord}), so the check runs it through \`${throughPm}\` — the way node_modules/.bin reaches PATH.`
           : null,
         named
-          ? `Dependencies are not installed in this checkout, so the candidate requires the \`${named}\` prerequisite declared in .manual/manual.yaml (${declared.node.run}); verify runs it before the check.`
+          ? partialNote || `Dependencies are not installed in this checkout, so the candidate requires the \`${named}\` prerequisite declared in .manual/manual.yaml (${declared.node.run}); verify runs it before the check.`
           : install
             ? `Dependencies are not installed in this checkout, so the candidate declares a setup (${install.run}); verify runs it before the check.`
             : null,
@@ -334,7 +361,8 @@ function checkBlock(f) {
   const setup = f.setup
     ? `  setup:\n    run: ${JSON.stringify(f.setup.run)}\n    evidence:\n${(f.setup.evidence || []).map((p) => `      - "${p}"`).join('\n')}\n    cache:\n${(f.setup.cache || []).map((p) => `      - ${p}`).join('\n')}\n${verifyBlock(f.setup, '    ')}`
     : '';
-  return `${requires}${setup}  run: ${JSON.stringify(f.check.run)}\n  expect:\n    exit: ${f.check.expect?.exit ?? 0}\n    max_ms: ${f.check.expect?.max_ms ?? 120000}`;
+  const bound = f.check.expect?.max_ms != null ? `\n    max_ms: ${f.check.expect.max_ms}` : '';
+  return `${requires}${setup}  run: ${JSON.stringify(f.check.run)}\n  expect:\n    exit: ${f.check.expect?.exit ?? 0}${bound}`;
 }
 
 function claimFile(f) {
@@ -367,6 +395,23 @@ ${f.note || 'Discovered automatically. Review, adjust, and accept.'}
   return fm;
 }
 
+// Calibration: init measures a check's first honest duration instead of
+// handing every claim the default time bound. The default exists to stop a
+// runaway command — it was never a statement about how long suites take, and
+// inheriting it is what stamped every five-minute suite `blocked` forever
+// (measured on vuejs/core: ~293s against a 120s cap).
+const CALIBRATION_MAX_MS = 600000; // the longest init will ever wait for a measurement
+const MAX_MS_FLOOR = 120000;       // today's default: init is never tighter than it used to be
+const MAX_MS_HEADROOM = 3;         // headroom: a healthy run on a slower machine must still fit
+
+// The bound a measured duration earns, rounded up to whole seconds. Fast
+// suites keep the floor: manual observe tightens bounds later from
+// accumulated evidence, and one cold run must not become doctrine.
+export function calibratedMaxMs(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return MAX_MS_FLOOR;
+  return Math.max(MAX_MS_FLOOR, Math.ceil((ms * MAX_MS_HEADROOM) / 1000) * 1000);
+}
+
 // Run each discovered candidate's check before a human is asked to accept it.
 //
 // Found on a real repository: `init` proposed "the test suite runs with npm
@@ -395,15 +440,25 @@ export async function probeCandidates(root, { timeoutMs = 20000, quiet = false, 
       const fm = fmRaw ? parseYaml(fmRaw) : {};
       if (!fm.check) continue;
 
+      // What the probe waits for. A declared bound is passed through as
+      // undefined so runCheck kills at the claim's own max_ms — a hand-written
+      // claim is measured against itself, not against the probe's floor. A
+      // command check with NO bound has never been measured; that absence is
+      // what this run exists to fix, so it gets the calibration window once
+      // and the number it earns is written back below. The 20s probe floor
+      // still covers everything else (expr checks, and as a minimum).
+      const declaredBound = fm.check?.expect?.max_ms || 0;
+      const measure = Boolean(fm.check?.run) && !declaredBound;
+      const waiting = measure ? Math.max(timeoutMs, CALIBRATION_MAX_MS) : declaredBound ? undefined : timeoutMs;
+
       const attempt = async () => {
         try {
           return await runCheck({ fm, check: fm.check, setup: normalizeSetup(fm.check) }, root, {
             sandbox,
-            // The probe's short cap is a floor, not a ceiling: a real suite
+            // The probe's short cap stays a floor, not a ceiling: a real suite
             // that takes 20s is not a broken claim, and reporting it as one is
-            // how discovery loses a human's trust. The claim's own bound is
-            // what will be asserted later, so it is what we wait for here.
-            timeoutMs: Math.max(timeoutMs, fm.check?.expect?.max_ms || 0),
+            // how discovery loses a human's trust.
+            timeoutMs: waiting,
             noSetup: !setup,
             quiet: true,
           });
@@ -436,20 +491,56 @@ export async function probeCandidates(root, { timeoutMs = 20000, quiet = false, 
           r = await attempt();
         }
       }
+      // A check stopped by its bound never produced a verdict: verify stamps
+      // such runs `blocked` — untested, not false (the rule learned on
+      // vuejs/core, whose ~293s suite met a 120s cap) — but the probe filed
+      // them `broken`, disagreeing with its own tool. One doctrine now. The
+      // note also names the bound in seconds: it used to print `120000s`,
+      // max_ms read as if it were seconds.
+      const timedOut = Boolean(r.timedOut);
+      const boundLabel = declaredBound
+        ? `${Math.round(declaredBound / 1000)}s bound`
+        : `${Math.round((waiting || 0) / 1000)}s calibration window`;
       const probe = {
-        state: r.ok ? 'fresh' : r.blocked ? 'blocked' : 'broken',
-        // "exit null" is what a killed process leaves behind, and it reads as
-        // a bug in the tool. Found on a real repo (vuejs/core): a five-minute
-        // vitest suite against a two-minute cap — the probe's verdict was
-        // right, but the note has to say what actually happened.
-        note: r.ok ? `${r.ms ?? '?'}ms` : (r.error || (r.timedOut ? `no exit within ${Math.round((r.ms || 0) / 1000)}s — the check ran longer than its ${r.expect?.max_ms || 'default'}s bound and was stopped` : `exit ${r.exit}`)),
+        state: r.ok ? 'fresh' : (r.blocked || timedOut) ? 'blocked' : 'broken',
+        note: r.ok
+          ? `${r.ms ?? '?'}ms`
+          : r.error
+            ? r.error
+            : timedOut
+              ? `no exit within ${Math.round((r.ms || 0) / 1000)}s — stopped at its ${boundLabel}, so it is untested, not false`
+              : `exit ${r.exit}`,
         ms: r.ms ?? null,
       };
+      // Measure once, write the number. A fresh run earns its own bound — the
+      // measured duration with headroom, floored at today's default so init is
+      // never tighter than it used to be. Anything that did not complete keeps
+      // the default: an absent bound falls through to a 60s runtime guess at
+      // verify time, which is the exact trap this removes.
+      const calibrated = measure
+        ? probe.state === 'fresh'
+          ? calibratedMaxMs(r.ms)
+          : MAX_MS_FLOOR
+        : null;
       const next = {
         ...fm,
+        ...(calibrated != null
+          ? { check: { ...fm.check, expect: { ...(fm.check.expect || {}), max_ms: calibrated } } }
+          : {}),
         observation: {
           ...(fm.observation || {}),
-          ...{ at: nowIso(), by: 'agent:manual-cli', probe_state: probe.state, probe_note: probe.note },
+          ...{
+            at: nowIso(),
+            by: 'agent:manual-cli',
+            probe_state: probe.state,
+            probe_note: probe.note,
+            ...(calibrated != null
+              ? {
+                  max_ms: calibrated,
+                  ...(probe.state === 'fresh' && r.ms != null ? { measured_ms: r.ms } : {}),
+                }
+              : {}),
+          },
           ...(declared
             ? {
                 setup: declared.run,
@@ -459,10 +550,20 @@ export async function probeCandidates(root, { timeoutMs = 20000, quiet = false, 
             : {}),
         },
       };
+      const boundClause =
+        calibrated == null
+          ? ''
+          : probe.state === 'fresh'
+            ? calibrated > MAX_MS_FLOOR
+              ? `; bound set to max_ms ${calibrated} (${r.ms}ms measured × ${MAX_MS_HEADROOM} headroom)`
+              : `; bound: max_ms ${calibrated} (measured ${r.ms ?? '?'}ms — the default floor holds)`
+            : `; bound: max_ms ${calibrated} (the default — this run never measured a healthy duration)`;
       const noteLine = probe.state === 'fresh'
-        ? `Probed before proposing: the check passes on this checkout (${probe.note})${declared ? `, after declaring its prerequisite (${declaredName ? `requires: ${declaredName} — ` : ''}${declared.run})` : ''}.`
+        ? `Probed before proposing: the check passes on this checkout (${probe.note}${boundClause})${declared ? `, after declaring its prerequisite (${declaredName ? `requires: ${declaredName} — ` : ''}${declared.run})` : ''}.`
         : probe.state === 'blocked'
-          ? `Probed before proposing: **the prerequisite could not be established here** (${probe.note}). The claim is untested — install it, then re-run \`manual verify\`. It is not a false claim, and it will report \`blocked\` rather than \`broken\` until then.`
+          ? timedOut
+            ? `Probed before proposing: **the check never exited within ${boundLabel}** (${probe.note}${boundClause}). The claim is untested, not false — if this suite legitimately needs longer, raise \`check.expect.max_ms\` before accepting it.`
+            : `Probed before proposing: **the prerequisite could not be established here** (${probe.note}). The claim is untested — install it, then re-run \`manual verify\`. It is not a false claim, and it will report \`blocked\` rather than \`broken\` until then.`
           : `Probed before proposing: **the check does not pass here** (${probe.note}). It may need dependencies installed, a build step, or a different command. Do not accept it as-is.`;
       fs.writeFileSync(full, `---\n${stringifyYaml(next)}---\n${body.trim()}\n\n${noteLine}\n`);
       results.push({

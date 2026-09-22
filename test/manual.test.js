@@ -9,7 +9,7 @@ import { parseYaml, parseFlow } from '../src/yaml.js';
 import { matches, expandFiles } from '../src/glob.js';
 import { loadManual } from '../src/claims.js';
 import { interpret } from '../src/runner.js';
-import { verify, printVerifyReport } from '../src/verify.js';
+import { verify, printVerifyReport, checkTimeoutMs } from '../src/verify.js';
 import { brief } from '../src/brief.js';
 import { State } from '../src/state.js';
 import { listInbox, acceptInbox } from '../src/inbox.js';
@@ -225,4 +225,16 @@ describe('report', () => {
     assert.equal(code, 1);
     fs.rmSync(dir, { recursive: true, force: true });
   });
+});
+
+test("a claim's own bound is how long verify waits for it", () => {
+  // init calibrates max_ms from a measured run; killing at the config default
+  // first would make every calibrated bound decorative (runCheck prefers an
+  // explicit timeoutMs over the claim's). The config default is what claims
+  // with no declared bound get.
+  const cfg = { verify: { default_timeout_s: 120 } };
+  assert.equal(checkTimeoutMs({ fm: { check: { expect: { max_ms: 879000 } } } }, cfg), 879000, 'the calibrated bound wins');
+  assert.equal(checkTimeoutMs({ fm: { check: { expect: {} } } }, cfg), 120000, 'config default for the unbound');
+  assert.equal(checkTimeoutMs({ fm: {} }, cfg), 120000);
+  assert.equal(checkTimeoutMs({ fm: {} }, {}), 60000, 'no config at all still stops a runaway at 60s');
 });

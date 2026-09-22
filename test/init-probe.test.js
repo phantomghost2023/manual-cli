@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { init, probeCandidates } from '../src/init.js';
+import { init, probeCandidates, calibratedMaxMs } from '../src/init.js';
 import { parseYaml } from '../src/yaml.js';
 import { splitFrontmatter } from '../src/md.js';
 
@@ -62,6 +62,34 @@ test('a discovered check that cannot run is marked broken, not proposed as true'
     assert.match(fm.observation.probe_note, /exit|not found|ENOENT/);
     assert.match(body, /does not pass here/);
     assert.match(body, /Do not accept it as-is/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a partial node_modules (present but not matching the lockfile) still wires the prerequisite', async () => {
+  // The real case (npm/cli): the checkout ships a partial node_modules in git
+  // — no dev deps, no .bin — so the old presence gate wired no prerequisite and
+  // the proposed check ran against an install that was never made. The
+  // lockfile builtin gets the last word when the tree exists.
+  const LOCK = JSON.stringify({
+    name: 'p',
+    lockfileVersion: 3,
+    packages: {
+      '': { name: 'p', version: '1.0.0', dependencies: { tap: '^16.0.0' } },
+      'node_modules/tap': { version: '16.3.10', dev: true },
+      'node_modules/left-pad': { version: '1.3.0' },
+    },
+  });
+  const dir = fixture({ name: 'p', version: '1.0.0', scripts: { test: 'tap test/' }, devDependencies: { tap: '^16.0.0' } }, {
+    'package-lock.json': LOCK,
+    'test/a.js': 'require("tap");\n',
+    'node_modules/left-pad/package.json': '{"name":"left-pad","version":"1.3.0"}',
+  });
+  try {
+    init(dir, {});
+    const { fm } = readCandidate(dir, 'init-tests.suite.md');
+    assert.equal(fm.check.requires, 'node', 'partial install must require the prerequisite');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -149,5 +177,92 @@ test('no inbox means no probing, and no crash', async () => {
     assert.deepEqual(await probeCandidates(dir, { quiet: true }), []);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('calibratedMaxMs: a measured suite earns a bound that can hold it', () => {
+  // The formula init writes: today's default as an unbreakable floor (init is
+  // never tighter than it used to be), otherwise the measured runtime times
+  // MAX_MS_HEADROOM, rounded up to whole seconds. vuejs/core's suite (~293s)
+  // is the case this exists for — against the old 120s default it could only
+  // ever stamp blocked.
+  assert.equal(calibratedMaxMs(3000), 120000);
+  assert.equal(calibratedMaxMs(40000), 120000, '40s × 3 lands exactly on the floor');
+  assert.equal(calibratedMaxMs(45000), 135000, 'just over: headroom applies');
+  assert.equal(calibratedMaxMs(293000), 879000, "vuejs/core's real ~293s suite");
+  assert.equal(calibratedMaxMs(0), 120000);
+  assert.equal(calibratedMaxMs(NaN), 120000);
+});
+
+test('discovery writes no bound; the probe measures one and writes it', async () => {
+  // The suite deliberately takes ~1.5s so there is a duration to measure. It
+  // still earns the floor (1.5s × 3 < 120s): fast suites keep today's default
+  // and observe tightens later from accumulated evidence. What matters is that
+  // the bound now has provenance — measured_ms — instead of being invented.
+  const dir = fixture({ name: 'p', version: '1.0.0', scripts: { test: 'node -e "setTimeout(() => {}, 1500)"' } }, {
+    'test/a.test.js': 'import { test } from "node:test"; test("ok", () => {});\n',
+  });
+  try {
+    init(dir, {});
+    const before = readCandidate(dir, 'init-tests.suite.md');
+    assert.equal(before.fm.check.expect.max_ms, undefined, 'discovery has not measured anything yet');
+
+    const probes = await probeCandidates(dir, { quiet: true });
+    assert.equal(probes[0].state, 'fresh');
+    const after = readCandidate(dir, 'init-tests.suite.md');
+    assert.equal(after.fm.check.expect.max_ms, 120000, 'the floor, now evidenced');
+    assert.equal(after.fm.observation.max_ms, 120000);
+    assert.equal(typeof after.fm.observation.measured_ms, 'number');
+    assert.ok(after.fm.observation.measured_ms >= 1000 && after.fm.observation.measured_ms < 60000, `measured the 1.5s suite, got ${after.fm.observation.measured_ms}`);
+    assert.match(after.body, /bound: max_ms 120000/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a probe stopped at its declared bound is blocked, never broken', async () => {
+  // Doctrine made executable: a check killed by a time bound never produced a
+  // verdict — verify stamps `blocked` (v0.11.2) and the probe now agrees. A
+  // hand-written candidate carries its own declared bound, which is what the
+  // probe kills at: the claim is measured against itself, not a default.
+  const dir = fixture({ name: 'p', version: '1.0.0' });
+  fs.mkdirSync(path.join(dir, '.manual', 'inbox'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.manual', 'inbox', 'init-slow.md'), [
+    '---',
+    'schema: manual/v1',
+    'id: slow.thing',
+    'kind: command',
+    'statement: A deliberately slow check.',
+    'priority: normal',
+    'check:',
+    '  run: node -e "setTimeout(() => {}, 10000)"',
+    '  expect:',
+    '    exit: 0',
+    '    max_ms: 2000',
+    '---',
+    '',
+    'body',
+    '',
+  ].join('\n'));
+  try {
+    const probes = await probeCandidates(dir, { quiet: true });
+    assert.equal(probes[0].state, 'blocked', 'a killed check is untested, not false');
+    assert.match(probes[0].note, /stopped at its 2s bound/);
+    const { fm, body } = readCandidate(dir, 'init-slow.md');
+    assert.equal(fm.check.expect.max_ms, 2000, 'a declared bound is not re-measured');
+    assert.equal(fm.observation.probe_state, 'blocked');
+    assert.match(body, /never exited within 2s bound/);
+    assert.match(body, /raise `check\.expect\.max_ms`/);
+  } finally {
+    // The killed child releases its hold on the temp dir asynchronously on
+    // Windows; retry briefly instead of failing the test on cleanup.
+    for (let i = 0; i < 10; i++) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+        break;
+      } catch {
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    }
   }
 });
