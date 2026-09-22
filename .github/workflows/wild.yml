@@ -120,9 +120,13 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         if: matrix.tool == 'bun'
       - name: Clone ${{ matrix.repo }}${{ matrix.ref && format(' at {0}', matrix.ref) }}
-        run: >-
-          git clone --depth 1 ${{ matrix.ref && format('{0} ', matrix.ref) || '' }}
-          "https://github.com/${{ matrix.repo }}" "$RUNNER_TEMP/wild"
+        run: |
+          git clone --depth 1 "https://github.com/${{ matrix.repo }}" "$RUNNER_TEMP/wild"
+          if [ -n "${{ matrix.ref }}" ]; then
+            cd "$RUNNER_TEMP/wild"
+            git fetch --depth 1 origin "${{ matrix.ref }}"
+            git checkout --detach "${{ matrix.ref }}"
+          fi
       - name: Install the tree the way the ecosystem does
         working-directory: ${{ runner.temp }}/wild
         run: ${{ matrix.setup }}
