@@ -311,6 +311,9 @@ export async function main(argv = []) {
             cached: st.cached,
             missing: st.missing,
             verify: s.spec.verify,
+            verify_label: st.verify_label,
+            verify_builtin: st.verify_builtin,
+            verify_why: st.verify_why,
             verify_unavailable: st.verify_unavailable,
             share: s.spec.share,
             borrowable_from: st.borrowable_from,
@@ -328,16 +331,19 @@ export async function main(argv = []) {
             // when it is actually used, and the plan says so rather than
             // implying the tree was inspected.
             const state = s.cached
-              ? c.green(s.verify ? `satisfied here (re-checked with ${s.verify} before use)` : 'satisfied here')
+              ? c.green(s.verify ? `satisfied here (re-checked before use)` : 'satisfied here')
               : s.borrowable_from
                 ? c.green('can be borrowed')
                 : c.amber('will run');
             const deps = s.requires.length ? c.grey(` needs ${s.requires.join(', ')}`) : '';
             console.log(`  ${i + 1}. ${label}${deps}  ${c.grey(s.claims.join(', '))}  ${state}`);
-            if (!s.cached && s.verify) console.log(c.grey(`       re-checked with: ${s.verify}`));
+            // `auto` is a question; the answer (and why) is what a reader needs.
+            if (s.verify) {
+              console.log(c.grey(`       ${s.cached ? 're-checked with' : 'will be re-checked with'}: ${s.verify_label}`));
+            }
             // A verifier that cannot run here is not a satisfied step either, and
             // saying so is the difference between "checked" and "unverifiable".
-            if (s.verify_unavailable) console.log(c.grey(`       ⚠ ${s.verify} cannot run here: ${s.verify_unavailable}`));
+            if (s.verify_unavailable) console.log(c.grey(`       ⚠ cannot run here: ${s.verify_unavailable}`));
           });
           for (const u of plan.unknown) console.log(c.red(`  ✖ ${u.name} is required by ${u.claims.join(', ')} but nothing declares it`));
           for (const cy of plan.cycles) console.log(c.red(`  ✖ cycle: ${cy.join(' → ')}`));
@@ -367,7 +373,12 @@ export async function main(argv = []) {
               : st.entry
                 ? `last attempt failed: ${short(st.entry.note, 120)}`
                 : 'not satisfied on this machine yet'}${st.missing.length ? ` · missing: ${st.missing.join(', ')}` : ''}`));
-            if (st.verify_unavailable) console.log(c.grey(`    ⚠ ${st.verify} cannot run here: ${st.verify_unavailable}`));
+            // Which verifier will answer for this install, and whether it can
+            // answer here at all: "verified" and "unverifiable" are different
+            // facts about a tree, and only one of them is reassuring.
+            if (st.verify) {
+              console.log(c.grey(`    verify: ${st.verify_label}${st.verify_unavailable ? ` — cannot run here: ${st.verify_unavailable}` : ''}`));
+            }
           }
           continue;
         }

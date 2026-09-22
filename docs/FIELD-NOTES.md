@@ -430,9 +430,80 @@ finding J, i.e. by accident. With the verifier fixed, the same clone has been
   describing the same directories; a mutation in one is not pushed to the other's
   record, so the second checkout's next verify is what catches it. A global tree
   registry (with a lockfile digest per *tree*, not per checkout) would close it.
-- **A verifier per ecosystem is still hand-written.** `builtin: lockfile` covers
-  node; Python, Ruby and Go want the same treatment (`.venv` against
-  `requirements.txt`, `vendor/bundle` against `Gemfile.lock`), and until then
-  those repos either accept witness-only caches or run a slow `verify:` command
-  on every verify. The tri-state result (finding K) is the interface to build
-  them against.
+- **A verifier per ecosystem was hand-written, and the tri-state result (finding
+  K) was the interface to build the rest against** — done for npm, pnpm, Python
+  virtualenvs, Bundler, Go modules and Cargo in the fifth pass below, which also
+  shows what a builtin may *not* claim. Yarn, bun, pipenv and uv are still
+  uncovered, and uv's gaps are reported rather than judged.
+
+## Fifth pass: the same question, in six ecosystems
+
+Probed on 2026-09-21, on Windows, against real trees rather than fixtures: an npm
+11 project with a nested dependency, a pnpm 11 project, a `python -m venv` with
+two distributions, a vendored `bundle install` (bundler 2.6.9, rake 13.4.2), a Go
+module with two requires in a scratch `GOMODCACHE` (go 1.25.3), and a crate
+fetched into a scratch `CARGO_HOME` (cargo 1.90). Each was driven through
+`manual init` / `setup` / `verify`, damaged on disk, and verified again.
+
+- **The question this release turned on: can the declared command repair what the
+  verifier reports?** Measured, not assumed. Deleting
+  `node_modules/is-odd/node_modules/is-number` and running `npm ci` restores it.
+  Deleting `.venv/Lib/site-packages/six-1.16.0.dist-info` and running the
+  declared `python -m venv … && … pip install -r requirements.txt` restores it
+  (8.7s). Deleting
+  `vendor/bundle/ruby/3.4.0/specifications/rake-13.4.2.gemspec` and running
+  `bundle install` restores it (3.4s). Deleting
+  `$GOMODCACHE/github.com/google/uuid@v1.6.0` together with its `.ziphash` and
+  running `go mod download` restores both (0.3s). Where that holds, a builtin may
+  say "no"; where it does not, saying "no" is a reinstall nobody can stop.
+- **pnpm 11 fails that test, twice, and the field probe is what caught it.** A
+  satisfied `pnpm install` leaves `node_modules/.pnpm/<pkg>` alone after the
+  directory is deleted, and leaves a hand-modified `node_modules/.pnpm/lock.yaml`
+  alone; `pnpm install --force` did not restore the copy either. Two reinstalls
+  later the state was still there — the first version of this check judged it,
+  and re-ran the install on every verify of a real repo. It now reports:
+  `1/2 package(s) the lockfile lists are not in node_modules/.pnpm, e.g.
+  is-number@6.0.0; node_modules/.pnpm/lock.yaml matches pnpm-lock.yaml — not a
+  verdict: a satisfied pnpm install re-imports only when the lockfile itself
+  changes`. The store check is still worth keeping: it sees a gap the top-level
+  witness cannot, and it is the reason a *yes* is now a stronger statement than
+  "the directory exists".
+- **crates reports for a different reason.** The registry check found the missing
+  crate at once (`1/1 crate(s) missing, e.g. itoa@1.0.18`), but `Cargo.lock` also
+  covers dev-dependencies and target-specific crates that a plain `cargo build`
+  never fetches, so a verdict would fail the same way pnpm's did. It says
+  `not a verdict: Cargo.lock also covers dev-dependencies …` and leaves the tree
+  alone; the run stays silent about nothing and loud about nothing it cannot
+  prove.
+- **A prerequisite written by `init` was platform-wrong.** It proposed
+  `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`, which
+  cannot run on Windows at all — the interpreter is `python`, the scripts live in
+  `.venv/Scripts`. Running `init` on the probe venv now writes
+  `python -m venv .venv && .venv/Scripts/pip install -r requirements.txt` with
+  `verify: { builtin: venv }`, and that command ran for real as part of the probe.
+  On the same run `init` also proposed the prerequisite for a repo that had no
+  virtualenv yet, which is the state a fresh clone is always in.
+- **The verifier is the only layer that sees inside a tree.** Deleting a
+  `dist-info` (venv), a `gemspec` (gems), a store directory (pnpm) or a module
+  (go) leaves the declared `cache` directory's own listing unchanged, so the
+  witness passes and the install stays trusted until a verifier looks. In every
+  case the run printed the layer that caught it (`cached install distrusted —
+  verify: …`) instead of a bare "rebuilt".
+- **When a verifier could answer and declined, the verify path now says so** —
+  `⚙ setup: pnpm install --frozen-lockfile — reused, not re-confirmed: 1/2
+  package(s) …`. Without that line the third answer was invisible on exactly the
+  path where a tree is reused, which makes "cannot tell" look like "fine".
+- **`auto` is a question, and the plan prints its answer.** `builtin:auto →
+  pnpm (matched pnpm-lock.yaml (declared evidence))` appeared in `setup --plan`
+  on the probe repo before anything ran, and `cannot tell which ecosystem:
+  package-lock.json, Cargo.lock are all here` is what a monorepo with two
+  ecosystems gets — correct, and still a paper cut for whoever wrote `auto`
+  expecting it to guess.
+- **Still uncovered, and still honest about it.** Yarn (`yarn.lock`) and bun
+  (`bun.lockb`) have no builtin, so `init` declares none for them rather than one
+  that could only ever answer "cannot tell"; poetry's default virtualenv lives
+  outside the checkout, where the venv builtin reports "no virtualenv to inspect"
+  instead of guessing; and every builtin inherits the provenance of the lockfile
+  it reads — a lockfile that was never committed, or hand-edited to match what is
+  installed, verifies perfectly. The journal and the tier system are what cover
+  that, not this.

@@ -30,7 +30,15 @@ export function doctor(root, state) {
     if (specs.length) {
       row.setups = specs.map(({ name, spec }) => {
         const su = setupStatus(root, spec);
-        return { name, run: su.run, cached: su.cached, missing: su.missing, last: su.entry?.at || null };
+        return {
+          name,
+          run: su.run,
+          cached: su.cached,
+          missing: su.missing,
+          last: su.entry?.at || null,
+          verify: su.verify_label,
+          verify_unavailable: su.verify_unavailable,
+        };
       });
       const label = (s) => (s.name ? `${s.name} (${s.run})` : s.run);
       const failed = (stamp?.setups || []).filter((s) => ['failed', 'timeout', 'skipped', 'unknown'].includes(s.status));
@@ -82,6 +90,12 @@ export function printDoctor(res) {
     for (const s of r.setups || []) {
       const label = s.name ? `${s.name} → ${s.run}` : s.run;
       console.log(c.grey(`    ⚙ setup${s.cached ? '' : ' (unsatisfied)'}: ${label}${s.missing.length ? ` — missing ${s.missing.join(', ')}` : ''}`));
+      // A verifier that cannot answer here is still a usable prerequisite — it
+      // just means a cached tree is trusted on its marker alone, and that is
+      // exactly the difference this report exists to make visible.
+      if (s.verify) {
+        console.log(c.grey(`       verify: ${s.verify}${s.verify_unavailable ? ` — cannot run here: ${s.verify_unavailable}` : ''}`));
+      }
     }
   }
   for (const e of res.errors) console.log(c.red(`✖ load error: ${e}`));

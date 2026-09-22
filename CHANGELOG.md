@@ -2,6 +2,21 @@
 
 All notable changes to manual-cli are documented here. Format: Keep a Changelog; versioning: SemVer.
 
+## [0.10.0] - 2026-09-21
+
+### Added
+- **Six ecosystem verifiers behind one word.** `verify: { builtin: … }` now covers `npm`, `pnpm`, `venv`, `gems`, `gomod` and `crates`, each comparing an installed tree against its own lockfile by reading directory listings instead of running the package manager's check: a Python virtualenv against the `dist-info` directories and versions its lockfile declares (`requirements.txt`, `poetry.lock`, `Pipfile.lock`, `uv.lock`, found in both `Lib/site-packages` and `lib/python3.x/site-packages`), a vendored Bundler tree (`vendor/bundle`, or whatever `.bundle/config`'s `BUNDLE_PATH` says) against `Gemfile.lock`'s `GEM` specs, `$GOMODCACHE` against `go.mod` (or `vendor/modules.txt` for a vendored build, in Go's `!`-escaped cache layout, with direct dependencies checked for source and the module graph for its `.mod`), and `$CARGO_HOME/registry` against `Cargo.lock`. `builtin: auto` resolves against the setup's own evidence — or the one lockfile in the checkout — and reports which verifier it picked and why; `lockfile` remains as the older spelling of `npm`.
+- **`init` declares the verifier for the ecosystem it found**, and the virtualenv it declares is platform-correct (`.venv/Scripts` on Windows, `.venv/bin` elsewhere). The old command was POSIX-only, so the first `manual verify` on Windows wrote a prerequisite that could not run — a bug the Windows field probe found immediately.
+- **A verifier reports rather than judges when a verdict would be unrepairable.** A builtin says "no" only when the declared command can put it right, which was measured rather than assumed: `npm ci` restores a deleted nested package, `pip install -r` restores a `dist-info`, `bundle install` restores a gemspec, `go mod download` restores a module. pnpm 11 does not — a satisfied `pnpm install` leaves a deleted `node_modules/.pnpm/<pkg>` and a modified `.pnpm/lock.yaml` alone, even with `--force` — so the pnpm builtin answers yes when the store and its lockfile copy agree and otherwise names exactly what it saw. `crates` reports for the same reason: `Cargo.lock` covers dev-dependencies and target-specific crates that a plain build never fetches. Those cases print on the verify path, where the person who can act on them is looking: `⚙ setup: … — reused, not re-confirmed: …`.
+- **A subset install is recognised.** `npm ci --omit=dev`, `bundle install --without test`, `uv sync --no-dev`, `poetry install --only main` install part of a lockfile; there, a package that is absent is a fact about the command rather than a gap in the tree, and the verdict says so instead of rebuilding on every verify.
+- **A verifier that cannot answer is reported on every surface that asks** — the plan, `manual setup`, `doctor` and the dashboard — and a verifier that *could* answer and declined is printed on the verify path, because "unverifiable" and "verified" are different facts about a tree.
+
+### Fixed
+- **A `lockfileVersion: 1` npm lockfile declared nothing**, and a verifier that declares nothing used to report "0 package(s) present, matching package-lock.json" — a *yes* for an empty tree. v1 locks are read (nested `dependencies`), and a lockfile that declares no installed packages is `cannot tell`, never a yes.
+- **A `builtin:name` written as a string** is read as the same declaration instead of being run as a shell command (`builtin:npm: command not found`), which is the shape of the bug that silently degraded every cached install to a reinstall in 0.9.0.
+- **Builtin options survive normalization.** `{ builtin: gems, path: … }` is no longer dropped when a spec is normalized a second time, which is what resolution does.
+- **`npm` availability names another package manager's lockfile** when that is what the checkout has, so a pnpm/yarn/bun repo is told which verifier covers it rather than reading as "no lockfile at all".
+
 ## [0.9.0] - 2026-09-21
 
 ### Added

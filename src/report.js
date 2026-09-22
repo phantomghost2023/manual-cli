@@ -131,7 +131,12 @@ function setupHtml(setups) {
       const badge = s.cached
         ? '<span class="badge" title="this machine already has the result">✔ satisfied here</span>'
         : `<span class="badge warn" title="verify will run this before the check">⚙ runs on next verify${s.missing?.length ? ` · missing ${esc(s.missing.join(', '))}` : ''}</span>`;
-      return `${name}<code>${esc(s.run)}</code> ${badge}`;
+      // Which verifier re-checks a cached tree, and whether it can. A verifier
+      // that cannot answer is a tree trusted on its marker alone.
+      const verify = s.verify
+        ? ` <span class="muted" title="${s.verify_unavailable ? `cannot run here: ${esc(s.verify_unavailable)}` : 're-checks the cached tree before it is trusted'}">verify ${esc(s.verify)}${s.verify_unavailable ? ' ⚠' : ''}</span>`
+        : '';
+      return `${name}<code>${esc(s.run)}</code> ${badge}${verify}`;
     })
     .join('<br/>');
 }

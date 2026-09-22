@@ -208,9 +208,18 @@ resulting sequence without executing it.
 
 Two keys make a satisfied prerequisite checkable rather than merely remembered.
 `verify:` is re-run before a cached install is trusted — a command that exits 0,
-or the builtin `{ builtin: lockfile }`, which compares the installed tree against
-`package-lock.json`/`npm-shrinkwrap.json` by stat (64ms against a 403-package
-tree, where `npm ls --depth=0` takes ~11s). A cache entry whose declared
+or a builtin, which compares the installed tree against its own lockfile by
+reading directory listings: `npm` (64ms against a 403-package tree, where
+`npm ls --depth=0` takes ~11s), `pnpm`, `venv` (`requirements.txt`,
+`poetry.lock`, `Pipfile.lock`, `uv.lock`), `gems` (`Gemfile.lock` against a
+vendored bundle), `gomod` (`go.mod` against `$GOMODCACHE`, or
+`vendor/modules.txt`) and `crates` (`Cargo.lock` against
+`$CARGO_HOME/registry`). `auto` picks one from the setup's own evidence and
+reports which and why; `lockfile` is the older spelling of `npm`. They all
+answer three ways — yes, no, and "nothing here to compare against" — and only
+say "no" when the declared command can put it right. That was measured rather
+than assumed, which is why the pnpm and crates builtins report a gap instead of
+judging it: their package managers leave those states alone. A cache entry whose declared
 directories are present, whose witness still matches and whose verifier still
 says yes is reused; one that fails a layer is recorded as distrusted — with the
 layer that caught it, printed on the reinstall — and rebuilt. `share: true`

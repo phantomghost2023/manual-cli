@@ -30,8 +30,14 @@ export function installCommand(root, pkg = null) {
   const p = pkg || readJson(path.join(root, 'package.json')) || {};
   const has = (f) => fs.existsSync(path.join(root, f));
   const js = { cache: ['node_modules'] };
+  // The verifier each package manager's lockfile is read by. Yarn and bun write
+  // lockfiles no builtin reads yet, so those prerequisites declare none rather
+  // than one that can only ever answer "cannot tell" — a permanently
+  // unverifiable line on every report is worse than an absent one.
+  const npmVerify = { builtin: 'npm' };
+  const pnpmVerify = { builtin: 'pnpm' };
   if (String(p.packageManager || '').startsWith('pnpm') || has('pnpm-lock.yaml')) {
-    return { run: 'pnpm install --frozen-lockfile', evidence: ['package.json', 'pnpm-lock.yaml'], ...js };
+    return { run: 'pnpm install --frozen-lockfile', evidence: ['package.json', 'pnpm-lock.yaml'], ...js, verify: pnpmVerify };
   }
   if (String(p.packageManager || '').startsWith('yarn') || has('yarn.lock')) {
     return { run: 'yarn install --frozen-lockfile', evidence: ['package.json', 'yarn.lock'], ...js };
@@ -40,7 +46,7 @@ export function installCommand(root, pkg = null) {
     return { run: 'bun install --frozen-lockfile', evidence: ['package.json', 'bun.lockb'], ...js };
   }
   if (has('package-lock.json') || has('npm-shrinkwrap.json')) {
-    return { run: 'npm ci', evidence: ['package.json', 'package-lock.json'], ...js };
+    return { run: 'npm ci', evidence: ['package.json', 'package-lock.json'], ...js, verify: npmVerify };
   }
   if (depCount(p) > 0) return { run: 'npm install', evidence: ['package.json'], ...js };
   return null;
@@ -59,12 +65,26 @@ export function ecosystemPrereqs(root, pkg = null) {
   const out = {};
   const node = installCommand(root, p);
   if (node && depCount(p) > 0) out.node = node;
-  // A virtualenv is project-local, so an install into one is a step a verifier
-  // may take; a global `pip install` is not, and is not proposed.
-  if (has('requirements.txt') && (has('.venv') || has('venv') || (has('pyproject.toml') && has('poetry.lock')))) {
-    out.python = has('poetry.lock')
-      ? { run: 'poetry install', evidence: ['pyproject.toml', 'poetry.lock'], cache: ['.venv'] }
-      : { run: 'python3 -m venv .venv && .venv/bin/pip install -r requirements.txt', evidence: ['requirements.txt'], cache: ['.venv'] };
+  // A virtualenv is project-local by construction — `python -m venv .venv`
+  // writes inside the checkout — so an install into one is a step a verifier may
+  // take, and the lockfile it installs from is the thing the venv builtin
+  // compares. A bare `pip install` into the system Python is shared machine
+  // state and is still not proposed.
+  const win = process.platform === 'win32';
+  const venv = has('.venv') ? '.venv' : has('venv') ? 'venv' : '.venv';
+  if (has('requirements.txt') || (has('pyproject.toml') && has('poetry.lock'))) {
+    out.python = has('pyproject.toml') && has('poetry.lock')
+      ? { run: 'poetry install', evidence: ['pyproject.toml', 'poetry.lock'], cache: [venv], verify: { builtin: 'venv' } }
+      : {
+        // The interpreter and the script directory differ per platform
+        // (`Scripts` on Windows, `bin` elsewhere), and a prerequisite that only
+        // works on the machine that discovered it is a prerequisite that fails
+        // on the next one.
+        run: `${win ? 'python' : 'python3'} -m venv ${venv} && ${venv}/${win ? 'Scripts' : 'bin'}/pip install -r requirements.txt`,
+        evidence: ['requirements.txt'],
+        cache: [venv],
+        verify: { builtin: 'venv' },
+      };
   }
   // A Makefile that declares a dependency target is the repo telling us its own
   // install story; `cache` is empty because the target decides where it lands.
@@ -258,7 +278,7 @@ function checkBlock(f) {
       : `  requires: ${f.requires}\n`
     : '';
   const setup = f.setup
-    ? `  setup:\n    run: ${JSON.stringify(f.setup.run)}\n    evidence:\n${(f.setup.evidence || []).map((p) => `      - "${p}"`).join('\n')}\n    cache:\n${(f.setup.cache || []).map((p) => `      - ${p}`).join('\n')}\n`
+    ? `  setup:\n    run: ${JSON.stringify(f.setup.run)}\n    evidence:\n${(f.setup.evidence || []).map((p) => `      - "${p}"`).join('\n')}\n    cache:\n${(f.setup.cache || []).map((p) => `      - ${p}`).join('\n')}\n${verifyBlock(f.setup, '    ')}`
     : '';
   return `${requires}${setup}  run: ${JSON.stringify(f.check.run)}\n  expect:\n    exit: ${f.check.expect?.exit ?? 0}\n    max_ms: ${f.check.expect?.max_ms ?? 120000}`;
 }
@@ -404,6 +424,14 @@ export async function probeCandidates(root, { timeoutMs = 20000, quiet = false, 
   return results;
 }
 
+// A declared verifier, as YAML at the given indentation. `auto` is never written:
+// discovery knows which ecosystem it just found, so the prerequisite names the
+// verifier for it and a reader does not have to.
+function verifyBlock(spec, indent) {
+  if (!spec?.verify?.builtin) return '';
+  return `${indent}verify:\n${indent}  builtin: ${spec.verify.builtin}\n`;
+}
+
 // The `setup:` block as YAML, indented for manual.yaml.
 function setupBlock(prereqs) {
   if (Object.keys(prereqs).length === 0) return '';
@@ -413,6 +441,7 @@ function setupBlock(prereqs) {
     if (spec.evidence?.length) out += `    evidence:\n${spec.evidence.map((e) => `      - "${e}"`).join('\n')}\n`;
     if (spec.cache?.length) out += `    cache:\n${spec.cache.map((c) => `      - ${c}`).join('\n')}\n`;
     else out += '    cache: []\n';
+    out += verifyBlock(spec, '    ');
   }
   return out;
 }

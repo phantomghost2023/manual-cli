@@ -274,7 +274,7 @@ $ manual setup --plan
 prerequisite plan — 1 step(s), 1 claim(s), in the order a full verify runs them
 
   1. node → npm install  tests.suite  will run
-       re-checked with: builtin:lockfile
+       re-checked with: builtin:npm
 
 0 satisfied, 1 to establish — verify pays for each once, in this order.
 ```
@@ -299,24 +299,56 @@ setup:
     evidence: ["package.json", "package-lock.json"]
     cache: ["node_modules"]
     verify:
-      builtin: lockfile        # every package the lockfile names is installed
+      builtin: npm             # every package the lockfile names is installed
     share: true                # other checkouts on this machine may borrow it
 ```
 
-- **`builtin: lockfile`** answers the question a marker cannot — is this install
-  still the one the lockfile describes? — by comparing the installed tree
-  against `package-lock.json` / `npm-shrinkwrap.json` in a few hundred `stat`
-  calls. On a 403-package express tree that is **~64ms**; the obvious command,
-  `npm ls --depth=0`, takes **10.9s**, which is why the easy answer was never
-  being run. A `verify:` command is still accepted for other ecosystems; the
-  map form is required for builtins so a bare word is never ambiguous.
+- **Seven ecosystems, one question.** A builtin compares an installed tree
+  against the lockfile that describes it by reading directory listings, not by
+  running the package manager's own check:
+
+  | builtin | lockfile | tree | what is compared |
+  | --- | --- | --- | --- |
+  | `npm` | `package-lock.json`, `npm-shrinkwrap.json` | `node_modules` | every declared package path exists (lockfileVersion 1 and 3) |
+  | `pnpm` | `pnpm-lock.yaml` | `node_modules/.pnpm` | every resolved package has a store directory, and pnpm's own copy of the lockfile matches |
+  | `venv` | `requirements.txt`, `poetry.lock`, `Pipfile.lock`, `uv.lock` | `.venv` (both `Lib/site-packages` and `lib/python3.x/site-packages`) | every declared distribution is installed, at the declared version |
+  | `gems` | `Gemfile.lock` | `vendor/bundle` (`BUNDLE_PATH` honoured) | every `GEM` spec has a `specifications/*.gemspec` |
+  | `gomod` | `go.mod` | `$GOMODCACHE`, or `vendor/modules.txt` | every required module is downloaded: source for direct dependencies, `.mod` for the module graph |
+  | `crates` | `Cargo.lock` | `$CARGO_HOME/registry`, `vendor/` | every registry package has extracted source or a verified archive |
+  | `auto` | — | — | picks from the setup's own `evidence`, or the one lockfile in the checkout, and says which it picked |
+
+  On a 403-package express tree `npm` answers in **~64ms** against **10.9s** for
+  the obvious command, `npm ls --depth=0` — which is why the easy answer was
+  never being run. `lockfile` is the older spelling of `npm` and still resolves.
+  A `verify:` command is still accepted for anything not covered; the map form is
+  required for builtins so a bare word is never ambiguous.
 - **Yes, no, and "nothing to compare against" are different answers.** A repo can
   ship `.npmrc` with `package-lock=false` (express does) and commit no lockfile
   at all; treating that as "no" would reinstall on every verify for a repository
-  that is perfectly fine. It is reported instead — `⚠ builtin:lockfile cannot run
-  here: no package-lock.json or npm-shrinkwrap.json in this checkout` in `manual
-  setup` and in the plan — because "unverifiable" and "verified" are different
-  facts about a tree. The builtin is only as good as the lockfile's provenance.
+  that is perfectly fine. It is reported instead — `⚠ cannot run here: no
+  package-lock.json or npm-shrinkwrap.json in this checkout` in `manual setup`
+  and in the plan — because "unverifiable" and "verified" are different facts
+  about a tree. The builtin is only as good as the lockfile's provenance.
+- **"No" is only said when the declared command can repair it.** Every verdict
+  was measured against the package manager that owns the tree: `npm ci` restores
+  a deleted nested package, `pip install -r` restores a `dist-info`, `bundle
+  install` restores a gemspec, `go mod download` restores a module. Where the
+  repair does *not* happen a builtin reports instead of judging, because a
+  verdict there would rebuild on every verify and never change its answer —
+  measured twice on pnpm 11 (a satisfied `pnpm install` leaves a deleted
+  `node_modules/.pnpm/<pkg>` and a modified `node_modules/.pnpm/lock.yaml`
+  alone, even with `--force`) and true of `crates`, whose `Cargo.lock` covers
+  dev-dependencies a plain build never fetches. Those steps print what they saw:
+
+  ```console
+  ⚙ setup: pnpm install --frozen-lockfile — reused, not re-confirmed: 1/2 package(s) the lockfile lists are not in node_modules/.pnpm, e.g. is-number@6.0.0; node_modules/.pnpm/lock.yaml matches pnpm-lock.yaml — not a verdict: a satisfied `pnpm install` re-imports only when the lockfile itself changes
+  ```
+- **`init` writes the verifier for the ecosystem it found** (`verify: { builtin:
+  venv }`), never `auto` — discovery knows which one it just detected, so a human
+  reading `manual.yaml` does not have to work it out. It also writes a
+  platform-correct virtualenv command (`.venv/Scripts` on Windows, `.venv/bin`
+  everywhere else), because a prerequisite that only works on the machine that
+  discovered it is a prerequisite that fails on the next one.
 - **A distrusted install is rebuilt, and the reason is printed**:
 
   ```console
@@ -327,7 +359,7 @@ setup:
   The witness alone could not have seen this: losing `node_modules/mocha/node_modules`
   does not change the immediate contents of `node_modules`. Without a verifier
   the same stale tree stays trusted — that boundary is deliberate, and the plan
-  says so out loud (`satisfied here (re-checked with builtin:lockfile before use)`).
+  says so out loud (`satisfied here (re-checked with builtin:npm before use)`).
 - **`share: true` lets another checkout borrow a verified tree** instead of
   installing it again: the store records *where* an install was verified (not a
   copy of it), keyed by platform + command + evidence content, and a checkout

@@ -181,6 +181,7 @@ Something is true about this repository today.
       requires: [],
       verify: null,
       verifyBuiltin: null,
+      builtinOptions: {},
       share: false,
     });
   });
@@ -206,10 +207,21 @@ Something is true about this repository today.
   test('normalizing an already-normalized setup changes nothing', () => {
     // Specs travel: a declared one is normalized when manual.yaml is read, then
     // normalized again when a claim resolves it. The second pass must not
-    // reinterpret `builtin:lockfile` (a marker) as a command to run.
-    const once = normalizeSetup({ setup: { run: 'npm ci', verify: { builtin: 'lockfile' }, requires: ['node'], share: true } });
-    assert.equal(once.verifyBuiltin, 'lockfile');
+    // reinterpret `builtin:npm` (a marker) as a command to run, and must not
+    // drop the options the first pass understood.
+    const once = normalizeSetup({
+      setup: { run: 'npm ci', verify: { builtin: 'lockfile', path: 'node_modules' }, requires: ['node'], share: true },
+    });
+    assert.equal(once.verifyBuiltin, 'npm', 'the older spelling of the npm verifier resolves to the current name');
+    assert.deepEqual(once.builtinOptions, { path: 'node_modules' });
     assert.deepEqual(normalizeSetup({ setup: once }), once);
+
+    // A marker written as a string is the same declaration, not a command: run
+    // as a command it is `builtin:npm: command not found`, and the symptom is a
+    // cached install that is silently distrusted on every verify.
+    const dashed = normalizeSetup({ setup: { run: 'npm ci', verify: 'builtin:lockfile' } });
+    assert.equal(dashed.verifyBuiltin, 'npm');
+    assert.equal(dashed.verify, 'builtin:npm');
   });
 });
 
@@ -1096,7 +1108,7 @@ describe('setup: a satisfied install is verified, not merely remembered', () => 
     );
     const config = loadConfig(root);
     const { specs } = resolvePrereqs({ check: { requires: ['node'] } }, config);
-    assert.equal(specs[0].spec.verifyBuiltin, 'lockfile', 'the declared verifier reaches the runner intact');
+    assert.equal(specs[0].spec.verifyBuiltin, 'npm', 'the declared verifier reaches the runner intact');
 
     assert.equal((await ensureSetup(root, specs[0].spec, { quiet: true })).status, 'ran');
     resetSetupMemo();

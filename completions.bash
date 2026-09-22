@@ -1,5 +1,5 @@
 # manual-cli bash completions
-# source /c/Users/bainb/Desktop/manual-cli/completions.bash
+# source /path/to/manual-cli/completions.bash
 
 _manual_cli() {
   local cur prev commands flags

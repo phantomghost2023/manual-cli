@@ -4,6 +4,18 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { filesDigest, sha256 } from './hash.js';
 import { nowIso, short } from './util.js';
+import {
+  BUILTIN_NAMES,
+  VERIFY_BUILTINS,
+  canonicalBuiltin,
+  lockfileIn,
+  resolveBuiltin,
+  runBuiltinVerifier,
+  verifierAvailable as verifierAvailability,
+  verifyLockfile,
+} from './verifiers.js';
+
+export { VERIFY_BUILTINS, lockfileIn, verifyLockfile };
 
 // Setup / prerequisites for command checks.
 //
@@ -255,30 +267,45 @@ export function planPrereqs(claims, config = {}) {
   return { steps, unknown: [...unknown.entries()].map(([name, claims]) => ({ name, claims })), cycles };
 }
 
-// Built-in verifiers. A command can answer "is this install still valid?", but
-// the question is the same in every repo of an ecosystem, and the obvious command
-// is too slow to run on every verify: `npm ls --depth=0` takes ~11s on a real
-// dependency tree. Comparing the installed tree against the lockfile answers it
-// with a few hundred `stat` calls instead.
-export const VERIFY_BUILTINS = new Set(['lockfile']);
+// Built-in verifiers live in verifiers.js — one per ecosystem, all of them
+// answering three ways: yes, no, and "there is nothing here to compare
+// against". A command can still answer the same question, but a builtin asks it
+// with a readdir per verify instead of a tree walk.
+const BUILTIN_CHOICES = ["auto", ...BUILTIN_NAMES].join(' | ');
 
-// `verify: "npm ls --depth=0"` is a command; `verify: { builtin: lockfile }` is
-// one of ours. The map form is required for builtins, so a bare word is never
-// ambiguous.
+// A typo deserves the list, not a refusal.
+function builtinError(name) {
+  return `builtin "${name}" is not one of: ${BUILTIN_CHOICES} (lockfile is an older spelling of npm)`;
+}
+
+// `verify: "npm ls --depth=0"` is a command; `verify: { builtin: npm }` is one of
+// ours. The map form is required for builtins, so a bare word is never
+// ambiguous — and a `builtin:name` string is read as the same declaration rather
+// than run as a command, because "run the marker as a shell command" is a bug
+// that has already happened here once (`builtin:lockfile: command not found`,
+// which degraded every cached install to a reinstall).
 export function normalizeVerify(raw) {
   if (raw === undefined || raw === null) return { verify: null, builtin: null };
   if (typeof raw === 'string') {
     if (!raw.trim()) return { error: 'must be a command that exits 0 for a valid install' };
+    const marker = /^builtin:\s*([A-Za-z0-9_-]+)$/.exec(raw.trim());
+    if (marker) {
+      const name = canonicalBuiltin(marker[1]);
+      if (!name) return { error: builtinError(marker[1]) };
+      return { verify: `builtin:${name}`, builtin: name, builtinOptions: {} };
+    }
     return { verify: raw, builtin: null };
   }
   if (typeof raw === 'object' && !Array.isArray(raw)) {
-    const name = raw.builtin;
-    if (!VERIFY_BUILTINS.has(name)) {
-      return { error: `builtin must be one of: ${[...VERIFY_BUILTINS].join(', ')}` };
-    }
-    return { verify: `builtin:${name}`, builtin: name, builtinOptions: { ...raw, builtin: undefined } };
+    const name = canonicalBuiltin(raw.builtin);
+    if (!name) return { error: builtinError(raw.builtin) };
+    // `builtin` is dropped rather than set to undefined: an own key holding
+    // undefined is still a difference, and options that survive one pass and not
+    // the next are options that work until the config is re-read.
+    const { builtin: _drop, ...options } = raw;
+    return { verify: `builtin:${name}`, builtin: name, builtinOptions: options };
   }
-  return { error: 'must be a command, or { builtin: lockfile }' };
+  return { error: `must be a command, or { builtin: ${BUILTIN_CHOICES} }` };
 }
 
 export function normalizeSetup(check) {
@@ -294,7 +321,7 @@ export function normalizeSetup(check) {
   // install was distrusted and reinstalled after `builtin:lockfile: command not
   // found`. Normalizing twice must be the same as normalizing once.
   const v = spec.verifyBuiltin !== undefined && spec.verifyBuiltin !== null
-    ? { verify: spec.verify ?? `builtin:${spec.verifyBuiltin}`, builtin: spec.verifyBuiltin }
+    ? { verify: spec.verify ?? `builtin:${spec.verifyBuiltin}`, builtin: spec.verifyBuiltin, builtinOptions: spec.builtinOptions || {} }
     : normalizeVerify(spec.verify);
   return {
     run: String(spec.run),
@@ -307,65 +334,41 @@ export function normalizeSetup(check) {
     requires: nameList(spec.requires),
     verify: v.verify || null,
     verifyBuiltin: v.builtin || null,
+    // What a builtin was told beyond its name (`{ builtin: venv, path: ".venv" }`),
+    // carried through normalization: normalizing twice is normalizing once, and
+    // options that vanish on the second pass would be options that work until
+    // something re-reads the config.
+    builtinOptions: v.builtinOptions || {},
     share: spec.share === true,
   };
 }
 
-// The `lockfile` builtin: every package the lockfile says should be installed is
-// actually installed. It answers the question the cache key cannot — an install
-// made from *this* lockfile can still have lost a subtree in the meantime (an
-// interrupted `npm ci`, a deletion, an antivirus quarantine) — in a few hundred
-// `stat` calls rather than by walking the tree.
-export function lockfileIn(root) {
-  return ['package-lock.json', 'npm-shrinkwrap.json'].find((f) => fs.existsSync(path.join(root, f))) || null;
-}
+// The builtin verifiers, and the npm one this file used to hold itself, now live
+// in verifiers.js: `lockfile` and `verifyLockfile` are imported above and
+// re-exported, so a caller that used them keeps working. The npm verifier still
+// answers the question the cache key cannot — an install made from *this*
+// lockfile can still have lost a subtree in the meantime (an interrupted
+// `npm ci`, a deletion, an antivirus quarantine) — in a few hundred `stat` calls
+// rather than by walking the tree.
 
-// Three answers, not two: yes, no, and "there is nothing here to compare
-// against". Found on a real repository (express ships `.npmrc` with
-// `package-lock=false`), where "no" would mean distrusting every cached install
-// and reinstalling it on every verify — the same symptom as a verifier that
-// cannot run at all, for a repo that is perfectly fine.
-export function verifyLockfile(root) {
-  const lockName = lockfileIn(root);
-  if (!lockName) return { ok: null, note: 'no package lockfile to compare the install against', ms: 0 };
-  let lock;
-  try {
-    lock = JSON.parse(fs.readFileSync(path.join(root, lockName), 'utf8'));
-  } catch (e) {
-    return { ok: null, note: `unreadable ${lockName}: ${e.message}`, ms: 0 };
-  }
-  const t0 = Date.now();
-  const declared = Object.keys(lock.packages || {}).filter((k) => k && k.startsWith('node_modules/'));
-  const missing = declared.filter((k) => !fs.existsSync(path.join(root, k)));
-  const ms = Date.now() - t0;
-  if (missing.length) {
-    return {
-      ok: false,
-      ms,
-      note: `${missing.length}/${declared.length} installed package(s) missing, e.g. ${missing[0]}`,
-      missing: missing.slice(0, 5),
-    };
-  }
-  return { ok: true, ms, note: `${declared.length} package(s) present, matching ${lockName}` };
-}
-
-// Run a prerequisite's verifier and describe the outcome. Command verifiers are
-// capped at two minutes: this check runs on the path where the point is to avoid
-// work, so a verifier that hangs is worse than a verifier that says no.
+// Run a prerequisite's verifier and describe the outcome.
+//
+// A builtin is answered by its ecosystem module in verifiers.js; a declared
+// command is capped at two minutes, because this runs on the path whose whole
+// point is to avoid work — a verifier that hangs is worse than one that says no.
 export function runVerifier(root, spec) {
-  if (spec.verifyBuiltin === 'lockfile') return verifyLockfile(root);
+  if (spec.verifyBuiltin) return runBuiltinVerifier(root, spec);
   if (!spec.verify) return null;
   const r = execInRoot(root, spec.verify, Math.min(spec.timeout_s, 120));
   return { ok: r.status === 0, ms: r.ms, note: r.status === 0 ? `exit 0 in ${r.ms}ms` : r.note };
 }
 
-// Whether a declared verifier can answer at all *here* — a stat, so it is cheap
-// enough for `manual setup` and the plan to report it without running anything.
+// Whether a declared verifier can answer at all *here* — a stat, or one readdir,
+// so it is cheap enough for `manual setup` and the plan to report it without
+// running anything. The reason is returned rather than logged, because "cannot
+// check" and "checked and fine" must never read the same.
 export function verifierAvailable(root, spec) {
-  if (spec.verifyBuiltin === 'lockfile') {
-    const f = lockfileIn(root);
-    return f ? null : 'no package-lock.json or npm-shrinkwrap.json in this checkout';
-  }
+  if (spec.verifyBuiltin) return verifierAvailability(root, spec);
   return null;
 }
 
@@ -522,6 +525,7 @@ export function storeLookup(root, spec) {
 // readdir, so it is worth answering with.
 export function setupStatus(root, spec) {
   const key = setupKey(root, spec);
+  const resolved = resolveBuiltin(root, spec);
   const entry = readSetupCache(root).entries[key] || null;
   const missing = spec.cache.filter((d) => !fs.existsSync(path.join(root, d)));
   const witnessOk = entry?.witness ? witnessMatches(root, entry.witness) : null;
@@ -535,6 +539,16 @@ export function setupStatus(root, spec) {
     missing,
     witness_ok: witnessOk,
     verify: spec.verify,
+    // Which ecosystem verifier will be asked, and why that one: `auto` is a
+    // question, and reporting the question instead of the answer would leave a
+    // reader unable to tell a resolved verifier from an unresolved one.
+    verify_builtin: resolved.name,
+    verify_why: resolved.why,
+    verify_label: !spec.verify
+      ? null
+      : resolved.name && resolved.name !== String(spec.verify).replace(/^builtin:/, '')
+        ? `${spec.verify} → ${resolved.name} (${resolved.why})`
+        : spec.verify,
     // A declared verifier that cannot run here is reported rather than silently
     // skipped: "verified" and "unverifiable" are different facts about a tree.
     verify_unavailable: verifierAvailable(root, spec),
@@ -624,6 +638,13 @@ export async function ensureSetup(root, spec, { force = false, quiet = false, on
     // reason to rebuild, and treating it as one would make every verify reinstall
     // on any repo without the file the verifier needs.
     if (witnessOk && (!check || check.ok !== false)) {
+      // The verifier could have answered and did not: that is news about the
+      // tree, and it belongs in front of whoever is reading the verify. A
+      // verifier that can never answer here is already reported by `manual setup`
+      // and doctor, and repeating it on every verify would be noise.
+      if (check?.ok === null && !check.unavailable && !quiet) {
+        console.log(`  ⚙ setup: ${spec.run} — reused, not re-confirmed: ${short(check.note, 240)}`);
+      }
       const out = {
         key,
         status: 'cached',
@@ -631,6 +652,9 @@ export async function ensureSetup(root, spec, { force = false, quiet = false, on
         ms: entry.ms ?? null,
         at: entry.at,
         verified_at: check ? nowIso() : entry.verified_at || null,
+        // What the verifier answered, kept on the result so a caller can report
+        // "reused because it was re-checked" rather than "reused".
+        verify: check ? { builtin: check.builtin || spec.verifyBuiltin || null, ok: check.ok, note: check.note, ms: check.ms } : null,
         note: `already satisfied at ${entry.at}${entry.ms != null ? ` (${entry.ms}ms)` : ''}`,
       };
       memo.set(memoKey, out);

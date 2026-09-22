@@ -7,7 +7,7 @@ From zero to a self-verifying manual on a repo you already have.
 Dependency-free — just point at it:
 
 ```bash
-alias manual="node /c/Users/bainb/Desktop/manual-cli/bin/manual.js"
+alias manual="node /path/to/manual-cli/bin/manual.js"
 ```
 
 ## 1. Discover (30 seconds)
@@ -116,14 +116,15 @@ computed, and `manual setup --plan` shows it before paying for it:
 $ manual setup --plan
 prerequisite plan — 2 step(s), 3 claim(s), in the order a full verify runs them
 
-  1. node → npm install  tests.suite, build.bundle  satisfied here (re-checked with builtin:lockfile before use)
+  1. node → npm install  tests.suite, build.bundle  satisfied here (re-checked before use)
+       re-checked with: builtin:npm
   2. build → make build  tests.suite  will run  needs node
 
 1 satisfied, 1 to establish — verify pays for each once, in this order.
 ```
 
 And `verify:` answers "is this install still the one the lockfile describes?" —
-cheaply, with the builtin:
+cheaply, with a builtin for whichever ecosystem the step installs:
 
 ```yaml
 setup:
@@ -131,8 +132,14 @@ setup:
     run: npm install
     evidence: ["package.json", "package-lock.json"]
     cache: ["node_modules"]
-    verify: { builtin: lockfile }   # 64ms on a 403-package tree
+    verify: { builtin: auto }       # resolves to npm here: 64ms on a 403-package tree
     share: true                     # other checkouts on this machine may borrow it
+
+  python:
+    run: python -m venv .venv && .venv/bin/pip install -r requirements.txt
+    evidence: ["requirements.txt"]
+    cache: [".venv"]
+    verify: { builtin: venv }       # every declared distribution, at the declared version
 ```
 
 When it says no, the reinstall explains itself instead of looking like a cache
@@ -227,7 +234,7 @@ manual graph --dot | dot -Tsvg  # if graphviz is installed
 Point your coding agent at the MCP server so it starts every session with verified context instead of exploration:
 
 ```json
-{ "mcpServers": { "manual": { "command": "node", "args": ["/c/Users/bainb/Desktop/manual-cli/bin/manual.js", "mcp", "--root", "."] } } }
+{ "mcpServers": { "manual": { "command": "node", "args": ["/path/to/manual-cli/bin/manual.js", "mcp", "--root", "."] } } }
 ```
 
 The agent calls `manual_brief` with the files it's about to touch. Two minutes of setup replaces ten minutes of flailing per session.
