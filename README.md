@@ -9,7 +9,7 @@ Zero dependencies. Node >= 20. No install needed.
 ## How it fits together
 
 ```mermaid
-flowchart LR
+flowchart TB
     subgraph REPO[".manual/ — committed beside the code"]
         CLAIMS["claims/*.md<br/>fact · command · trap · policy · ownership"]
         INBOX["inbox/*.md<br/>candidates proposed by agents, init, observe"]
@@ -18,25 +18,24 @@ flowchart LR
     end
 
     subgraph VERIFY["manual verify"]
-        SETUP["prerequisites<br/>declared once in manual.yaml,<br/>verified against the lockfile"]
-        SANDBOX["checks in a git worktree<br/>HEAD + your uncommitted diff"]
+        SETUP["prerequisites — declared once in manual.yaml,<br/>verified against the lockfile (8 ecosystems)"] -->
+        SANDBOX["checks run in a git worktree<br/>HEAD + your uncommitted diff"] -->
         STATE[("state.json<br/>fresh · stale · broken · blocked")]
     end
 
-    HUMAN(["a human reviews the diff"])
-
     CLAIMS -->|"evidence changed?"| SANDBOX
-    SETUP --> SANDBOX
-    SANDBOX --> STATE
-    STATE -->|"fresh stamps"| BRIEF["manual brief<br/>token-budgeted, trust-ranked<br/>also over MCP"]
-    STATE -->|"drift"| OBSERVE["manual observe<br/>proposes bounds, names the cause"]
+
+    STATE -->|"fresh stamps"| BRIEF["manual brief — token-budgeted,<br/>trust-ranked · also over MCP"]
+    STATE -->|"broken"| GATE["manual enforce<br/>pre-commit / PR gate"]
+    STATE -->|"drift"| OBSERVE["manual observe — proposes bounds,<br/>names the cause of a spiky series"]
+
     OBSERVE --> INBOX
+    HUMAN(["a human reviews the diff"])
     INBOX --> HUMAN
-    HUMAN -->|"accept"| CLAIMS
+    HUMAN -->|"accept — re-verified on the spot"| CLAIMS
     HUMAN -->|"turned out false → undo"| INBOX
     HUMAN --> JOURNAL
     STATE --> LEDGER
-    STATE -->|"broken"| GATE["manual enforce<br/>pre-commit / PR gate"]
 ```
 
 Claims, checks, and the gate are the same object — enforcement cannot drift from documentation because there is only one file to drift. Agents propose; a human accepts; the accept is re-verified immediately, journaled with its reason, and revertible from any checkout.
