@@ -729,9 +729,39 @@ export async function ensureSetup(root, spec, { force = false, quiet = false, on
   }
 
   const r = execInRoot(root, spec.run, spec.timeout_s);
-  const witness = r.status === 0 ? witnessFor(root, spec.cache) : null;
+  let witness = r.status === 0 ? witnessFor(root, spec.cache) : null;
 
   if (r.status === 0) {
+    // A successful run is not evidence of a repaired tree. Found on a real
+    // repo (a classic yarn 1 checkout): deleting a package behind yarn's back
+    // distrusts the install (the witness), the declared
+    // `yarn install --frozen-lockfile` runs as a measured no-op
+    // ("Already up-to-date"), and recording a fresh witness then laundered
+    // the damage — the verifier's `no` was architecturally unreachable,
+    // because it was only consulted on the *reused* path. The same laundering
+    // happens one step later for a retry of a failed install. So every run
+    // this cache records is held to its own verifier first, and a `no` is a
+    // failed install: the tree on disk does not satisfy what the manual
+    // declared, and a failure is one thing this cache never trusts.
+    if (spec.verify) {
+      const check = runVerifier(root, spec);
+      if (check && check.ok === false && !check.unavailable) {
+        const note = `verify: ${short(check.note || 'the verifier said no', 160)}`;
+        cache.entries[key] = {
+          run: spec.run,
+          ok: false,
+          at: nowIso(),
+          ms: r.ms,
+          dirs: spec.cache,
+          note,
+        };
+        writeSetupCache(root, cache);
+        const out = { key, status: 'failed', run: spec.run, ms: r.ms, exit: r.status, note };
+        memo.set(memoKey, out);
+        if (!quiet) console.log(`  ⚙ setup: ${spec.run} (ran, but did not satisfy it — ${note})`);
+        return out;
+      }
+    }
     // Having just run, the tree is by definition the one the command produced —
     // so `verify:` is recorded rather than paid for. It pays for itself the next
     // time this install is reused.

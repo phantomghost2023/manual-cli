@@ -81,6 +81,29 @@ test('a script that starts with a system binary is run as written', async () => 
   }
 });
 
+test('a workspaces monorepo discovers its test suite even without a root src/ or test/', async () => {
+  // Found on a real repo (remix-run/react-router v5): the tests live under
+  // packages/*/src and packages/*/test, the root has neither directory, and
+  // discovery proposed nothing on a repo with a real test suite.
+  const dir = fixture({
+    name: 'p',
+    version: '1.0.0',
+    workspaces: { packages: ['packages/*'] },
+    scripts: { test: 'node --test' },
+  }, {
+    'packages/a/src/index.js': 'export const x = 1;\n',
+    'packages/a/test/a.test.js': 'import { test } from "node:test"; test("ok", () => {});\n',
+  });
+  try {
+    init(dir, {});
+    const { fm } = readCandidate(dir, 'init-tests.suite.md');
+    assert.equal(fm.id, 'tests.suite');
+    assert.equal(fm.check.run, 'node --test');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('probing is idempotent and skips anything that is not an init candidate', async () => {
   const dir = fixture({ name: 'p', version: '1.0.0', scripts: { test: 'node --test' } }, {
     'test/a.test.js': 'import { test } from "node:test"; test("ok", () => {});\n',

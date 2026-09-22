@@ -2,6 +2,15 @@
 
 All notable changes to manual-cli are documented here. Format: Keep a Changelog; versioning: SemVer.
 
+## [0.11.1] - 2026-09-22
+
+### Fixed
+- **`init` discovered nothing on a workspaces monorepo.** The gate deciding whether a repo has tests to discover checked four root directories (`test`, `tests`, `src`, `lib`); a workspaces repo keeps them under `packages/*/src` and `packages/*/test`, so `init` proposed zero claim candidates on remix-run/react-router v5.3.4 — a repo with one of the largest test suites in the ecosystem — and its plan was empty. A workspaces declaration is itself evidence that packages with code exist, so it now counts (`hasTestSources`).
+- **A rebuild that did not repair the tree recorded a fresh witness, laundering the damage.** Found on the real yarn 1 clone: in-place damage trips the witness before the verifier is ever consulted; the declared `yarn install --frozen-lockfile` (a command that cannot repair — measured "Already up-to-date") runs as a no-op; the success path records a fresh witness of the *damaged* tree; and the reused path now trusts it. The verifier's `no` was architecturally unreachable — always outrun by the witness exactly when the tree was damaged. Every run the cache records is now held to its own verifier first, and a `no` is a failed install: recorded untrusted, never a fresh witness, retried like any other failure.
+
+### Added
+- The registry flake on the wild clone (`ESOCKETTIMEDOUT` at 317s into the first yarn install) confirmed the probe's honesty rule end to end: the candidate came out `blocked — the claim is untested, not false`, the journal carried the reason, and nothing false entered the manual. See `docs/FIELD-NOTES.md`, "Seventh pass".
+
 ## [0.11.0] - 2026-09-21
 
 ### Added

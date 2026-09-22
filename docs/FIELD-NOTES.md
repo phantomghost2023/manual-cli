@@ -601,3 +601,86 @@ install distrusted — witness: the declared directories changed since it ran)`,
   reported rather than repaired on every verify, which is honest but noisy on a
   repo somebody damaged by hand; and `bun.lockb` — still the only lockfile some
   repos have — remains unreadable by anything here.
+
+## Seventh pass: a wild yarn 1 repo, and the bug that could only be found there
+
+### The pickings changed
+
+The obvious wild yarn-1 repos are gone: axios, mocha, and chalk all read
+`package-lock.json` on `main` today. The wild migrates. react-router at
+`v5.3.4` still ships the real thing — `yarn.lock` v1, 103 top-level packages, a
+workspaces monorepo — so that is the repo this pass ran against, fresh clone,
+nothing installed.
+
+### Breakdown one: discovery proposed nothing at all
+
+`init` on a monorepo discovered **zero** claim candidates on a repo with one of
+the largest test suites in the ecosystem. The gate that decides whether a repo
+has tests to discover checked exactly four root directories — `test`, `tests`,
+`src`, `lib` — and a workspaces repo keeps its tests under
+`packages/*/src` and `packages/*/test`. The root has none of them. A
+workspaces declaration is itself evidence that packages with code exist, so it
+now counts; a fixture with the v5 shape would have caught this before the wild
+did.
+
+### The registry flake the probe refused to lie about
+
+The first install died at 317 seconds on
+`ESOCKETTIMEDOUT ... registry.yarnpkg.com/rxjs/-/rxjs-6.5.3.tgz`. The probe
+marked the candidate **blocked — "the claim is untested, not false"** — rather
+than broken. The direct rerun completed in 142.7s. A flaky network is the
+checkout's story, and the tool kept it out of the repository's.
+
+### Breakdown two: the fresh-witness laundering (the one that mattered)
+
+With the install cached and the declared command the plain
+`yarn install --frozen-lockfile` (the command that *cannot* repair), deleting a
+top-level package produced, on every later verify:
+
+```
+⚙ setup: yarn install --frozen-lockfile (cached install distrusted — witness: the declared directories changed since it ran)
+⚙ setup: yarn install --frozen-lockfile (rebuilding the distrusted install)
+⚙ setup: ok (1751ms)          # "Already up-to-date" — it repaired nothing
+```
+
+and the *next* verify — the one after the rebuild — said nothing at all, with
+the package still missing from disk. The sequence: in-place damage trips the
+witness before the verifier is ever consulted; the rebuild runs; the success
+path records a fresh witness of the *damaged* tree; and the reused path now
+trusts it. The verifier's `no` was architecturally unreachable — consulted
+only on the reused path, always outrun by the witness on the damaged one. The
+cache had learned to launder the exact damage the verifier exists to catch.
+
+**The fix is a rule, not a patch: a successful run is not evidence of a
+repaired tree.** Every run the cache records is now held to its own verifier
+first; a `no` is a failed install — recorded untrusted, never a fresh witness.
+The suite's regression test replicates the yarn shape (first run creates the
+tree, satisfied runs are "Already up-to-date" no-ops) and asserts the witness
+is *not* written for a tree the verifier called broken.
+
+Two effects on the real repo, both correct:
+
+- With the non-repairing command still declared, the missing package is now
+  **reported on every verify** instead of being laundered after one rebuild:
+  `⚙ setup: yarn install --frozen-lockfile — reused, not re-confirmed: 6/103
+  top-level package(s) yarn linked are not in node_modules, e.g. react
+  (installed for react@>=15) — not a verdict: a satisfied `yarn install`
+  trusts .yarn-integrity and leaves them missing (measured: "Already
+  up-to-date", 0.2s). `yarn …` — the message names the flag that fixes it.
+- With `init`'s command (`--check-files`) restored, the same damage produces
+  distrust → rebuild → **53.5s** → react back on disk → verifier confirms.
+
+And the loop was demonstrated both ways on the wild repo: the tool reported a
+laundered tree before the fix, and a self-healing one after it.
+
+### Also true of this repo, stated plainly
+
+- `yarn test` on this clone fails on Windows/Node 22 outside the tool too
+  (jest 24 cannot resolve its glob project config here), so the accepted
+  claim's `broken` is the repository's real story on this machine — complete
+  with journal entry and undo token. The tool recorded a truth, not an error.
+- One fixture bug during the fix was the tool's own doing: a generated script
+  with a mangled escape made the *fixture* a SyntaxError, and the first
+  debugging hour went to the implementation before the note
+  (`verify: bash: -c: line 1: syntax error`) pointed at the test. The
+  assertions that print `note:` now exist because of it.

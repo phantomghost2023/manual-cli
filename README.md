@@ -1,8 +1,45 @@
 # manual-cli
 
+![manual-cli: the repository that checks itself](docs/hero.svg)
+
 **Self-verifying repository operating manual** — every claim about a repo is backed by an executable check, stamped fresh/stale/broken/blocked in `state.json`, and compiled into token-budgeted session briefs.
 
 Zero dependencies. Node >= 20. No install needed.
+
+## How it fits together
+
+```mermaid
+flowchart LR
+    subgraph REPO[".manual/ — committed beside the code"]
+        CLAIMS["claims/*.md<br/>fact · command · trap · policy · ownership"]
+        INBOX["inbox/*.md<br/>candidates proposed by agents, init, observe"]
+        JOURNAL["journal/*.md<br/>why every accepted change happened"]
+        LEDGER["ledger.jsonl<br/>trust earned across machines"]
+    end
+
+    subgraph VERIFY["manual verify"]
+        SETUP["prerequisites<br/>declared once in manual.yaml,<br/>verified against the lockfile"]
+        SANDBOX["checks in a git worktree<br/>HEAD + your uncommitted diff"]
+        STATE[("state.json<br/>fresh · stale · broken · blocked")]
+    end
+
+    HUMAN(["a human reviews the diff"])
+
+    CLAIMS -->|"evidence changed?"| SANDBOX
+    SETUP --> SANDBOX
+    SANDBOX --> STATE
+    STATE -->|"fresh stamps"| BRIEF["manual brief<br/>token-budgeted, trust-ranked<br/>also over MCP"]
+    STATE -->|"drift"| OBSERVE["manual observe<br/>proposes bounds, names the cause"]
+    OBSERVE --> INBOX
+    INBOX --> HUMAN
+    HUMAN -->|"accept"| CLAIMS
+    HUMAN -->|"turned out false → undo"| INBOX
+    HUMAN --> JOURNAL
+    STATE --> LEDGER
+    STATE -->|"broken"| GATE["manual enforce<br/>pre-commit / PR gate"]
+```
+
+Claims, checks, and the gate are the same object — enforcement cannot drift from documentation because there is only one file to drift. Agents propose; a human accepts; the accept is re-verified immediately, journaled with its reason, and revertible from any checkout.
 
 ```
 manual verify   # is the manual still true?
@@ -447,7 +484,7 @@ The demo ships a genuine trap discovered while building it: `node --test --test-
 ## Test
 
 ```bash
-npm test        # 192 tests across 36 suites (seeded fuzzing, real-git integration, HTTP end-to-end)
+npm test        # 250 tests across 49 suites (seeded fuzzing, real-git integration, HTTP end-to-end)
 npm run bench   # 500-claim scale benchmark (see numbers below)
 ```
 

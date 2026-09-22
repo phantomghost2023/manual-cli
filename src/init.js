@@ -138,6 +138,21 @@ function safeRead(p) {
 // Commands that a shell can run without the package manager's PATH injection.
 const SYSTEM_BINS = /^(node|nodejs|deno|bun|python|python3|pytest|go|cargo|make|cmake|bash|sh|zsh|ruby|rake|php|dotnet|java|mvn|gradle|ant|npm|pnpm|yarn)$/;
 
+// Whether this checkout plausibly has a test suite the `test` script can run.
+//
+// Found on a real repo (remix-run/react-router v5): a workspaces monorepo keeps
+// its tests under `packages/*/src` and `packages/*/test`, so the root has no
+// `src/` or `test/` directory to find — and discovery proposed *nothing* on a
+// repo with one of the largest test suites in the ecosystem. A workspaces
+// declaration is itself evidence that packages with code exist, so it counts;
+// the check either runs or is probed broken, and a human decides.
+export function hasTestSources(root, pkg = null) {
+  const p = pkg || readJson(path.join(root, 'package.json')) || {};
+  if (['test', 'tests', 'src', 'lib'].some((d) => fs.existsSync(path.join(root, d)))) return true;
+  const ws = p.workspaces;
+  return Array.isArray(ws) ? ws.length > 0 : !!(ws && typeof ws === 'object' && Array.isArray(ws.packages) && ws.packages.length > 0);
+}
+
 // The repo's own "run the tests" entry point, in whatever manager it uses.
 // `bun run test`, never `bun test`: the latter is bun's built-in runner and
 // would silently ignore the script the repository actually wrote.
@@ -216,9 +231,7 @@ export function detect(root) {
   const scripts = pkg.scripts || {};
   const testScript = scripts.test || '';
   const pmRunTest = packageManagerTestCommand(root, pkg);
-  const hasTests = ['test', 'tests', 'src', 'lib'].some((d) =>
-    fs.existsSync(path.join(root, d)),
-  );
+  const hasTests = hasTestSources(root, pkg);
   if (testScript && hasTests) {
     // What the check runs must be what the statement says, and it must be able
     // to run outside `npm run`.

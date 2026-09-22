@@ -291,6 +291,61 @@ describe('setup: running once', () => {
     assert.equal(countInstalls(counter), 2);
   });
 
+  test('a rebuild that did not repair the tree is a failed install, not a fresh witness', async () => {
+    // Found on a real yarn 1 clone: deleting a package behind the manager's
+    // back distrusts the install (the witness), a satisfied
+    // `yarn install --frozen-lockfile` repairs nothing, and recording the
+    // fresh witness afterwards laundered the damage — the verifier's `no`
+    // was only ever consulted on the reused path, so it was unreachable
+    // exactly when the tree was damaged and the command could not fix it.
+    const { root, counter } = makeDepRepo();
+    // yarn 1's shape: the first install creates the tree, a satisfied install
+    // is a no-op that repairs nothing ("Already up-to-date"). Runs are counted
+    // by the length of the counter file ('y' per run) so the generated script
+    // carries no escape sequences of its own.
+    const lines = [
+      "const fs = require('node:fs');",
+      `const F = ${JSON.stringify(counter)};`,
+      'const n = fs.existsSync(F) ? fs.readFileSync(F, "utf8").length : 0;',
+      "fs.appendFileSync(F, 'y');",
+      'if (n === 0) {',
+      "  fs.mkdirSync('node_modules/fake-dep', { recursive: true });",
+      "  fs.writeFileSync('node_modules/fake-dep/ok.txt', 'ok');",
+      '}',
+      "console.log('Already up-to-date');",
+    ];
+    fs.writeFileSync(path.join(root, 'fake-yarn-install.js'), lines.join('\n') + '\n');
+    const installs = () => (fs.existsSync(counter) ? fs.readFileSync(counter, 'utf8').length : 0);
+    const spec = normalizeSetup({
+      setup: {
+        run: 'node fake-yarn-install.js',
+        cache: ['node_modules'],
+        // What the yarn builtin asks on a tree like this: is what was linked
+        // still there?
+        verify: "node -e 'require(\"node:fs\").accessSync(\"node_modules/fake-dep/ok.txt\")'",
+      },
+    });
+
+    const first = await ensureSetup(root, spec, { quiet: true });
+    assert.equal(first.status, 'ran', `first note: ${first.note || ''}`);
+
+    fs.rmSync(path.join(root, 'node_modules/fake-dep'), { recursive: true, force: true });
+    resetSetupMemo();
+    const second = await ensureSetup(root, spec, { quiet: true });
+    assert.equal(second.status, 'failed', `a no-op rebuild is not a repair — note: ${second.note || ''}`);
+    assert.match(second.note, /verify:/);
+    const entry = readSetupCache(root).entries[second.key];
+    assert.equal(entry.ok, false);
+    assert.equal(entry.witness, undefined, 'no witness is recorded for a tree the verifier called broken');
+    assert.equal(installs(), 2, 'the rebuild ran once');
+
+    // Like any failed install, it is never trusted: the next attempt runs again.
+    resetSetupMemo();
+    const third = await ensureSetup(root, spec, { quiet: true });
+    assert.equal(third.status, 'failed');
+    assert.equal(installs(), 3);
+  });
+
   test('--force re-runs an install the cache considers done', async () => {
     const { root, counter, installCmd } = makeDepRepo();
     const spec = normalizeSetup({ setup: { run: installCmd, cache: ['node_modules'] } });

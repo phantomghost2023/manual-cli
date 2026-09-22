@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="600" viewBox="0 0 1200 600" role="img" aria-label="manual-cli: the repository that checks itself. Claims become checks; checks become trust.">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1120"/>
+      <stop offset="0.55" stop-color="#101830"/>
+      <stop offset="1" stop-color="#0d1526"/>
+    </linearGradient>
+    <radialGradient id="glowA" cx="0.22" cy="0.18" r="0.55">
+      <stop offset="0" stop-color="#22d3ee" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#22d3ee" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowB" cx="0.82" cy="0.85" r="0.6">
+      <stop offset="0" stop-color="#8b5cf6" stop-opacity="0.14"/>
+      <stop offset="1" stop-color="#8b5cf6" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="edge" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#a78bfa"/>
+    </linearGradient>
+    <linearGradient id="term" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#151f38"/>
+      <stop offset="1" stop-color="#101a30"/>
+    </linearGradient>
+    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="18" flood-color="#000000" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="600" rx="24" fill="url(#bg)"/>
+  <rect width="1200" height="600" rx="24" fill="url(#glowA)"/>
+  <rect width="1200" height="600" rx="24" fill="url(#glowB)"/>
+
+  <!-- faint blueprint grid -->
+  <g stroke="#ffffff" stroke-opacity="0.045">
+    <path d="M0 120 H1200 M0 240 H1200 M0 360 H1200 M0 480 H1200"/>
+    <path d="M150 0 V600 M300 0 V600 M450 0 V600 M600 0 V600 M750 0 V600 M900 0 V600 M1050 0 V600"/>
+  </g>
+  <rect x="1" y="1" width="1198" height="598" rx="24" fill="none" stroke="url(#edge)" stroke-opacity="0.5" stroke-width="2"/>
+
+  <!-- wordmark -->
+  <g font-family="Segoe UI, Helvetica, Arial, sans-serif">
+    <text x="80" y="128" font-size="58" font-weight="700" fill="#f8fafc">manual<tspan fill="#22d3ee">-cli</tspan></text>
+    <text x="80" y="176" font-size="27" fill="#94a3b8">The repository that checks itself.</text>
+    <text x="80" y="214" font-size="20" fill="#64748b">Every claim about your repo is backed by an executable check.</text>
+    <text x="80" y="242" font-size="20" fill="#64748b">Checks earn trust. Trust ranks what agents read first.</text>
+
+    <!-- the pipeline -->
+    <g font-size="18" font-weight="600" text-anchor="middle">
+      <rect x="80"  y="290" width="150" height="58" rx="14" fill="#0e7490" fill-opacity="0.28" stroke="#22d3ee" stroke-opacity="0.75" stroke-width="1.6"/>
+      <text x="155" y="326" fill="#a5f3fc">claim</text>
+
+      <path d="M238 319 h42" stroke="url(#edge)" stroke-width="3" stroke-linecap="round"/>
+      <path d="M278 312 l12 7 -12 7 z" fill="#22d3ee"/>
+
+      <rect x="298" y="290" width="150" height="58" rx="14" fill="#6d28d9" fill-opacity="0.28" stroke="#a78bfa" stroke-opacity="0.75" stroke-width="1.6"/>
+      <text x="373" y="326" fill="#ddd6fe">check</text>
+
+      <path d="M456 319 h42" stroke="url(#edge)" stroke-width="3" stroke-linecap="round"/>
+      <path d="M496 312 l12 7 -12 7 z" fill="#a78bfa"/>
+
+      <rect x="516" y="290" width="150" height="58" rx="14" fill="#047857" fill-opacity="0.28" stroke="#34d399" stroke-opacity="0.75" stroke-width="1.6"/>
+      <text x="591" y="326" fill="#a7f3d0">verdict</text>
+    </g>
+
+    <!-- terminal -->
+    <g filter="url(#soft)">
+      <rect x="80" y="382" width="560" height="164" rx="14" fill="url(#term)" stroke="#334155" stroke-width="1.4"/>
+      <circle cx="106" cy="406" r="6" fill="#f87171"/>
+      <circle cx="126" cy="406" r="6" fill="#fbbf24"/>
+      <circle cx="146" cy="406" r="6" fill="#34d399"/>
+      <text x="170" y="411" font-family="Consolas, Menlo, monospace" font-size="15" fill="#64748b">manual verify</text>
+      <text x="100" y="442" font-family="Consolas, Menlo, monospace" font-size="15">
+        <tspan fill="#4ade80">&#10003; tests.suite</tspan><tspan fill="#475569">        fresh    18.2s</tspan>
+      </text>
+      <text x="100" y="466" font-family="Consolas, Menlo, monospace" font-size="15">
+        <tspan fill="#fbbf24">&#9679; docs.api</tspan><tspan fill="#475569">         stale    evidence moved</tspan>
+      </text>
+      <text x="100" y="490" font-family="Consolas, Menlo, monospace" font-size="15">
+        <tspan fill="#f87171">&#10007; policy.gate</tspan><tspan fill="#475569">      broken   exit 1 — blocks the commit</tspan>
+      </text>
+      <text x="100" y="522" font-family="Consolas, Menlo, monospace" font-size="14" fill="#22d3ee">brief ready &#183; 612 tokens &#183; gold claims first</text>
+    </g>
+
+    <!-- ecosystem verifiers panel -->
+    <g font-family="Segoe UI, Helvetica, Arial, sans-serif">
+      <text x="700" y="288" font-size="17" fill="#94a3b8">Cached installs, verified in milliseconds &#8212; eight lockfiles:</text>
+      <g font-family="Consolas, Menlo, monospace" font-size="15" font-weight="600" text-anchor="middle">
+        <rect x="700"  y="306" width="98" height="36" rx="9" fill="#0f172a" stroke="#22d3ee" stroke-opacity="0.55"/><text x="749"  y="329" fill="#a5f3fc">npm</text>
+        <rect x="810"  y="306" width="98" height="36" rx="9" fill="#0f172a" stroke="#22d3ee" stroke-opacity="0.55"/><text x="859"  y="329" fill="#a5f3fc">pnpm</text>
+        <rect x="920"  y="306" width="98" height="36" rx="9" fill="#0f172a" stroke="#22d3ee" stroke-opacity="0.55"/><text x="969"  y="329" fill="#a5f3fc">yarn</text>
+        <rect x="1030" y="306" width="98" height="36" rx="9" fill="#0f172a" stroke="#22d3ee" stroke-opacity="0.55"/><text x="1079" y="329" fill="#a5f3fc">bun</text>
+        <rect x="700"  y="350" width="98" height="36" rx="9" fill="#0f172a" stroke="#a78bfa" stroke-opacity="0.5"/><text x="749"  y="373" fill="#ddd6fe">venv</text>
+        <rect x="810"  y="350" width="98" height="36" rx="9" fill="#0f172a" stroke="#a78bfa" stroke-opacity="0.5"/><text x="859"  y="373" fill="#ddd6fe">gems</text>
+        <rect x="920"  y="350" width="98" height="36" rx="9" fill="#0f172a" stroke="#a78bfa" stroke-opacity="0.5"/><text x="969"  y="373" fill="#ddd6fe">gomod</text>
+        <rect x="1030" y="350" width="98" height="36" rx="9" fill="#0f172a" stroke="#a78bfa" stroke-opacity="0.5"/><text x="1079" y="373" fill="#ddd6fe">crates</text>
+      </g>
+    </g>
+
+    <!-- trust ladder -->
+    <g font-family="Consolas, Menlo, monospace" font-size="16" font-weight="700" text-anchor="middle">
+      <rect x="700" y="432" width="104" height="46" rx="10" fill="#b45309" fill-opacity="0.35" stroke="#fbbf24" stroke-opacity="0.8"/>
+      <text x="752" y="461" fill="#fde68a">gold</text>
+      <rect x="820" y="432" width="104" height="46" rx="10" fill="#475569" fill-opacity="0.35" stroke="#94a3b8" stroke-opacity="0.8"/>
+      <text x="872" y="461" fill="#e2e8f0">silver</text>
+      <rect x="940" y="432" width="104" height="46" rx="10" fill="#78350f" fill-opacity="0.35" stroke="#d97706" stroke-opacity="0.8"/>
+      <text x="992" y="461" fill="#fed7aa">bronze</text>
+      <rect x="1060" y="432" width="104" height="46" rx="10" fill="#1e293b" fill-opacity="0.5" stroke="#475569" stroke-opacity="0.9" stroke-dasharray="5 4"/>
+      <text x="1112" y="461" fill="#94a3b8">ghost</text>
+    </g>
+    <text x="700" y="512" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="16" fill="#64748b">Trust is earned by running, not written &#8212; breaks demote.</text>
+  </g>
+
+  <!-- footer strip -->
+  <rect x="80" y="552" width="1040" height="2" rx="1" fill="url(#edge)" fill-opacity="0.55"/>
+  <text x="80" y="582" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="18" fill="#94a3b8">Zero dependencies &#183; one command to verify &#183; briefs for humans and agents</text>
+</svg>
