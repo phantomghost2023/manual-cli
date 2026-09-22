@@ -47,18 +47,23 @@ jobs:
             setup: corepack enable && pnpm install --frozen-lockfile
             builtin: pnpm
             expect: ok
-          # Ships a partial node_modules in git (no dev deps, no .bin), so a
-          # naive install gate concludes the tree is done. The verifier must
-          # answer "no" here and say why.
-          - name: npm (npm/cli, which commits a partial tree)
-            repo: npm/cli
+          # A big npm tree whose lockfile is actually in sync with package.json
+          # at HEAD (npm/cli's was not — `npm ci` failed there before any
+          # verifier ran, which is upstream drift, not a canary result).
+          - name: npm (microsoft/TypeScript)
+            repo: microsoft/TypeScript
             setup: npm ci
             builtin: npm
             expect: ok
             timeout: 30
           # Classic yarn: `.yarn-integrity` is the lockfile-readable state.
-          - name: yarn 1 (remix-run/react-router)
+          # Pinned: react-router's HEAD has migrated to pnpm
+          # (`packageManager: yarn@pnpm@11.7.0`), so the tree this cell exists
+          # to install no longer exists there. This is the commit the local
+          # drill validated as a genuine yarn-1 tree.
+          - name: yarn 1 (remix-run/react-router, pinned)
             repo: remix-run/react-router
+            ref: 1ca0e8f6dbb4f02874183dadd6b2481a6d599008
             setup: npm i -g yarn@1 && yarn install --frozen-lockfile
             builtin: yarn
             expect: ok
@@ -114,8 +119,10 @@ jobs:
           cache: false
       - uses: oven-sh/setup-bun@v2
         if: matrix.tool == 'bun'
-      - name: Clone ${{ matrix.repo }}
-        run: git clone --depth 1 "https://github.com/${{ matrix.repo }}" "$RUNNER_TEMP/wild"
+      - name: Clone ${{ matrix.repo }}${{ matrix.ref && format(' at {0}', matrix.ref) }}
+        run: >-
+          git clone --depth 1 ${{ matrix.ref && format('{0} ', matrix.ref) || '' }}
+          "https://github.com/${{ matrix.repo }}" "$RUNNER_TEMP/wild"
       - name: Install the tree the way the ecosystem does
         working-directory: ${{ runner.temp }}/wild
         run: ${{ matrix.setup }}
@@ -140,8 +147,8 @@ jobs:
             repo: nodejs/undici
           - name: init/verify on a Go repo (spf13/cobra)
             repo: spf13/cobra
-          - name: init/verify on a Python repo (encode/httpx)
-            repo: encode/httpx
+          - name: init/verify on a Python repo (pallets/flask)
+            repo: pallets/flask
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -156,5 +163,15 @@ jobs:
           cache: false
       - name: Clone ${{ matrix.repo }}
         run: git clone --depth 1 "https://github.com/${{ matrix.repo }}" "$RUNNER_TEMP/wild"
+      # The Python cell preinstalls httpx's declared venv setup before the
+      # lifecycle runs: the helper-based discovery proposal it used to test was
+      # reported honestly as broken (a plain-pytest claim cannot hold there),
+      # so the cell moved to flask — and flask's suite needs its deps, which
+      # would otherwise consume the probe's calibration window.
+      - name: Preinstall the Python repo's declared setup
+        if: contains(matrix.repo, 'pallets/flask')
+        working-directory: ${{ runner.temp }}/wild
+        run: pip install uv && uv sync --frozen
+        timeout-minutes: 15
       - name: Canary — discovery finds something, and nothing it finds is broken
         run: node test/wild.mjs lifecycle --root "$RUNNER_TEMP/wild" --label "${{ matrix.name }}"

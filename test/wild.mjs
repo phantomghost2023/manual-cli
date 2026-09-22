@@ -123,7 +123,10 @@ async function lifecycle() {
   // pre-installed the tree and passed --no-setup would never exercise the
   // prerequisite path at all — and that path is where "the claim ran against an
   // install that was never made" hides (npm/cli, whose checkout commits a
-  // partial node_modules).
+  // partial node_modules). The --preinstalled cells are the exception: the
+  // workflow installed the tree because the probe's calibration window cannot
+  // hold this suite's first cold run; verify still runs, with setup allowed but
+  // already satisfied, so the claim is checked against the tree it declared.
   const res = await verify(root, { state, force: true, quiet: true });
   state.save();
 

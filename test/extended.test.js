@@ -22,6 +22,12 @@ const tmp = (name) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), name));
   fs.cpSync(ROOT, dir, { recursive: true });
   fs.rmSync(path.join(dir, '.manual', 'state.json'), { force: true }); // fixtures start unstamped
+  // The committed ledger is this repo's real verify history, written by the
+  // machine running the tests. A fixture that inherits it observes a phantom
+  // second machine on any host not named in it — the single-machine observe
+  // test failed exactly that way on ubuntu. Fixtures start with no history;
+  // tests that study the ledger write their own.
+  fs.rmSync(path.join(dir, '.manual', 'ledger.jsonl'), { force: true });
   return dir;
 };
 
