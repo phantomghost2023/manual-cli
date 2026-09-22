@@ -142,6 +142,28 @@ setup:
     verify: { builtin: venv }       # every declared distribution, at the declared version
 ```
 
+The Node package managers are all covered, and each one's check knows what that
+manager's own install does when the tree is damaged:
+
+```yaml
+setup:
+  node:
+    run: yarn install --frozen-lockfile --check-files   # what `init` writes for yarn 1
+    evidence: ["package.json", "yarn.lock"]
+    cache: ["node_modules"]
+    verify: { builtin: yarn }       # v1's integrity map + the directories it linked;
+                                    # berry's linked locations vs the locators
+```
+
+That `--check-files` is not decoration. Classic yarn trusts its integrity file,
+which records *which lockfile the tree came from* and nothing about the tree:
+delete `node_modules/is-odd` and a plain `yarn install --frozen-lockfile` answers
+"Already up-to-date" in 0.2s with the package still gone, while `--check-files`
+re-links it in the same 0.2s. So the builtin only *judges* a missing directory
+when the declared command repairs it, and otherwise reports it — the same rule
+that makes pnpm and `bun --linker isolated` report a missing store directory
+instead of reinstalling forever.
+
 When it says no, the reinstall explains itself instead of looking like a cache
 that does not work:
 

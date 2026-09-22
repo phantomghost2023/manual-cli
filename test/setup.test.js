@@ -775,6 +775,29 @@ describe('init: discovering a prerequisite', () => {
     fs.rmSync(path.join(root, 'pnpm-lock.yaml'));
     fs.writeFileSync(path.join(root, 'yarn.lock'), '# yarn\n');
     assert.match(installCommand(root).run, /^yarn install --frozen-lockfile/);
+    assert.equal(installCommand(root).verify.builtin, 'yarn');
+
+    // Classic yarn 1 trusts .yarn-integrity and will not re-link a package that
+    // is missing from node_modules; `--check-files` is what makes its install
+    // repair the tree the verifier reports on (measured, 0.2s either way).
+    fs.writeFileSync(path.join(root, 'yarn.lock'), '# yarn lockfile v1\n\nis-odd@3.0.1:\n  version "3.0.1"\n');
+    assert.match(installCommand(root).run, /^yarn install --frozen-lockfile --check-files$/);
+
+    // Berry rejects that flag outright ("Unsupported option name"), so it is
+    // only ever added where the lockfile says classic.
+    fs.writeFileSync(path.join(root, 'yarn.lock'), '__metadata:\n  version: 8\n');
+    assert.match(installCommand(root).run, /^yarn install --frozen-lockfile$/);
+    fs.rmSync(path.join(root, 'yarn.lock'));
+
+    // bun 1.2 writes the text lockfile, which the bun verifier can read; the
+    // pre-1.2 binary one declares no verifier at all rather than one that can
+    // only answer "cannot tell".
+    fs.writeFileSync(path.join(root, 'bun.lock'), '{\n  "lockfileVersion": 1,\n  "packages": {}\n}\n');
+    assert.match(installCommand(root).run, /^bun install --frozen-lockfile$/);
+    assert.equal(installCommand(root).verify.builtin, 'bun');
+    fs.rmSync(path.join(root, 'bun.lock'));
+    fs.writeFileSync(path.join(root, 'bun.lockb'), '\u0000binary\u0000');
+    assert.equal(installCommand(root).verify, undefined);
   });
 
   test('missing-dependency output is distinguished from a failing assertion', () => {

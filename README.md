@@ -303,14 +303,17 @@ setup:
     share: true                # other checkouts on this machine may borrow it
 ```
 
-- **Seven ecosystems, one question.** A builtin compares an installed tree
-  against the lockfile that describes it by reading directory listings, not by
-  running the package manager's own check:
+- **Eight ecosystems, one question.** Every Node package manager a repo can
+  use is covered. A builtin compares an installed tree against the lockfile that
+  describes it by reading directory listings, not by running the package
+  manager's own check:
 
   | builtin | lockfile | tree | what is compared |
   | --- | --- | --- | --- |
   | `npm` | `package-lock.json`, `npm-shrinkwrap.json` | `node_modules` | every declared package path exists (lockfileVersion 1 and 3) |
   | `pnpm` | `pnpm-lock.yaml` | `node_modules/.pnpm` | every resolved package has a store directory, and pnpm's own copy of the lockfile matches |
+  | `yarn` | `yarn.lock` | `node_modules` | v1: the pattern → resolved-URL map in `.yarn-integrity` matches the lockfile, and every directory it linked is on disk. berry: every location `.yarn-state.yml` lists exists, and every locator is resolved |
+  | `bun` | `bun.lock` | `node_modules` | every path the lockfile keys resolve to is installed (hoisted), or every resolved package has its own store directory under `node_modules/.bun` (isolated linker) |
   | `venv` | `requirements.txt`, `poetry.lock`, `Pipfile.lock`, `uv.lock` | `.venv` (both `Lib/site-packages` and `lib/python3.x/site-packages`) | every declared distribution is installed, at the declared version |
   | `gems` | `Gemfile.lock` | `vendor/bundle` (`BUNDLE_PATH` honoured) | every `GEM` spec has a `specifications/*.gemspec` |
   | `gomod` | `go.mod` | `$GOMODCACHE`, or `vendor/modules.txt` | every required module is downloaded: source for direct dependencies, `.mod` for the module graph |
@@ -319,7 +322,11 @@ setup:
 
   On a 403-package express tree `npm` answers in **~64ms** against **10.9s** for
   the obvious command, `npm ls --depth=0` — which is why the easy answer was
-  never being run. `lockfile` is the older spelling of `npm` and still resolves.
+  never being run. On real trees the new two answer in **2–5ms**: a yarn 1 clone
+  (`2 package pattern(s) present, matching yarn.lock; 1 linked directory present
+  on disk`), a berry clone (`3 package(s) linked on disk, all of them resolved by
+  yarn.lock`) and a bun clone (`6 package(s) present, matching bun.lock
+  (hoisted)`). `lockfile` is the older spelling of `npm` and still resolves.
   A `verify:` command is still accepted for anything not covered; the map form is
   required for builtins so a bare word is never ambiguous.
 - **Yes, no, and "nothing to compare against" are different answers.** A repo can
@@ -337,11 +344,28 @@ setup:
   verdict there would rebuild on every verify and never change its answer —
   measured twice on pnpm 11 (a satisfied `pnpm install` leaves a deleted
   `node_modules/.pnpm/<pkg>` and a modified `node_modules/.pnpm/lock.yaml`
-  alone, even with `--force`) and true of `crates`, whose `Cargo.lock` covers
-  dev-dependencies a plain build never fetches. Those steps print what they saw:
+  alone, even with `--force`), on bun's isolated linker (a deleted
+  `node_modules/.bun/<pkg>@<version>` is answered with "Checked 6 installs
+  across 32 packages (no changes)") and true of `crates`, whose `Cargo.lock`
+  covers dev-dependencies a plain build never fetches. Those steps print what
+  they saw:
+
+  The same rule decides what yarn's classic generation is allowed to say, and
+  there it changed the command `init` writes. Classic yarn's integrity file
+  records *which lockfile the tree came from* and nothing about the tree: delete
+  `node_modules/is-odd` and both the file and `yarn install --frozen-lockfile`
+  say the install is fine ("Already up-to-date", 0.2s, tree still damaged).
+  `--check-files` and `--force` do re-link it, in the same 0.2s — so a classic
+  repo's discovered prerequisite is `yarn install --frozen-lockfile
+  --check-files`, and a linked directory that is missing is a verdict that
+  command repairs. Berry rejects that flag ("Unsupported option name"), and does
+  not need it: a plain `yarn install` re-links a deleted location in 155ms. On a
+  tree whose declared command is just `yarn install --frozen-lockfile`, the
+  missing directory is reported rather than judged:
 
   ```console
   ⚙ setup: pnpm install --frozen-lockfile — reused, not re-confirmed: 1/2 package(s) the lockfile lists are not in node_modules/.pnpm, e.g. is-number@6.0.0; node_modules/.pnpm/lock.yaml matches pnpm-lock.yaml — not a verdict: a satisfied `pnpm install` re-imports only when the lockfile itself changes
+  ⚙ setup: yarn install --frozen-lockfile — reused, not re-confirmed: 1/1 top-level package(s) yarn linked are not in node_modules, e.g. is-odd (installed for is-odd@3.0.1) — not a verdict: a satisfied `yarn install` trusts .yarn-integrity and leaves them missing (measured: "Already up-to-date", 0.2s). `yarn install --check-files` (or `--force`) re-links them in the same 0.2s
   ```
 - **`init` writes the verifier for the ecosystem it found** (`verify: { builtin:
   venv }`), never `auto` — discovery knows which one it just detected, so a human

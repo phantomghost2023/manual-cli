@@ -173,7 +173,7 @@ function report(v, reason, lockName) {
 // ---------------------------------------------------------------------------
 
 const NPM_LOCKS = ['package-lock.json', 'npm-shrinkwrap.json'];
-const OTHER_PM_LOCKS = ['pnpm-lock.yaml', 'yarn.lock', 'bun.lockb'];
+const OTHER_PM_LOCKS = ['pnpm-lock.yaml', 'yarn.lock', 'bun.lock', 'bun.lockb'];
 
 // lockfileVersion 1 lists the tree as nested `dependencies` objects instead of
 // `packages` paths. Reading only `packages` made a v1 lockfile declare nothing,
@@ -842,10 +842,392 @@ const crates = {
 };
 
 // ---------------------------------------------------------------------------
+// yarn — two lockfile generations, and the state file each one writes.
+//
+// Classic yarn records the pattern → resolved-URL map it installed from in
+// `node_modules/.yarn-integrity`, and its `IntegrityChecker` compares exactly
+// that map against `yarn.lock` to decide whether to install anything. Measured:
+// injecting one entry into the file made `yarn install` do a full install and
+// rewrite it. So a difference here is not this tool's opinion about the tree —
+// it is yarn's own answer, which is why "no" is safe to say.
+//
+// Berry writes `node_modules/.yarn-state.yml` in node-modules mode, which lists
+// the locations it linked (and no checksums), and deleting a location from it
+// made `yarn install` re-link and restore the entry — measured. Its PnP linker
+// has no readable equivalent: `.pnp.cjs` is generated from a binary install
+// state, and the locators do not appear in it (checked), so PnP is reported as
+// unverifiable rather than guessed at.
+// ---------------------------------------------------------------------------
+
+export function yarnKind(text) {
+  if (/^# yarn lockfile v1\b/m.test(text)) return 'classic';
+  if (/^__metadata:\s*$/m.test(text)) return 'berry';
+  return null;
+}
+
+// The directory a classic-yarn lockfile pattern is installed into. Patterns are
+// `name@range`, with a scoped name spelled `@scope/name@range`; a URL or file
+// pattern has no directory that follows from it.
+function yarnPatternName(pattern) {
+  const p = String(pattern).trim();
+  if (!p || p.includes('://') || /^file:/.test(p)) return null;
+  const at = p.startsWith('@') ? p.indexOf('@', 1) : p.indexOf('@');
+  const name = at > 0 ? p.slice(0, at) : p;
+  return /^(@[^/\s]+\/)?[^/@\s]+$/.test(name) ? name : null;
+}
+
+// A declared install that re-links from scratch, rather than trusting what its
+// own bookkeeping says is already there. This is what decides whether a missing
+// directory can be a verdict: the verdict has to be one the command repairs.
+const RE_LINKING_INSTALL = /(^|\s)(--check-files|--force)(\s|$)/;
+
+// Classic entries: one or more patterns at column 0 ending in `:`, then the
+// indented `version "1.2.3"` / `resolved "https://…"` lines that belong to them.
+function yarnClassicEntries(text) {
+  const out = new Map();
+  let patterns = null;
+  for (const raw of String(text).split(/\r?\n/)) {
+    if (!raw.trim() || raw.trimStart().startsWith('#')) continue;
+    if (!/^\s/.test(raw)) {
+      patterns = raw
+        .replace(/:\s*$/, '')
+        .split(/,\s*/)
+        .map((p) => p.trim().replace(/^"|"$/g, ''))
+        .filter(Boolean);
+      for (const p of patterns) if (!out.has(p)) out.set(p, {});
+      continue;
+    }
+    if (!patterns) continue;
+    const m = /^\s+(version|resolved)\s+"?([^"\s]*)"?\s*$/.exec(raw);
+    if (!m) continue;
+    for (const p of patterns) out.get(p)[m[1]] = m[2];
+  }
+  return out;
+}
+
+// Berry entries: descriptors at column 0, and the `resolution:` each one pins.
+function yarnBerryLocators(text) {
+  const out = new Map();
+  let cur = null;
+  for (const raw of String(text).split(/\r?\n/)) {
+    if (!raw.trim() || raw.trimStart().startsWith('#')) continue;
+    if (!/^\s/.test(raw)) {
+      cur = { descriptors: raw.replace(/:\s*$/, '').trim() };
+      continue;
+    }
+    if (!cur) continue;
+    const m = /^\s+(version|resolution|linkType|checksum):\s*"?([^"\s]*)"?\s*$/.exec(raw);
+    if (!m) continue;
+    if (m[1] === 'resolution') {
+      cur.resolution = m[2];
+      out.set(m[2], cur);
+    } else {
+      cur[m[1]] = m[2];
+    }
+  }
+  return out;
+}
+
+// `"is-odd@npm:3.0.1":` at column 0, then `  locations:` and `    - "node_modules/is-odd"`.
+function yarnStateLocations(text) {
+  const out = new Map();
+  let cur = null;
+  for (const raw of String(text).split(/\r?\n/)) {
+    if (!raw.trim() || raw.trimStart().startsWith('#')) continue;
+    if (!/^\s/.test(raw)) {
+      const key = raw.replace(/:\s*$/, '').trim().replace(/^"|"$/g, '');
+      cur = key === '__metadata' ? null : [];
+      if (cur) out.set(key, cur);
+      continue;
+    }
+    const m = /^\s+-\s+"?([^"]*?)"?\s*$/.exec(raw);
+    if (m && cur) cur.push(m[1]);
+  }
+  return out;
+}
+
+const yarn = {
+  name: 'yarn',
+  unit: 'package pattern',
+  lockfiles: ['yarn.lock'],
+  trees: ['node_modules', '.pnp.cjs'],
+  available(root) {
+    const lock = read(path.join(root, 'yarn.lock'));
+    if (lock === null) return 'no yarn.lock in this checkout to compare the install against';
+    const kind = yarnKind(lock);
+    if (!kind) return 'this yarn.lock is neither the classic (v1) nor the modern (berry) format, so there is nothing it can be compared with';
+    if (kind === 'classic' && !exists(path.join(root, 'node_modules', '.yarn-integrity'))) {
+      return 'no node_modules/.yarn-integrity — yarn writes it on every install, and without it there is no record here of which lockfile the tree came from';
+    }
+    if (kind === 'berry' && !exists(path.join(root, 'node_modules', '.yarn-state.yml'))) {
+      return exists(path.join(root, '.pnp.cjs'))
+        ? "this checkout uses yarn's PnP linker: the runtime map is generated from a binary install state and does not contain a readable list of what was linked, so there is nothing here to compare against — a `verify:` command (`yarn install --immutable`) is the way to check this tree"
+        : 'no node_modules/.yarn-state.yml — berry writes it in node-modules mode, and without it there is no record here of which packages were linked';
+    }
+    return null;
+  },
+  verify(root, spec = {}) {
+    const lockText = read(path.join(root, 'yarn.lock')) || '';
+    const kind = yarnKind(lockText);
+    const t0 = Date.now();
+
+    if (kind === 'classic') {
+      const integ = readJson(path.join(root, 'node_modules', '.yarn-integrity'));
+      if (!integ) return { ok: null, ms: Date.now() - t0, note: 'no node_modules/.yarn-integrity to compare against' };
+      const want = yarnClassicEntries(lockText);
+      const got = integ.lockfileEntries && typeof integ.lockfileEntries === 'object' ? integ.lockfileEntries : {};
+      if (!want.size) return { ok: null, ms: Date.now() - t0, note: 'yarn.lock lists no packages to compare against' };
+      const differing = [];
+      for (const [pattern, entry] of want) {
+        if (!(pattern in got)) differing.push(`${pattern} (in yarn.lock, not in the install)`);
+        else if (entry.resolved && got[pattern] !== entry.resolved) differing.push(`${pattern} (installed from ${String(got[pattern]).replace(/^https?:\/\/[^/]+\//, '')})`);
+      }
+      for (const pattern of Object.keys(got)) if (!want.has(pattern)) differing.push(`${pattern} (installed, and no longer in yarn.lock)`);
+      const ms = Date.now() - t0;
+      if (differing.length) {
+        return {
+          ok: false,
+          ms,
+          note: `${differing.length} of ${want.size} package pattern(s) differ between yarn.lock and node_modules/.yarn-integrity, e.g. ${differing[0]}`,
+          missing: differing.slice(0, 5),
+        };
+      }
+      // Classic yarn's integrity check compares this map with yarn.lock and
+      // nothing else. Measured: deleting `node_modules/is-odd` left the map
+      // matching and a plain `yarn install --frozen-lockfile` answering
+      // "Already up-to-date" in 0.2s — the tree stayed damaged. `--check-files`
+      // (0.2s) and `--force` (0.2s) do re-link it. So a directory that the
+      // install claims to have linked is only judged when the declared command
+      // re-links; otherwise it is reported and the cache stays trusted.
+      const top = Array.isArray(integ.topLevelPatterns) ? integ.topLevelPatterns : [];
+      const checkedTop = [];
+      const missingDirs = [];
+      for (const pattern of top) {
+        const name = yarnPatternName(pattern);
+        if (!name) continue;
+        checkedTop.push(name);
+        if (!exists(path.join(root, 'node_modules', name))) missingDirs.push(`${name} (installed for ${pattern})`);
+      }
+      if (missingDirs.length) {
+        if (RE_LINKING_INSTALL.test(String(spec?.run || ''))) {
+          return {
+            ok: false,
+            ms,
+            note: `${missingDirs.length}/${checkedTop.length} top-level package(s) yarn linked are not in node_modules, e.g. ${missingDirs[0]}`,
+            missing: missingDirs.slice(0, 5),
+          };
+        }
+        return {
+          ok: null,
+          ms,
+          note: `${missingDirs.length}/${checkedTop.length} top-level package(s) yarn linked are not in node_modules, e.g. ${missingDirs[0]} — not a verdict: a satisfied \`yarn install\` trusts .yarn-integrity and leaves them missing (measured: "Already up-to-date", 0.2s). \`yarn install --check-files\` (or \`--force\`) re-links them in the same 0.2s`,
+        };
+      }
+      const linked = checkedTop.length ? `; ${checkedTop.length} linked director${checkedTop.length === 1 ? 'y' : 'ies'} present on disk` : '';
+      return { ok: true, ms, note: `${want.size} package pattern(s) present, matching yarn.lock${linked}` };
+    }
+
+    if (kind === 'berry') {
+      const stateText = read(path.join(root, 'node_modules', '.yarn-state.yml'));
+      if (stateText === null) return { ok: null, ms: Date.now() - t0, note: 'no node_modules/.yarn-state.yml to compare against' };
+      const locators = yarnBerryLocators(lockText);
+      const state = yarnStateLocations(stateText);
+      if (!locators.size) return { ok: null, ms: Date.now() - t0, note: 'yarn.lock lists no packages to compare against' };
+      const unlinked = [];
+      for (const [locator, paths] of state) {
+        for (const rel of paths) {
+          // The workspace itself is linked at the checkout root.
+          if (!rel || rel === '.') continue;
+          if (!exists(path.join(root, rel))) unlinked.push(`${locator} → ${rel}`);
+        }
+      }
+      const leftovers = [...state.keys()].filter((l) => !locators.has(l));
+      const ms = Date.now() - t0;
+      if (unlinked.length || leftovers.length) {
+        const bits = [];
+        if (unlinked.length) bits.push(`${unlinked.length} package(s) yarn linked are not on disk, e.g. ${unlinked[0]}`);
+        if (leftovers.length) bits.push(`${leftovers.length} linked package(s) are not in yarn.lock, e.g. ${leftovers[0]}`);
+        return { ok: false, ms, note: `${bits.join('; ')} — yarn re-links this`, missing: [...unlinked, ...leftovers].slice(0, 5) };
+      }
+      // A lockfile locator with no location is what an optional or
+      // platform-specific dependency looks like; it is reported, never judged.
+      // An entry with `locations: []` is the same thing after yarn wrote it.
+      const linked = [...state.entries()].filter(([, paths]) => paths.length > 0);
+      const notLinked = [...locators.entries()]
+        .filter(([l, ent]) => ent.linkType !== 'soft' && !(state.get(l) || []).length)
+        .map(([l]) => l);
+      return {
+        ok: true,
+        ms,
+        note: `${linked.length} package(s) linked on disk, all of them resolved by yarn.lock${notLinked.length ? `; ${notLinked.length} resolved package(s) have no location here (optional or platform-specific dependencies are not linked)` : ''}`,
+      };
+    }
+
+    return { ok: null, ms: Date.now() - t0, note: 'yarn.lock is neither the classic nor the berry format' };
+  },
+};
+
+// ---------------------------------------------------------------------------
+// bun — the lockfile is the whole record.
+//
+// bun keeps no state file of its own: `bun.lock` (text, since bun 1.2) holds the
+// resolved tree as `path → [name@version, source, metadata, integrity]`, and the
+// path is where the package is installed, nesting included
+// (`is-odd/is-number` → `node_modules/is-odd/node_modules/is-number`, measured).
+// Measured on bun 1.2: deleting a package — top level or nested — is repaired by
+// `bun install` in tens of milliseconds, while a package.json whose version was
+// edited in place is left alone. So a missing install is judged and a wrong
+// version is only reported.
+// ---------------------------------------------------------------------------
+
+// bun.lock is JSON with trailing commas.
+function parseBunLock(text) {
+  return JSON.parse(String(text).replace(/,(\s*[}\]])/g, '$1'));
+}
+
+// A lockfile key is a path under node_modules without the repeated prefix: the
+// first segment is the scope (`@scope/name`) or the package name, and every
+// segment after it starts a nested level.
+function bunEntryPath(key) {
+  const segs = String(key).split('/');
+  let out = 'node_modules/';
+  let i = 0;
+  while (i < segs.length) {
+    const scoped = segs[i].startsWith('@');
+    out += scoped ? `${segs[i]}/${segs[i + 1]}` : segs[i];
+    i += scoped ? 2 : 1;
+    if (i < segs.length) out += '/node_modules/';
+  }
+  return out;
+}
+
+const platformSays = (v, want) => (Array.isArray(v) ? v.includes(want) : v === want);
+
+const bun = {
+  name: 'bun',
+  unit: 'package',
+  lockfiles: ['bun.lock', 'bun.lockb'],
+  trees: ['node_modules'],
+  available(root) {
+    if (exists(path.join(root, 'bun.lock'))) return null;
+    if (exists(path.join(root, 'bun.lockb'))) {
+      return 'this checkout has bun.lockb, the binary lockfile, which this verifier cannot read — bun 1.2 and later write bun.lock (text) on install';
+    }
+    return 'no bun.lock in this checkout to compare the install against';
+  },
+  verify(root) {
+    const lockPath = path.join(root, 'bun.lock');
+    if (!exists(lockPath)) return { ok: null, ms: 0, note: 'no bun.lock to compare the install against' };
+    let lock;
+    try {
+      lock = parseBunLock(read(lockPath));
+    } catch (e) {
+      return { ok: null, ms: 0, note: `unreadable bun.lock: ${e.message}` };
+    }
+    const packages = lock?.packages && typeof lock.packages === 'object' ? lock.packages : {};
+    // A workspace member is keyed by its path, not by a node_modules location.
+    const workspaceNames = new Set(Object.values(lock?.workspaces || {}).map((w) => w && w.name).filter(Boolean));
+    const keys = Object.keys(packages).filter((k) => {
+      if (!k || k.startsWith('.')) return false;
+      const first = k.startsWith('@') ? k.split('/').slice(0, 2).join('/') : k.split('/')[0];
+      return !workspaceNames.has(first);
+    });
+    if (!keys.length) return { ok: null, ms: 0, note: 'bun.lock lists no installed packages to compare against' };
+
+    // Which linker wrote this tree decides what the install even is, and it is
+    // visible from the tree itself: the isolated linker keeps a
+    // `node_modules/.bun` store.
+    //
+    // hoisted: the lockfile key path under node_modules is the install —
+    // `node_modules/is-number`, and `node_modules/is-odd/node_modules/is-number`
+    // for a key that could not be hoisted. Measured: deleting either a direct or
+    // a transitive entry left `bun install --frozen-lockfile` restoring it in
+    // 30-42ms, so a missing entry is a verdict a plain install repairs.
+    //
+    // isolated: there is no top-level entry for a transitive package at all
+    // (only the workspace's own dependencies are linked at the root), so the
+    // store directory `node_modules/.bun/<name>@<version>` is the install, and
+    // a name with two versions has one farm link but two store directories.
+    // Measured: a deleted store directory is *not* rebuilt — `bun install
+    // --frozen-lockfile` answered "Checked 6 installs across 32 packages (no
+    // changes)" and left it gone — which is why its absence is reported rather
+    // than judged, exactly like pnpm.
+    const isolated = exists(path.join(root, 'node_modules', '.bun'));
+    const t0 = Date.now();
+    const missing = [];
+    const wrong = [];
+    const skipped = [];
+    for (const key of keys) {
+      const entry = packages[key];
+      const spec = Array.isArray(entry) ? entry[0] : null;
+      const meta = (Array.isArray(entry) && entry[2] && typeof entry[2] === 'object') ? entry[2] : {};
+      if (!spec || typeof spec !== 'string') { skipped.push(key); continue; }
+      // A package for another platform, or one that is optional here, is
+      // legitimately absent: checking it would call a correct checkout broken.
+      if ((meta.os && !platformSays(meta.os, process.platform)) ||
+          (meta.cpu && !platformSays(meta.cpu, os.arch())) ||
+          meta.libc || meta.optional === true) {
+        skipped.push(key);
+        continue;
+      }
+      const at = spec.lastIndexOf('@');
+      const name = spec.slice(0, at);
+      const version = spec.slice(at + 1);
+      // Reported paths are written the way a path in a lockfile is written —
+      // with forward slashes — because they are meant to be pasted into a
+      // message or a shell, not resolved by this process.
+      const rel = isolated ? `node_modules/.bun/${name.replace(/\//g, '+')}@${version}` : bunEntryPath(key);
+      if (!exists(path.join(root, rel))) {
+        missing.push(rel);
+        continue;
+      }
+      if (!isolated) {
+        const pj = readJson(path.join(root, rel, 'package.json'));
+        if (!pj || pj.version !== version) wrong.push(`${rel} (${pj?.version || 'no package.json'} instead of ${version})`);
+      }
+    }
+    const ms = Date.now() - t0;
+    const checked = keys.length - skipped.length;
+    const unchecked = skipped.length ? `${skipped.length} not checked (another platform or optional here, e.g. ${skipped[0]})` : '';
+
+    if (missing.length) {
+      if (isolated) {
+        return {
+          ok: null,
+          ms,
+          note: [`${missing.length}/${checked} package(s) bun.lock resolves have no directory in node_modules/.bun, e.g. ${missing[0]} — not a verdict: bun considers the install satisfied (measured: "Checked 6 installs across 32 packages (no changes)") and does not rebuild a missing store directory; a fresh \`bun install\` after removing node_modules does`, unchecked].filter(Boolean).join('; '),
+        };
+      }
+      return {
+        ok: false,
+        ms,
+        note: [`${missing.length}/${checked} installed package(s) missing, e.g. ${missing[0]}`, unchecked].filter(Boolean).join('; '),
+        missing: missing.slice(0, 5),
+      };
+    }
+    if (wrong.length) {
+      // Measured: `bun install` leaves an edited package.json alone, so this is
+      // reported rather than judged — a verdict would rebuild forever.
+      return {
+        ok: null,
+        ms,
+        note: `${wrong.length} package(s) are installed at a different version than bun.lock, e.g. ${wrong[0]} — not a verdict: bun install does not rewrite a tree it considers satisfied`, 
+        missing: wrong.slice(0, 5),
+      };
+    }
+    return {
+      ok: true,
+      ms,
+      note: [`${checked} package(s) present, matching bun.lock${isolated ? ' (isolated store)' : ' (hoisted)'}`, unchecked].filter(Boolean).join('; '),
+    };
+  },
+};
+
+// ---------------------------------------------------------------------------
 // The registry
 // ---------------------------------------------------------------------------
 
-const BUILTINS = { npm, pnpm, venv, gems, gomod, crates };
+const BUILTINS = { npm, pnpm, yarn, bun, venv, gems, gomod, crates };
 
 export const BUILTIN_NAMES = Object.keys(BUILTINS);
 export const VERIFY_BUILTINS = new Set([AUTO, ...BUILTIN_NAMES]);

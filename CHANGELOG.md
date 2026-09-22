@@ -2,6 +2,17 @@
 
 All notable changes to manual-cli are documented here. Format: Keep a Changelog; versioning: SemVer.
 
+## [0.11.0] - 2026-09-21
+
+### Added
+- **`yarn` and `bun` builtins, so every Node package manager a repo can use has a cached-install check.** `verify: { builtin: yarn }` reads both generations: classic yarn 1 compares the pattern → resolved-URL map in `node_modules/.yarn-integrity` with `yarn.lock` *and* checks that every directory the install claims to have linked is on disk (`topLevelPatterns` names them); berry compares each location in `node_modules/.yarn-state.yml` with the locators `yarn.lock` resolves, reporting a resolved package that has no location here (an optional or platform-specific dependency) rather than judging it missing. PnP stays unverifiable and says so: `.pnp.cjs` is generated from a binary install state and contains no locator list. `verify: { builtin: bun }` reads `bun.lock` (text, trailing commas and all) and knows both linkers — in a hoisted tree the lockfile key path under `node_modules` is the install, and in an isolated one (`node_modules/.bun` present) each resolved package has its own store directory `node_modules/.bun/<name>@<version>`, scoped names spelled `@scope+name`, with the workspace's own packages excluded and entries for another platform or marked optional skipped and counted. `bun.lockb` (the pre-1.2 binary lockfile) declares no verifier rather than one that can only answer "cannot tell".
+- **`init` discovers both**: a `yarn.lock` or `bun.lock` repo gets a prerequisite with a verifier that reads it, and a classic yarn 1 lockfile gets `yarn install --frozen-lockfile --check-files`. `yarnKind` is exported from `src/verifiers.js` so discovery and verification agree on what the lockfile's format is.
+- **A verdict must be one the declared command repairs — now enforced by the command itself, not by convention.** Classic yarn 1 trusts `.yarn-integrity` and nothing else: measured on a real 1.22.22 clone, deleting `node_modules/is-odd` left both the integrity file and `yarn install --frozen-lockfile` saying the install was fine ("Already up-to-date", 0.2s) with the package still gone, while `--check-files` and `--force` re-link it in the same 0.2s. So the classic-yarn builtin makes a missing linked directory a *verdict* only when the declared command re-links (`--check-files`/`--force`) and otherwise reports it with the flag that would fix it. bun's isolated linker is the third case of the same rule: a deleted `node_modules/.bun/<name>@<version>` is answered with "Checked 6 installs across 32 packages (no changes)", so its absence is reported, not judged, while a missing entry in a hoisted tree (repaired by a plain `bun install --frozen-lockfile` in 30–42ms, direct or transitive) is judged.
+
+### Fixed
+- **Paths in bun's reports were written with the host's separators** (`node_modules\.bun\is-odd@3.0.1` on Windows) because they were built with `path.join`. They are now written the way a path in a lockfile is — with forward slashes — since they are meant to be pasted into a message or a shell, not resolved by this process.
+- **`init`'s classic/berry detection read `yarn.lock` relative to the working directory** instead of the repository root, so a classic lockfile seen from outside the repo was mistaken for a modern one and the repo got the install command that cannot repair a damaged tree. Caught by the test that writes both generations.
+
 ## [0.10.0] - 2026-09-21
 
 ### Added

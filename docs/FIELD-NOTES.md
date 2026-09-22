@@ -438,6 +438,9 @@ finding J, i.e. by accident. With the verifier fixed, the same clone has been
 
 ## Fifth pass: the same question, in six ecosystems
 
+> Superseded by the sixth pass, below, which added the last two Node package
+> managers and the `--check-files` finding that changed `init`.
+
 Probed on 2026-09-21, on Windows, against real trees rather than fixtures: an npm
 11 project with a nested dependency, a pnpm 11 project, a `python -m venv` with
 two distributions, a vendored `bundle install` (bundler 2.6.9, rake 13.4.2), a Go
@@ -507,3 +510,94 @@ fetched into a scratch `CARGO_HOME` (cargo 1.90). Each was driven through
   it reads — a lockfile that was never committed, or hand-edited to match what is
   installed, verifies perfectly. The journal and the tier system are what cover
   that, not this.
+
+## Sixth pass: the last two Node package managers, and a command that had to
+## change shape
+
+Both new builtins went through the same rule as pnpm and crates — *only say no
+when the declared command repairs it* — and both times the rule changed what got
+built. This was measured on a real yarn 1.22.22 clone, a real yarn 4.9.0
+(corepack) clone and a real bun 1.2 clone, each damaged and repaired.
+
+- **Classic yarn's integrity file says nothing about the tree, and that is the
+  whole finding.** Delete `node_modules/is-odd` from a yarn 1 clone and
+  `.yarn-integrity` still matches `yarn.lock`; `yarn install --frozen-lockfile`
+  answers "Already up-to-date. Done in 0.20s" and leaves the package gone;
+  `yarn install --force` (0.20s) and `yarn install --check-files` (0.21s, and it
+  prints `[3/4] Linking dependencies...`) put it back. So the first version of
+  the check — map versus lockfile, which is exactly yarn's own IntegrityChecker —
+  reported `true` for a tree that could not `require('is-odd')`. The map check
+  stayed (it *is* repaired: corrupt the map and a plain install re-links in
+  0.2s), and on top of it the builtin now checks that the directories
+  `topLevelPatterns` claims to have linked are on disk.
+- **That finding changed `init`'s command, which is the interesting part.** A
+  classic repo's discovered prerequisite is now `yarn install --frozen-lockfile
+  --check-files`, so the missing-directory verdict is one the command repairs and
+  the verify path self-heals in the same 0.2s a plain install would have wasted
+  saying nothing. Berry rejects that flag outright (`Unknown Syntax Error:
+  Unsupported option name ("--check-files")`), and does not need it: a plain
+  `yarn install --frozen-lockfile` re-linked a deleted location in 155ms — so
+  `yarnKind` decides which generation gets which command, and the two verdicts
+  are allowed to differ because the two commands do.
+- **One clone, three answers, all measured** (`manual verify` on the probe, with
+  the flag in the declared command):
+
+  ```console
+  yarn: true  | 2 package pattern(s) present, matching yarn.lock; 1 linked directory present on disk | 2ms
+  yarn (yarn install --frozen-lockfile):          null  | 1/1 top-level package(s) yarn linked are not in node_modules, e.g. is-odd (installed for is-odd@3.0.1) — not a verdict: a satisfied `yarn install` trusts .yarn-integrity and leaves them missing (measured: "Already up-to-date", 0.2s). `yarn install --check-files` (or `--force`) re-links them in the same 0.2s
+  yarn (yarn install --frozen-lockfile --check-files): false | 1/1 top-level package(s) yarn linked are not in node_modules, e.g. is-odd …
+  ```
+
+  End to end through the lifecycle on that clone, the witness usually fires
+  first — deleting a top-level package changes `node_modules`'s own listing — and
+the run reads `⚙ setup: yarn install --frozen-lockfile --check-files (cached
+install distrusted — witness: the declared directories changed since it ran)`,
+  `(rebuilding the distrusted install)`, `ok (1109ms)`, claim `fresh`. The
+  verifier is for the damage the witness cannot see: anything *inside* a package
+  directory, a nested store, or a fresh checkout that arrived with a state file.
+- **bun has two linkers and the check cannot be the same for both.** A fresh
+  `bun install` on the probe produced a hoisted tree (no `.bun` at all), while
+  `bun install --linker isolated` (and the `bun add` that created the lockfile)
+  produced `node_modules/.bun/<name>@<version>/node_modules/<name>` plus a
+  symlink farm. Hoisted: the lockfile key path (`node_modules/is-number`, and
+  `node_modules/is-odd/node_modules/is-number` for a key that could not be
+  hoisted) is the install, and deleting one — direct *or* transitive — was
+  restored by `bun install --frozen-lockfile` in 33–42ms, so a missing entry is a
+  verdict. Isolated: transitive packages have no top-level entry at all, so the
+  store directory is the install, and bun does **not** rebuild a deleted one:
+  `Checked 6 installs across 32 packages (no changes)` and it stayed gone (and in
+  the earlier `bun add` tree, deleting `.bun/is-odd@3.0.1` produced
+  `+ is-odd@3.0.1 / 1 package installed` — which restored only the *top-level*
+  copy and left the farm symlink dangling). That is pnpm's case again, and it
+  reports:
+
+  ```console
+  bun: true | 6 package(s) present, matching bun.lock (hoisted); 25 not checked (another platform or optional here, e.g. @esbuild/aix-ppc64) | 5ms
+  bun: false | 1/6 installed package(s) missing, e.g. node_modules/is-odd        # hoisted — a plain install repairs this
+  bun: null  | 1/6 package(s) bun.lock resolves have no directory in node_modules/.bun, e.g. node_modules/.bun/is-odd@3.0.1 — not a verdict: bun considers the install satisfied …
+  ```
+- **A wrong version is invisible to the isolated linker, and that is a feature.**
+  The store directory embeds the version (`is-odd@3.0.1`), so a version that
+  differs from the lockfile *is* a missing directory there. In the hoisted tree a
+  `package.json` edited to `9.9.9` is reported rather than judged, because
+  measured: `bun install` leaves an edited package.json alone (`+ 1 package
+  installed` only when files are missing).
+- **A bug the fixture found before a real repo did.** The reported paths were
+  built with `path.join`, so on Windows the note read
+  `node_modules\.bun\is-odd@3.0.1` — wrong for the thing the line is for, which
+  is a human pasting it into a shell or a search. They are forward slashes now,
+  and there is a test that would have caught them on any platform.
+- **`init`'s classic/berry test read the wrong file.** The detection used a path
+  relative to the process's working directory, so a classic lockfile was seen as
+  modern whenever the tool was run from outside the repo, and the repo got the
+  install command with no `--check-files` — the one shape that cannot repair a
+  damaged tree. The verifier's answer depended on where you stood; the test that
+  writes both generations caught it, which is the argument for testing the
+  command and the check together rather than separately.
+- **What is still open.** A classic yarn repo whose `topLevelPatterns` is absent
+  (older 1.x) has its map checked and its directories not; nested packages under
+  a hoisted classic yarn tree are only checked where the pattern maps to a
+  top-level directory; a bun isolated tree that lost a store directory stays
+  reported rather than repaired on every verify, which is honest but noisy on a
+  repo somebody damaged by hand; and `bun.lockb` — still the only lockfile some
+  repos have — remains unreadable by anything here.

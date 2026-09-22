@@ -7,6 +7,7 @@ import { runCheck } from './runner.js';
 import { Sandbox } from './sandbox.js';
 import { normalizeSetup } from './setup.js';
 import { VENDORED_CLI } from './eject.js';
+import { yarnKind } from './verifiers.js';
 
 // Init: discover facts about a repo by inspection and scaffold a .manual/
 // with confident, executable claims. Only emits claims it can back with
@@ -15,6 +16,14 @@ import { VENDORED_CLI } from './eject.js';
 function readJson(p) {
   try {
     return JSON.parse(fs.readFileSync(p, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function read(p) {
+  try {
+    return fs.readFileSync(p, 'utf8');
   } catch {
     return null;
   }
@@ -30,20 +39,44 @@ export function installCommand(root, pkg = null) {
   const p = pkg || readJson(path.join(root, 'package.json')) || {};
   const has = (f) => fs.existsSync(path.join(root, f));
   const js = { cache: ['node_modules'] };
-  // The verifier each package manager's lockfile is read by. Yarn and bun write
-  // lockfiles no builtin reads yet, so those prerequisites declare none rather
-  // than one that can only ever answer "cannot tell" — a permanently
-  // unverifiable line on every report is worse than an absent one.
+  // The verifier each package manager's lockfile is read by. Only a checkout
+  // whose lockfile nothing here can read declares none, rather than one that can
+  // only ever answer "cannot tell" — a permanently unverifiable line on every
+  // report is worse than an absent one.
   const npmVerify = { builtin: 'npm' };
   const pnpmVerify = { builtin: 'pnpm' };
   if (String(p.packageManager || '').startsWith('pnpm') || has('pnpm-lock.yaml')) {
     return { run: 'pnpm install --frozen-lockfile', evidence: ['package.json', 'pnpm-lock.yaml'], ...js, verify: pnpmVerify };
   }
+  // Both yarn generations write `yarn.lock`, and both leave something readable
+  // behind to compare it against. They differ in what a plain install does with
+  // a tree that lost a package: berry re-links it, classic yarn 1 trusts
+  // `.yarn-integrity` and answers "Already up-to-date" — so a classic repo's
+  // install asks for `--check-files` (measured 0.2s either way), which makes the
+  // verifier's "a linked directory is missing" a verdict the command repairs.
+  // Berry rejects that flag ("Unsupported option name"), so it is only added
+  // where the lockfile says classic.
   if (String(p.packageManager || '').startsWith('yarn') || has('yarn.lock')) {
-    return { run: 'yarn install --frozen-lockfile', evidence: ['package.json', 'yarn.lock'], ...js };
+    const yarnLock = read(path.join(root, 'yarn.lock'));
+    const classic = yarnLock !== null && yarnKind(yarnLock) === 'classic';
+    return {
+      run: `yarn install --frozen-lockfile${classic ? ' --check-files' : ''}`,
+      evidence: ['package.json', 'yarn.lock'],
+      ...js,
+      verify: { builtin: 'yarn' },
+    };
   }
-  if (String(p.packageManager || '').startsWith('bun') || has('bun.lockb')) {
-    return { run: 'bun install --frozen-lockfile', evidence: ['package.json', 'bun.lockb'], ...js };
+  if (String(p.packageManager || '').startsWith('bun') || has('bun.lock') || has('bun.lockb')) {
+    // bun ≥ 1.2 writes the text lockfile; the older `bun.lockb` is binary and
+    // nothing here can read it, so a repo that still has one declares no
+    // verifier rather than one that can only ever answer "cannot tell".
+    const lock = has('bun.lock') ? 'bun.lock' : 'bun.lockb';
+    return {
+      run: 'bun install --frozen-lockfile',
+      evidence: ['package.json', lock],
+      ...js,
+      ...(has('bun.lock') ? { verify: { builtin: 'bun' } } : {}),
+    };
   }
   if (has('package-lock.json') || has('npm-shrinkwrap.json')) {
     return { run: 'npm ci', evidence: ['package.json', 'package-lock.json'], ...js, verify: npmVerify };
