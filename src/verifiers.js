@@ -93,6 +93,72 @@ const splitAtLastDash = (base) => {
   return [base.slice(0, i), base.slice(i + 1)];
 };
 
+// Cargo's directory format is `{name}-{version}`, and a crate name may itself
+// contain dashes — so the boundary is wherever the remainder parses as a full
+// semver, scanning left to right. Last-dash is wrong here: build metadata may
+// contain dashes (`toml-1.1.2+spec-1.1.0`), and last-dash splits inside it,
+// inventing name `toml-1.1.2+spec` version `1.1.0` — every such crate became a
+// false miss on a healthy registry. Left-to-right first match is the same
+// resolution cargo itself uses; build metadata sits after `+`, so the earliest
+// valid remainder is the version and everything before it is the name.
+const CARGO_DIR_VERSION = /^\d+(\.\d+){1,2}(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/;
+const splitCargoDir = (base) => {
+  for (let i = base.indexOf('-'); i > 0; i = base.indexOf('-', i + 1)) {
+    const rest = base.slice(i + 1);
+    if (CARGO_DIR_VERSION.test(rest)) return [base.slice(0, i), rest];
+  }
+  return null;
+};
+
+// Does this checkout's cargo config actually build from vendor/? `cargo vendor`
+// tells you to write exactly this: a `[source.vendored-sources]` block with
+// `directory = "vendor"`, and a `replace-with` pointing at it. Without it a
+// vendor/ directory is spare evidence, not the build's source of truth.
+function cargoVendorWired(root) {
+  for (const f of ['.cargo/config.toml', '.cargo/config']) {
+    const text = read(path.join(root, f));
+    if (text && /(vendored-sources|directory\s*=\s*["']vendor["'])/.test(text)) return true;
+  }
+  return false;
+}
+
+// Crates the lockfile declares that the vendored tree itself lacks — computed
+// from the vendor listing alone, so the shared registry cache cannot mask a gap.
+// Cargo vendors one directory per crate: classic layout is `vendor/<name>-<version>`,
+// current cargo writes `vendor/<name>/` with the version in its Cargo.toml, so
+// both are read. (Reading the dir names alone indexed nothing — every dir is a
+// bare name — and the check silently compared only the shared registry cache.)
+function vendorGapOf(root, declared) {
+  const vendor = path.join(root, 'vendor');
+  if (!exists(vendor)) return null;
+  const vendorOnly = new Map();
+  const add = (name, version) => {
+    const key = normName(name);
+    if (!vendorOnly.has(key)) vendorOnly.set(key, new Set());
+    vendorOnly.get(key).add(normVersion(version));
+  };
+  for (const entry of list(vendor) || []) {
+    const parts = splitCargoDir(entry);
+    if (parts) {
+      add(parts[0], parts[1]);
+      continue;
+    }
+    const toml = read(path.join(vendor, entry, 'Cargo.toml'));
+    if (!toml) continue;
+    // The [package] section's version — not a dependency's version line.
+    const sec = /^\s*\[package\]/m.exec(toml);
+    const m = /^\s*version\s*=\s*"([^"]+)"/m.exec(toml.slice(sec ? sec.index : 0));
+    if (m) add(entry, m[1]);
+  }
+  const gap = declared.filter((d) => {
+    const versions = vendorOnly.get(normName(d.name));
+    if (!versions || !versions.size) return true;
+    return Boolean(d.version) && !versions.has(normVersion(d.version));
+  });
+  if (!gap.length) return null;
+  return { gap, wired: cargoVendorWired(root) };
+}
+
 // A directory listing, indexed as name → the versions installed there. One
 // readdir per directory, and every question answered from the listing: on a real
 // verify this runs once per claim's prerequisite, so a stat per package is
@@ -1060,10 +1126,31 @@ const crates = {
     // `registry/src` holds extracted crates and `registry/cache` the verified
     // archives; the vendored directory holds extracted ones too. Cargo builds
     // from any of them offline, so any of them counts.
-    const index = mergeIndexes(trees.map((t) => indexInstalled(list(t.dir) || [], t.cache ? ['.crate'] : null, splitAtLastDash)));
-    const ms = Date.now() - t0;
+    const index = mergeIndexes(trees.map((t) => indexInstalled(list(t.dir) || [], t.cache ? ['.crate'] : null, splitCargoDir)));
     const v = verdict({ declared, index, unit: 'crate', lockName: 'Cargo.lock', extra: `${trees.length} registry source(s) read` });
-    if (!v.missing.length && !v.stale.length) return { ok: true, ms, note: v.note };
+    // The vendored tree is its own story, not a union member. Its whole purpose
+    // is the offline build, so a crate it lacks is a defect even when the
+    // shared registry cache still has a copy — the same hole the Go vendor
+    // check closed (modules.txt promising a deleted tree). Whether the gap is a
+    // verdict depends on wiring: when .cargo/config replaces crates.io with
+    // the vendored sources, cargo never falls back to the network, so a gap is
+    // a build failure and answers no; an unwired vendor/ is spare evidence and
+    // the gap is named without judging.
+    const vendorGap = vendorGapOf(root, declared);
+    const fmt = (d) => `${d.name}${d.version ? `@${d.version}` : ''}`;
+    if (!v.missing.length && !v.stale.length) {
+      if (vendorGap) {
+        const g = vendorGap.gap.map(fmt);
+        if (vendorGap.wired) return { ok: false, ms: Date.now() - t0, note: `${g.length}/${declared.length} crate(s) missing from the vendored tree, e.g. ${g[0]} — .cargo config builds from vendor/, so the build fails there` };
+        return { ok: true, ms: Date.now() - t0, note: `${v.note}; the vendored tree lacks ${g.length} crate(s), e.g. ${g[0]} — the registry cache covers them, a vendored build would not` };
+      }
+      return { ok: true, ms: Date.now() - t0, note: v.note };
+    }
+    if (vendorGap?.wired) {
+      const g = vendorGap.gap.map(fmt);
+      return { ok: false, ms: Date.now() - t0, note: `${g.length}/${declared.length} crate(s) missing from the vendored tree, e.g. ${g[0]} — .cargo config builds from vendor/, so the build fails there` };
+    }
+    const ms = Date.now() - t0;
     // Cargo.lock covers dev-dependencies and target-specific packages too, and
     // nothing in it marks which is which: an absent crate may simply never have
     // been fetched. Reported, not judged — a verdict here would rebuild on every

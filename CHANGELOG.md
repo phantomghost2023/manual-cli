@@ -2,6 +2,19 @@
 
 All notable changes to manual-cli are documented here. Format: Keep a Changelog; versioning: SemVer.
 
+## [0.11.4] - 2026-09-22
+
+### Added
+
+- **A Node-free fallback for verify and brief** (`scripts/fallback/verify.py`, `scripts/fallback/brief.py`). A manual written on a machine with Node must stay readable — and checkable — on hosts with none: a minimal container, an air-gapped build box, a laptop with only Python. The fallback parses the same manual/v1 frontmatter and manual.yaml subset, runs command and expression checks (exit-code expectations, `exists()`, `manifest()`, `lockActive()`), re-implements the npm, yarn-1, pnpm, venv and gomod lockfile comparisons with the same yes/no/cannot-tell answers (other-platform entries skipped, uv-lock refusal honored), satisfies declared prerequisites, and stamps `state.json` with `"tool": "python-fallback"` so a later Node verify can tell the stamps apart. No sandbox, no digests, no ledger — the note says so on every run. Proven on this repo's demo (5/5 fresh, including the trap's exit-7 expectation and the ownership lockActive guards), on an npm fixture, and on a Go repo running its real 27s suite under bash.
+- **A crates.io drill against a real Rust repo** (sharkdp/bat: 316 locked crates, `cargo fetch` registry, `cargo vendor` tree). Healthy registry-cache verdict after the fix: `ok: true — 316 crate(s) present, matching Cargo.lock` in 17 ms, zero false positives; damage (deleted crate from both `src/` and `cache/`) flagged by name, repaired by `cargo fetch`.
+- **The vendored-tree gap now has an opinion.** A `vendor/` directory exists for the offline build, so a crate it lacks is a defect even when the shared `$CARGO_HOME` registry still has a copy — the same hole the Go vendor check closed, mirrored in Rust. Whether the gap is a verdict follows the wiring: when `.cargo/config` replaces crates.io with the vendored sources (exactly what `cargo vendor` instructs), the build fails there and the verifier answers `no`; an unwired `vendor/` is spare evidence, the gap is named and the answer stays `yes`. bat itself ships a rustflags-only `.cargo/config.toml`, which correctly reads as unwired.
+
+### Fixed
+
+- **The crates builtin misparsed every crate whose version carries build metadata containing a dash.** Cargo registry dirs are `name-version`, and last-dash splitting turned `toml-1.1.2+spec-1.1.0` into name `toml-1.1.2+spec`, version `1.1.0` — 5 false misses and 2 false stale on a freshly-fetched healthy registry (a 2.2% false-positive rate on bat). The split now resolves like cargo itself does: the earliest dash-remainder that parses as a full semver is the version, everything before it is the name.
+- **A deleted vendored crate was invisible behind the shared registry cache.** With both a populated `$CARGO_HOME` and a vendor tree present, the vendor listing contributed nothing unique and a removed crate still verified `ok: true` — the false-negative twin of the Go modules.txt hole. The vendored tree is now checked on its own (both cargo layouts: `name-version` dirs and current cargo's bare-name dirs with the version in Cargo.toml), and the gap is reported or judged per the wiring rule above.
+
 ## [0.11.3] - 2026-09-22
 
 ### Added

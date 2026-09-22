@@ -357,7 +357,7 @@ setup:
   | `venv` | `requirements.txt`, `poetry.lock`, `Pipfile.lock`, `uv.lock` | `.venv` (both `Lib/site-packages` and `lib/python3.x/site-packages`) | every declared distribution is installed, at the declared version |
   | `gems` | `Gemfile.lock` | `vendor/bundle` (`BUNDLE_PATH` honoured) | every `GEM` spec has a `specifications/*.gemspec` |
   | `gomod` | `go.mod` | `$GOMODCACHE`, or `vendor/modules.txt` | every required module is downloaded: source for direct dependencies, `.mod` for the module graph |
-  | `crates` | `Cargo.lock` | `$CARGO_HOME/registry`, `vendor/` | every registry package has extracted source or a verified archive |
+  | `crates` | `Cargo.lock` | `$CARGO_HOME/registry`, `vendor/` | every registry crate has extracted source or a verified archive; a crate missing from a vendored tree is judged when `.cargo/config` builds from `vendor/`, named otherwise |
   | `auto` | — | — | picks from the setup's own `evidence`, or the one lockfile in the checkout, and says which it picked |
 
   On a 403-package express tree `npm` answers in **~64ms** against **10.9s** for
@@ -478,6 +478,7 @@ it. The diagnosis is recorded in the candidate, in the journal entry, and in
   undo/*.json        # gitignored: local byte-exact undo snapshots (pruned to 20)
   cache/setup.json   # gitignored: which prerequisites this machine has satisfied
 .github/workflows/manual.yml   # written by init when .github exists
+scripts/fallback/               # node-free verify.py + brief.py for hosts without Node
 ```
 
 ## Provenance of this tool

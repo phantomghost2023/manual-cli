@@ -337,3 +337,81 @@ describe('init', () => {
     }
   });
 });
+
+describe('observe across machines (the committed ledger)', () => {
+  // The ledger is the portable half of trust: it is committed, so another
+  // machine's verify outcomes — including CI's, which are usually the slowest —
+  // are visible to every checkout. A bound computed only from state.json
+  // describes the fastest machine in the room, and CI is where a calibrated
+  // bound meets its first flake.
+  const seed = (dir, ms, machine, extra = {}) => {
+    fs.appendFileSync(
+      path.join(dir, '.manual', 'ledger.jsonl'),
+      `${JSON.stringify({ at: new Date().toISOString(), machine, id: 'tests.demo', state: 'fresh', ms, ...extra })}\n`,
+    );
+  };
+
+  test('a slow CI machine stops a tighten the laptop would have proposed', () => {
+    const dir = tmp('manual-obs-ci-tighten-');
+    const state = new State(dir);
+    state.set('tests.demo', { state: 'fresh', note: 'ok' });
+    for (let i = 0; i < 6; i++) state.pushHistory({ id: 'tests.demo', state: 'fresh', at: nowIso(), ms: 200 + i * 5 });
+    // The runner that flaked: its p90 is far above what the local tail supports.
+    for (const ms of [40000, 42000, 44000, 46000, 48000]) seed(dir, ms, 'ci-runner-7');
+    const tighten = planProposals(dir, state).find((p) => p.id === 'tests.demo' && p.kind === 'tighten');
+    assert.equal(tighten, undefined, `expected no tighten when the ledger's slowest machine would flake`);
+    cleanup(dir);
+  });
+
+  test('the slowest machine shapes the raise, and the candidate names it', () => {
+    const dir = tmp('manual-obs-ci-raise-');
+    const state = new State(dir);
+    state.set('tests.demo', { state: 'fresh', note: 'ok' });
+    for (const ms of [2000, 2100, 4000, 9000, 12000, 18000, 24000]) state.pushHistory({ id: 'tests.demo', state: 'fresh', at: nowIso(), ms });
+    for (const ms of [30000, 34000, 38000, 42000, 46000]) seed(dir, ms, 'ci-runner-7');
+    const raise = planProposals(dir, state).find((p) => p.id === 'tests.demo' && p.kind === 'raise');
+    assert.ok(raise, 'expected a raise');
+    assert.equal(raise.proposed, 51000, 'the bound clears the slowest machine, not just the laptop');
+    const written = writeProposals(dir, state, { quiet: true });
+    const text = fs.readFileSync(path.join(dir, '.manual', 'inbox', written[0].file), 'utf8');
+    assert.match(text, /ci-runner-7's 90th percentile is 46000ms against \d+ms everywhere else/);
+    assert.match(text, /plus the committed ledger across machines/);
+    cleanup(dir);
+  });
+
+  test('a bounded ledger entry — a run stopped at the bound — counts toward the raise', () => {
+    const dir = tmp('manual-obs-ci-bounded-');
+    const state = new State(dir);
+    state.set('tests.demo', { state: 'fresh', note: 'ok' });
+    for (let i = 0; i < 6; i++) state.pushHistory({ id: 'tests.demo', state: 'fresh', at: nowIso(), ms: 900 + i * 20 });
+    // CI stopped at the bound: no duration, but it is the strongest raise signal
+    // there is. A bound the tool cannot keep on the machines that run it is a
+    // bound that is already wrong.
+    seed(dir, null, 'ci-runner-7', { state: 'blocked', note: 'no exit within 30s' });
+    const raise = planProposals(dir, state).find((p) => p.id === 'tests.demo' && p.kind === 'raise');
+    assert.ok(raise, 'a timed-out CI run must raise the bound even without a duration');
+    assert.equal(raise.proposed, 36000, 'proposed from the local tail, which fits under the bound CI could not finish inside');
+    assert.equal(raise.boundedRuns, 1);
+    const written = writeProposals(dir, state, { quiet: true });
+    const text = fs.readFileSync(path.join(dir, '.manual', 'inbox', written[0].file), 'utf8');
+    assert.match(text, /1 ledger entry carries no duration/);
+    assert.match(text, /counts toward the raise/);
+    cleanup(dir);
+  });
+
+  test('a single-machine manual reads exactly as before', () => {
+    const dir = tmp('manual-obs-solo-');
+    const state = new State(dir);
+    state.set('tests.demo', { state: 'fresh', note: 'ok' });
+    for (const ms of [2000, 2100, 4000, 9000, 12000, 18000, 24000]) state.pushHistory({ id: 'tests.demo', state: 'fresh', at: nowIso(), ms });
+    const raise = planProposals(dir, state).find((p) => p.id === 'tests.demo' && p.kind === 'raise');
+    assert.ok(raise);
+    assert.equal(raise.machineShare, null);
+    assert.equal(raise.boundedRuns, 0);
+    const written = writeProposals(dir, state, { quiet: true });
+    const text = fs.readFileSync(path.join(dir, '.manual', 'inbox', written[0].file), 'utf8');
+    assert.doesNotMatch(text, /Across machines/);
+    assert.doesNotMatch(text, /committed ledger/);
+    cleanup(dir);
+  });
+});

@@ -29,10 +29,29 @@ check it recovers.
 | gomod | spf13/cobra (vendored) | 5 pkg dirs, 2 ms | **0** | the vendor hole below |
 | gomod | caddyserver/caddy (vendored, 787 pkg dirs) | 787 dirs, 379 ms | **0** (was: deleted package reported as present) | modules.txt is a manifest, not a tree — the disk is checked now |
 | gomod | spf13/cobra (module cache) · caddyserver/caddy | 4 and 169 modules | **0** | nothing; indirect/graph-only requires read `.mod`, direct ones read source |
+| crates | sharkdp/bat (`cargo fetch` registry + `cargo vendor`, 316 crates) | 316 crates, 17 ms | **0** (was **5** + 2 stale, 2.2%) | `+build-metadata` versions with dashes misparsed by last-dash splitting; a vendored gap was invisible behind the shared registry cache — see below |
 
 Damage tests ran in each drill: a deleted vendored package dir, a removed
-distribution, a bogus `require` — each flagged by name, each repaired to
-`ok: true` by the ecosystem's own installer.
+distribution, a bogus `require`, a crate removed from both `registry/src` and
+`registry/cache` — each flagged by name, each repaired to `ok: true` by the
+ecosystem's own installer.
+
+Two structural lessons the crates drill added:
+
+- **Build metadata is part of the version.** Cargo dirs are `name-version`, and
+  versions like `1.1.2+spec-1.1.0` contain dashes; last-dash splitting parsed
+  them as name `toml-1.1.2+spec`, version `1.1.0`. Five healthy crates became
+  false misses, two became false stale. The fix resolves like cargo does: the
+  earliest dash-remainder that parses as a full semver is the version.
+- **The vendored tree is not a union member.** With `$CARGO_HOME` populated and
+  `vendor/` present, deleting a vendored crate changed nothing — the shared
+  registry cache masked the gap, the false-negative twin of Go's modules.txt
+  hole. Vendor is checked on its own now (current cargo vendors bare names with
+  the version in `Cargo.toml`; classic layout is `name-version` dirs), and the
+  verdict follows the wiring: a `.cargo/config` that replaces crates.io with
+  the vendored sources makes a gap a build failure (`ok: false`); an unwired
+  vendor — bat ships a rustflags-only one — is spare evidence, the gap named
+  without judging.
 
 Two failures were found *by* the lifecycle half of the canary rather than by a
 verifier probe:
@@ -57,7 +76,7 @@ verifier probe:
 
 `.github/workflows/wild.yml` runs on release publish, monthly, and on demand:
 
-- **builtin** — eight matrix cells, each cloning a wild repo, installing the
+- **builtin** — nine matrix cells, each cloning a wild repo, installing the
   tree the way the ecosystem does, and asserting `ok: true` (or, for uv.lock,
   that a verdict is correctly withheld). Fail = false "no" on a healthy tree,
   which is always this repo's bug.

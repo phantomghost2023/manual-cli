@@ -1090,6 +1090,51 @@ describe('verifiers: crates', () => {
     assert.equal(v.ok, true);
     assert.match(v.note, /matching Cargo\.lock/);
   });
+
+  // Cargo's registry dirs are `name-version`, but the version may carry build
+  // metadata containing dashes (`1.1.2+spec-1.1.0`). Last-dash splitting parsed
+  // such crates as name `toml-1.1.2+spec` version `1.1.0` — 5 false misses and
+  // 2 false stale on a freshly-fetched healthy bat registry.
+  test('build metadata with dashes parses as a version, not a name suffix', () => {
+    const { root, home } = makeCargoRepo();
+    write(root, 'Cargo.lock', CARGO_LOCK.replace('"serde"\nversion = "1.0.228"', '"serde"\nversion = "1.1.2+spec-1.1.0"'));
+    mkdir(home, 'registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.1.2+spec-1.1.0');
+    const v = withEnv({ CARGO_HOME: home }, () => runBuiltinVerifier(root, spec({ builtin: 'crates' })));
+    assert.equal(v.ok, true);
+    assert.match(v.note, /2 crate\(s\) present, matching Cargo\.lock/);
+  });
+
+  // The vendored tree exists for the offline build, so a crate it lacks is a
+  // defect even when the shared registry cache still has a copy. Whether that
+  // is a verdict depends on wiring: with .cargo/config replacing crates.io, a
+  // gap is a build failure (no); without it, vendor/ is spare evidence and the
+  // gap is named without judging. (Found on bat: 316 crates vendored, one
+  // deleted, all green — the registry cache masked the gap.)
+  test('a vendored gap is named, and judged only when cargo builds from vendor', () => {
+    const vendored = tmp('manual-cargo-');
+    write(vendored, 'Cargo.lock', CARGO_LOCK);
+    mkdir(vendored, 'vendor/serde-1.0.228');
+    // The gap: itoa is in the lockfile and the shared registry cache, but the
+    // vendored tree (current cargo layout: bare name, version in Cargo.toml)
+    // does not have it.
+    const home = path.join(vendored, 'cargo-home');
+    mkdir(home, 'registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228');
+    mkdir(home, 'registry/src/index.crates.io-1949cf8c6b5b557f/itoa-1.0.15');
+
+    // Unwired (bat's own committed config is rustflags-only, matching this):
+    // the shared cache covers everything, so the answer stays yes — but the
+    // gap must be visible, not masked.
+    const unwired = withEnv({ CARGO_HOME: home }, () => runBuiltinVerifier(vendored, spec({ builtin: 'crates' })));
+    assert.equal(unwired.ok, true);
+    assert.match(unwired.note, /vendored tree lacks 1 crate\(s\), e\.g\. itoa@1\.0\.15/);
+
+    // Wired: cargo builds from vendor/ and never falls back, so the gap is a
+    // build failure — a definitive no.
+    write(vendored, '.cargo/config.toml', '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "vendor"\n');
+    const wired = withEnv({ CARGO_HOME: home }, () => runBuiltinVerifier(vendored, spec({ builtin: 'crates' })));
+    assert.equal(wired.ok, false);
+    assert.match(wired.note, /1\/2 crate\(s\) missing from the vendored tree, e\.g\. itoa@1\.0\.15/);
+  });
 });
 
 describe('verifiers: the plan prints which verifier will answer', () => {

@@ -912,12 +912,55 @@ Its first local run found two things a verifier probe never would have:
 Also discovered and honored: `uv sync --frozen` is the project-local install
 uv.lock repos deserve (the python prerequisite now picks the command from the
 lockfile — uv.lock, poetry.lock, then requirements.txt), and flask's repo got
-exercised with the real uv 0.12.
+exercised with the real uv 0.12.  ### The cost accounting
 
-### The cost accounting
+  A canary cell that installs caddy's vendored tree costs ~4 minutes; the pnpm
+  cell installs vuejs/core. That is why this runs on release, monthly, and on
+  demand — never per-push. The drills themselves found real bugs at a rate
+  fixtures never have: ten passes, and every false-positive class (six and
+  counting across ecosystems) was invisible until a wild repo ran the builtin.
 
-A canary cell that installs caddy's vendored tree costs ~4 minutes; the pnpm
-cell installs vuejs/core. That is why this runs on release, monthly, and on
-demand — never per-push. The drills themselves found real bugs at a rate
-fixtures never have: ten passes, and every false-positive class (six and
-counting across ecosystems) was invisible until a wild repo ran the builtin.
+## Eleventh pass: the crates drill, a red canary, and a manual that outlives Node
+
+Three threads, one lesson: the canaries earn their minutes.
+
+The **v0.11.3 canary run** came back 8/11 green, and all three red cells were
+legible — the triage the workflow was built for. Two were upstream drift:
+npm/cli's committed lockfile is out of sync at their HEAD (`npm ci` fails before
+any verifier runs), and react-router's HEAD now declares
+`packageManager: yarn@pnpm@11.7.0` — the yarn-1 cell was faithfully installing a
+tree that no longer exists. Both rows were replaced: TypeScript (npm, lockfile
+synced, suite runs in CI) and react-router pinned at the commit the local drill
+validated. The third red cell was the Python lifecycle on httpx: discovery
+proposed `tests.python` from a test layout that passes only through their
+no-dependency test helper, so a plain-`pytest` claim could not hold. Flask has
+a `[tool.pytest.ini_options]` the canary can read, so the lifecycle cell moves
+there. Two maintenance rows and one honest report is exactly the split the
+header promises; nothing in the red needed a verifier reverted.
+
+The **crates drill** (sharkdp/bat: 316 locked crates, a fetched registry and a
+vendored tree) found the two-sided failure the best drills find. The false
+positive: cargo registry dirs are `name-version`, and build metadata like
+`1.1.2+spec-1.1.0` contains dashes, so last-dash splitting parsed five healthy
+crates into phantoms. The false negative: with a populated `$CARGO_HOME` *and* a
+`vendor/` tree, deleting a vendored crate changed nothing — the shared cache
+masked the gap, the twin of Go's modules.txt hole. Both fixes carry the same
+shape as their Go ancestor: split like cargo does (earliest dash-remainder that
+parses as semver), and judge vendor on its own — with the wiring rule that a
+`.cargo/config` which replaces crates.io with the vendored sources turns a gap
+into `ok: false`, while an unwired vendor (bat ships rustflags-only) stays
+spare evidence. Healthy after: `ok: true — 316 crate(s) present` in 17 ms,
+zero false positives; damage named and repaired in both registry and vendor.
+
+The **python fallback** (`scripts/fallback/verify.py` + `brief.py`) answers the
+dependency the tool could not shake: manuals written by Node only verifiable by
+Node. The fallback is deliberately the smallest honest slice — same frontmatter,
+same command/expr checks (including `lockActive`), five lockfile builtins with
+the same report-not-judge answers (other-platform entries skipped, uv-lock
+refused), prerequisite satisfaction, and stamps marked `python-fallback` so a
+later Node verify can tell them apart. No sandbox, no digests, no ledger: the
+banner says so every run. Proven on the demo repo (5/5 fresh, trap exit-7
+expectation included) and on a Go checkout running its real 27-second suite
+under bash. The doctrine: a manual's truth should not need the tool that wrote
+it to be installable.
+

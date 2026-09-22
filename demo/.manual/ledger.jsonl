@@ -1,1 +1,6 @@
 {"at":"2026-09-21T23:10:43.155Z","machine":"BainBeats","id":"tests.demo","state":"fresh","tier":"silver","ms":539,"passes":5,"machines":["BainBeats"],"reason":"pass-milestone"}
+{"at":"2026-09-22T23:29:08.754Z","machine":"BainBeats","id":"ownership.src-db","state":"fresh","tier":"silver","ms":244,"passes":1,"machines":["BainBeats"],"reason":"new-machine"}
+{"at":"2026-09-22T23:29:08.754Z","machine":"BainBeats","id":"tooling.node-esm","state":"fresh","tier":"silver","ms":0,"passes":1,"machines":["BainBeats"],"reason":"new-machine"}
+{"at":"2026-09-22T23:29:08.754Z","machine":"BainBeats","id":"tests.demo","state":"fresh","tier":"silver","ms":392,"passes":6,"machines":["BainBeats"],"reason":"new-machine,pass-milestone"}
+{"at":"2026-09-22T23:29:08.754Z","machine":"BainBeats","id":"policy.tests-registered","state":"fresh","tier":"silver","ms":151,"passes":1,"machines":["BainBeats"],"reason":"new-machine"}
+{"at":"2026-09-22T23:29:08.754Z","machine":"BainBeats","id":"traps.reporter-pipe","state":"fresh","tier":"silver","ms":252,"passes":1,"machines":["BainBeats"],"reason":"new-machine"}

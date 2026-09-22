@@ -3,6 +3,7 @@ import path from 'node:path';
 import { nowIso, parseTtl } from './util.js';
 import { loadManual } from './claims.js';
 import { readInbox } from './inbox.js';
+import { mergedEvents, slowestMachineShare, boundedLedgerRuns } from './observe-machines.js';
 
 // The automated flywheel: read verify stamps + measurement history from
 // state.json, and write inbox candidates when reality diverges from claims.
@@ -217,7 +218,7 @@ function roundBound(ms) {
   return Math.ceil(ms / 1000) * 1000;
 }
 
-export function planProposals(root, state) {
+export function planProposals(root, state, { quiet = false } = {}) {
   const { claims } = loadManual(root);
   const proposals = [];
 
@@ -232,24 +233,29 @@ export function planProposals(root, state) {
     // Recalibration needs a stable picture: at least 3 measured runs, and a
     // bound to reason against. `supported` is what the accumulated history
     // argues for; the direction is a comparison, not a second heuristic.
+    //
+    // The history is multi-machine when the ledger has entries: state.json's
+    // history is the laptop that wrote it, and a CI runner is usually the slower
+    // machine a calibrated bound meets first. Computing the bound from local runs
+    // alone describes the fastest machine in the room. The ledger also has
+    // *bounded* entries (runs stopped at the bound, which carry no duration) — a
+    // timed-out CI run is the strongest possible raise signal, and it must not
+    // need a duration to be heard.
     if (st.samples >= 3 && bound && st.p50 !== null) {
+      const machineEvents = mergedEvents(state, root, id);
+      const share = slowestMachineShare(machineEvents);
+      // Bounded runs are timed out *at the bound*; they carry no duration but
+      // say more than any number: the bound already failed somewhere.
+      const bounded = boundedLedgerRuns(root, id).length;
       const supported = proposeBound(st);
-      if (supported < bound && st.p50 < bound * 0.5) {
-        proposals.push({
-          kind: 'tighten',
-          id,
-          measured: st.p50,
-          p50: st.p50,
-          p90: st.p90,
-          max: st.max,
-          bound,
-          proposed: supported,
-          samples: st.samples,
-          diagnosis,
-        });
-      } else if (supported > bound && needsRaise(st, bound)) {
-        // The suite grew slower than the bound without ever breaking it. Waiting
-        // for the break means the first honest signal is a false alarm.
+      // The proposed bound must hold on the slowest machine, not only here:
+      // the local tail argues for the floor, the ledger's slowest machine for
+      // anything above it.
+      const supportedEverywhere = share ? roundBound(Math.max(supported, share.p90 * 1.1)) : supported;
+      // A bounded run outranks a tighten: the bound is not merely loose, it
+      // already stopped a run somewhere. A bound that killed a run needs more
+      // than a token raise, hence the 1.2x floor on the failed bound.
+      if (bounded > 0) {
         proposals.push({
           kind: 'raise',
           id,
@@ -258,9 +264,51 @@ export function planProposals(root, state) {
           p90: st.p90,
           max: st.max,
           bound,
-          proposed: supported,
+          proposed: roundBound(Math.max(supportedEverywhere, bound * 1.2)),
           samples: st.samples,
           diagnosis,
+          machineShare: share,
+          boundedRuns: bounded,
+        });
+      } else if (supported < bound && st.p50 < bound * 0.5) {
+        // A slow CI machine argues against tightening: the bound the laptop's
+        // numbers support would flake on the runner. The tighten is only
+        // written when every machine's story fits under it.
+        const fitsAllMachines = !share || supported >= share.p90 * 1.1;
+        if (fitsAllMachines) {
+          proposals.push({
+            kind: 'tighten',
+            id,
+            measured: st.p50,
+            p50: st.p50,
+            p90: st.p90,
+            max: st.max,
+            bound,
+            proposed: supported,
+            samples: st.samples,
+            diagnosis,
+            machineShare: share,
+          });
+        } else if (!quiet) {
+          console.log(`↔ not tightening ${id}: ${share.machine}'s p90 is ${share.p90}ms, above the ${supported}ms the local tail supports — the ledger's slowest machine would flake`);
+        }
+      } else if (supportedEverywhere > bound && needsRaise(st, bound)) {
+        // Two warrants live in the branches above: a run stopped AT the bound
+        // (proof the bound already failed, needing no duration), and the tail
+        // outgrowing it (the raise fires before a legitimate run fails).
+        proposals.push({
+          kind: 'raise',
+          id,
+          measured: st.p50,
+          p50: st.p50,
+          p90: st.p90,
+          max: st.max,
+          bound,
+          proposed: roundBound(Math.max(supportedEverywhere, bound * 1.2)),
+          samples: st.samples,
+          diagnosis,
+          machineShare: share,
+          boundedRuns: bounded,
         });
       }
     }
@@ -355,8 +403,17 @@ export function writeProposals(root, state, { quiet = false } = {}) {
     const dominant = dom
       ? `\nThe runtime is dominated by a single test, so consider fixing or splitting it rather\nthan only adjusting this bound.`
       : '';
+    // Whose story the bound now tells. The multi-machine line is only added
+    // when the ledger actually contributes, so a single-machine manual's
+    // candidates read exactly as they did before.
+    const machineLine = p.machineShare
+      ? `\nAcross machines: ${p.machineShare.machine}'s 90th percentile is ${p.machineShare.p90}ms against ${p.machineShare.othersP90}ms everywhere else — the slowest machine is the one this bound must hold on.`
+      : '';
+    const boundedLine = p.boundedRuns
+      ? `\n${p.boundedRuns} ledger entr${p.boundedRuns === 1 ? 'y' : 'ies'} carr${p.boundedRuns === 1 ? 'ies' : 'y'} no duration: run${p.boundedRuns === 1 ? '' : 's'} stopped at the bound itself. Untested is not no-data — ${p.boundedRuns === 1 ? 'it counts' : 'they count'} toward the raise.`
+      : '';
     const recalibrated = `This also rewrites the claim's recorded measurement to ${p.p50}ms — the median of
-${p.samples} runs — replacing the single probe init took the day the claim was written.`;
+${p.samples} runs — replacing the single probe init took the day the claim was written.${machineLine}${boundedLine}`;
     const body =
       p.kind === 'tighten'
         ? `Recent runs: ${tail}. The claim allows ${p.bound}ms.${why}
@@ -365,9 +422,15 @@ Propose tightening to ${p.proposed}ms — at least 3x the median, 1.5x the 90th 
 variance does not.${dominant}
 ${recalibrated}`
         : p.kind === 'raise'
-          ? `Recent runs: ${tail}. The claim allows ${p.bound}ms and the tail no longer fits under it.
-${p.max >= p.bound ? `The worst run (${p.max}ms) already meets the bound, so this claim is one busy machine
-away from breaking on a run that is not a regression.` : `The 90th percentile (${p.p90}ms) is crowding the bound, so the next slow day trips it.`}${why}
+          ? `Recent runs: ${tail}. The claim allows ${p.bound}ms.
+${p.boundedRuns > 0 && p.max < p.bound
+  ? `A run on another machine was stopped at the bound itself — the bound has already failed somewhere.
+Every run here still fits, which is exactly how an already-wrong bound looks from the fast machine.`
+  : p.max >= p.bound
+    ? `The tail no longer fits under it: the worst run (${p.max}ms) already meets the bound, so this claim is
+one busy machine away from breaking on a run that is not a regression.`
+    : `The tail no longer fits under it: the 90th percentile (${p.p90}ms) is crowding the bound, so the next
+slow day trips it.`}${why}
 Propose raising to ${p.proposed}ms now — before a legitimate run fails and has to be triaged as
 one. If the growth is real, the code is the thing to look at; the bound only has to
 stop lying about it in the meantime.${dominant}
@@ -393,7 +456,7 @@ observation:
   p90_ms: ${p.p90}
   worst_ms: ${p.max}
   diagnosis: "${(p.diagnosis || []).map((d) => d.kind).join(', ') || 'none'}"
-  evidence: "verify history in state.json; ${p.kind} proposal vs ${p.bound}ms bound"
+  evidence: "verify history in state.json${p.machineShare ? ' plus the committed ledger across machines' : ''}; ${p.kind} proposal vs ${p.bound}ms bound"
 review:
   needed: human-approve
 ---
