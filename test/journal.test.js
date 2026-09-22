@@ -270,9 +270,14 @@ test('a corrupt ledger line is ignored rather than fatal', () => {
   }
 });
 
-test('entryId is filename-safe and ordered', () => {
+test('entryId is filename-safe, ordered, and collision-proof within a second', () => {
   const id = entryId('2026-09-21T19:03:21.430Z', 'tests.demo');
-  assert.equal(id, 'T190321Z-tests.demo'.replace('T190321Z', '20260921T190321Z'));
+  assert.match(id, /^20260921T190321Z-tests\.demo-/);
   assert.ok(!/[:\/\\]/.test(id));
   assert.ok(entryId('2026-09-21T19:03:22Z', 'x') > id);
+  // Two entries in the same millisecond must not share a filename — the old
+  // second-resolution id let a revert overwrite the accept it recorded.
+  const a = entryId('2026-09-21T19:03:21.430Z', 'tests.demo');
+  const b = entryId('2026-09-21T19:03:21.430Z', 'tests.demo');
+  assert.notEqual(a, b);
 });

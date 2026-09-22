@@ -24,7 +24,14 @@ export function journalDir(root) {
 const stamp = (iso) => iso.replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
 
 export function entryId(at, claim) {
-  return `${stamp(at)}-${claim || 'unknown'}`;
+  // Millisecond precision, and a 3-char disambiguator when two entries for the
+  // same claim land in the same millisecond. The old second-resolution id made
+  // an accept and its immediate revert collide: same second, same id, and the
+  // revert's write silently overwrote the accept it was recording — an entry
+  // count that looked right and a journal that had lost the original. First
+  // seen on ubuntu CI, where a revert follows its accept within milliseconds;
+  // slower machines passed by latency luck.
+  return `${stamp(at)}-${claim || 'unknown'}-${Math.random().toString(36).slice(2, 5)}`;
 }
 
 export function entryPath(root, id) {

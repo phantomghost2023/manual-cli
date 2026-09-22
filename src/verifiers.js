@@ -865,6 +865,11 @@ const gomod = {
   trees: ['$GOMODCACHE', 'vendor'],
   available(root, spec) {
     if (!exists(path.join(root, 'go.mod'))) return 'no go.mod in this checkout to compare the module cache against';
+    // A vendored build reads the vendor tree, not the module cache —
+    // vendor/modules.txt is the evidence — so a cache-less machine (a fresh
+    // CI runner, a container) can still verify it. Found on the first ubuntu
+    // CI run: the gate below demanded a cache even for vendored checks.
+    if (exists(path.join(root, 'vendor', 'modules.txt'))) return null;
     if (!goModCache(spec)) return 'no Go module cache found (GOMODCACHE, GOPATH/pkg/mod, ~/go/pkg/mod) — declare one with { builtin: gomod, modcache: <dir> }';
     return null;
   },
