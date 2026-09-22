@@ -104,6 +104,29 @@ test('a workspaces monorepo discovers its test suite even without a root src/ or
   }
 });
 
+test('a pnpm-workspace monorepo discovers its test suite too', async () => {
+  // Found on a real repo (vuejs/core): pnpm monorepos declare packages in
+  // pnpm-workspace.yaml, not package.json, so the package.json-only check
+  // still proposed nothing on one of the largest test suites in the wild.
+  const dir = fixture({
+    name: 'p',
+    version: '1.0.0',
+    packageManager: 'pnpm@9.0.0',
+    scripts: { test: 'node --test' },
+  }, {
+    'pnpm-workspace.yaml': "packages:\n  - 'packages/*'\n",
+    'packages/a/src/index.js': 'export const x = 1;\n',
+    'packages/a/test/a.test.js': 'import { test } from "node:test"; test("ok", () => {});\n',
+  });
+  try {
+    init(dir, {});
+    const { fm } = readCandidate(dir, 'init-tests.suite.md');
+    assert.equal(fm.id, 'tests.suite');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('probing is idempotent and skips anything that is not an init candidate', async () => {
   const dir = fixture({ name: 'p', version: '1.0.0', scripts: { test: 'node --test' } }, {
     'test/a.test.js': 'import { test } from "node:test"; test("ok", () => {});\n',

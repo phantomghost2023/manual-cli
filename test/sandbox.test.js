@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execSync } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
 import { verify } from '../src/verify.js';
+import { Sandbox } from '../src/sandbox.js';
 import { State } from '../src/state.js';
 
 // Regression: the manual lives in a subdirectory of a git repo, and its
@@ -53,6 +54,55 @@ The overlay file is visible from the nested working directory.
     const res = await verify(nested, { state, force: true });
     const probe = res.results.find((r) => r.claim.fm.id === 'probe.untracked');
     assert.equal(probe.stamp.state, 'fresh'); // would be broken without cwd/overlay fixes
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+});
+
+// Regression from a real drill on vuejs/core: on Windows the check's node.exe
+// can still hold handles when teardown's recursive delete runs, so rmSync died
+// with EBUSY *after* the checks had run — and because exit() runs before the
+// caller saves state, the whole verify crashed and lost the stamps it had just
+// computed. Teardown must be best-effort, never fatal.
+describe('sandbox: teardown is best-effort', () => {
+  test('exit() survives a worktree that cannot be deleted', async () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'manual-sbx2-'));
+    fs.mkdirSync(path.join(repo, '.manual'), { recursive: true });
+    fs.writeFileSync(path.join(repo, '.manual', 'keep.md'), 'so the fixture has something to commit');
+    const g = (args) =>
+      execSync(`git ${args}`, { cwd: repo, stdio: ['ignore', 'pipe', 'pipe'] });
+    g('init -q');
+    g('-c user.email=t@t -c user.name=t add .manual');
+    g('-c user.email=t@t -c user.name=t commit -qm init');
+
+    const sb = new Sandbox(repo);
+    await sb.enter();
+    assert.equal(sb.mode, 'worktree');
+    const wt = sb.wt;
+
+    let child = null;
+    if (process.platform === 'win32') {
+      // A live process whose cwd is inside the worktree holds it: the
+      // recursive delete dies with EBUSY. This is exactly the shape of the
+      // original failure (a check's node.exe still exiting).
+      child = spawn(process.execPath, ['-e', 'setTimeout(()=>{},10000)'], {
+        cwd: wt,
+        stdio: 'ignore',
+      });
+      await new Promise((r) => setTimeout(r, 500));
+    }
+
+    await sb.exit(); // must not throw — the failure must stay a warning
+
+    if (child) {
+      child.kill();
+      await new Promise((r) => setTimeout(r, 300));
+      // The locked directory legitimately survives exit(); clean it up here
+      // so the temp dir does not fill across runs.
+      fs.rmSync(wt, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    } else {
+      assert.ok(!fs.existsSync(wt), 'posix: worktree should be fully removed');
+    }
+    execSync('git worktree prune', { cwd: repo, stdio: 'ignore' });
     fs.rmSync(repo, { recursive: true, force: true });
   });
 });

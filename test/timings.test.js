@@ -150,6 +150,32 @@ test('a check with no per-test output records no timing fields', async () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test('a check stopped by its time bound is blocked — untested, not false', async () => {
+  // Stamping a killed run "broken exit ?" blamed the claim for what is really
+  // an environment judgment call (the bound). vuejs/core's suite needs ~5
+  // minutes against the default 120s: the honest stamp is blocked.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'manual-timeout-'));
+  fs.mkdirSync(path.join(root, '.manual', 'claims'), { recursive: true });
+  const state = new State(root);
+  const claim = {
+    check: { run: 'node -e "setTimeout(()=>{},60000)"', expect: { exit: 0, max_ms: 300 } },
+    fm: { id: 'tests.slow', kind: 'command', check: { expect: { exit: 0, max_ms: 300 } }, provenance: {} },
+    digest: 'sha256:slow',
+    fileCount: 0,
+  };
+  const r = await verifyOne(claim, root, state, {});
+  assert.equal(r.stamp.state, 'blocked');
+  assert.match(r.stamp.note, /untested, not false/);
+  // The child was killed moments ago; on Windows its handle can outlive the
+  // kill for a beat, so give it a grace period before removing the tree.
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  try {
+    fs.rmSync(root, { recursive: true, force: true });
+  } catch {
+    // Still held — it is in the OS temp dir; Windows will reap it shortly.
+  }
+});
+
 test('history marks whether a run followed a change to the evidence', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'manual-digest-'));
   fs.mkdirSync(path.join(root, '.manual', 'claims'), { recursive: true });

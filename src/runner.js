@@ -108,6 +108,10 @@ export async function runCheck(claim, root, { sandbox, timeoutMs, noSetup = fals
       ok,
       value: r.exit,
       exit: r.exit,
+      // A check that never exited is a different fact from one that failed:
+      // "exit null" alone reads as a bug in the tool, not in the claim.
+      timedOut: Boolean(r.timedOut),
+      killed: Boolean(r.killed),
       ms,
       setups,
       stdout: out.slice(0, 4000),
@@ -196,6 +200,14 @@ export function interpret(claim, result) {
       return { state: 'blocked', note };
     }
     if (kind === 'trap') return { state: 'broken', note: 'gotcha no longer reproduces' };
+    // A check that was stopped by its time bound never produced a verdict —
+    // "broken exit ?" would blame the claim for what is really an environment
+    // judgment call (the bound). Same reasoning as the blocked-setup case
+    // above: the claim is untested, not false. Measured on vuejs/core, whose
+    // suite needs ~5 minutes against the default 120s bound.
+    if (result.timedOut) {
+      return { state: 'blocked', note: `no exit within ${Math.round((result.ms || 0) / 1000)}s — untested, not false; raise max_ms if this check needs longer` };
+    }
     return { state: 'broken', note: result.error || `exit ${result.exit ?? '?'}` };
   }
   return { state: 'fresh', note: result.ms != null ? `${result.ms}ms` : 'ok' };

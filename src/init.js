@@ -146,11 +146,19 @@ const SYSTEM_BINS = /^(node|nodejs|deno|bun|python|python3|pytest|go|cargo|make|
 // repo with one of the largest test suites in the ecosystem. A workspaces
 // declaration is itself evidence that packages with code exist, so it counts;
 // the check either runs or is probed broken, and a human decides.
+//
+// Found on a second real repo (vuejs/core): pnpm monorepos declare their
+// packages in `pnpm-workspace.yaml`, not in package.json — the first fix read
+// only `workspaces`, so the same blind spot existed for the other half of the
+// wild. The file must actually declare `packages:` (it can exist for `catalog:`
+// alone), same evidence bar as before.
 export function hasTestSources(root, pkg = null) {
   const p = pkg || readJson(path.join(root, 'package.json')) || {};
   if (['test', 'tests', 'src', 'lib'].some((d) => fs.existsSync(path.join(root, d)))) return true;
   const ws = p.workspaces;
-  return Array.isArray(ws) ? ws.length > 0 : !!(ws && typeof ws === 'object' && Array.isArray(ws.packages) && ws.packages.length > 0);
+  if (Array.isArray(ws) ? ws.length > 0 : !!(ws && typeof ws === 'object' && Array.isArray(ws.packages) && ws.packages.length > 0)) return true;
+  const pnpmWs = path.join(root, 'pnpm-workspace.yaml');
+  return fs.existsSync(pnpmWs) && /^packages:/m.test(safeRead(pnpmWs));
 }
 
 // The repo's own "run the tests" entry point, in whatever manager it uses.
@@ -430,7 +438,11 @@ export async function probeCandidates(root, { timeoutMs = 20000, quiet = false, 
       }
       const probe = {
         state: r.ok ? 'fresh' : r.blocked ? 'blocked' : 'broken',
-        note: r.ok ? `${r.ms ?? '?'}ms` : (r.error || `exit ${r.exit}`),
+        // "exit null" is what a killed process leaves behind, and it reads as
+        // a bug in the tool. Found on a real repo (vuejs/core): a five-minute
+        // vitest suite against a two-minute cap — the probe's verdict was
+        // right, but the note has to say what actually happened.
+        note: r.ok ? `${r.ms ?? '?'}ms` : (r.error || (r.timedOut ? `no exit within ${Math.round((r.ms || 0) / 1000)}s — the check ran longer than its ${r.expect?.max_ms || 'default'}s bound and was stopped` : `exit ${r.exit}`)),
         ms: r.ms ?? null,
       };
       const next = {

@@ -55,6 +55,23 @@ The manual/v1 schema is load-bearing for every repo using it. New fields must be
 - Sandbox tests create real git repos in temp dirs; they skip nothing and clean up after themselves.
 - Windows is a first-class platform (the project was built on it); use `path.join` and forward-slash normalization in glob land.
 
+## Brand images (hero + social preview)
+
+Both cards derive from one design and must stay in sync with each other:
+
+- `docs/hero.svg` — the README banner (1200×600, rounded corners allowed)
+- `docs/social-preview.svg` → `docs/social-preview.png` — the GitHub social card (**exactly 1200×630**; GitHub crops anything else)
+
+To regenerate after editing either SVG:
+
+```bash
+rsvg-convert -w 1200 -h 630 docs/social-preview.svg -o docs/social-preview.png
+```
+
+(Any renderer works — Inkscape, ImageMagick, a headless browser screenshot. `rsvg-convert` is what was used originally.) Then eyeball the PNG at card size before committing: zoom the browser out to ~40% and check the wordmark, the claim → check → verdict pipeline, and the verifier chips all stay legible. If you edit the hero, mirror any *content* changes (new commands, new ecosystems, new tiers) in the social SVG and re-render; the social card is the version other sites show, so a stale one mislabels the project everywhere links unfurl.
+
+Uploading the social card is UI-only: open the repo's **Settings → General → Social preview** and drag in `docs/social-preview.png`. GitHub offers no API for this (deliberately requested many times; still true), so it cannot be automated — and the card is committed here precisely so the canonical bytes survive independent of that setting.
+
 ## Releasing
 
 1. Bump version in `package.json`, move `[Unreleased]` → `## [x.y.z] - date` in CHANGELOG.

@@ -1,10 +1,14 @@
 # manual-cli
 
+[![manual](https://github.com/phantomghost2023/manual-cli/actions/workflows/manual.yml/badge.svg)](https://github.com/phantomghost2023/manual-cli/actions/workflows/manual.yml)
+
 ![manual-cli: the repository that checks itself](docs/hero.svg)
 
 **Self-verifying repository operating manual** — every claim about a repo is backed by an executable check, stamped fresh/stale/broken/blocked in `state.json`, and compiled into token-budgeted session briefs.
 
 Zero dependencies. Node >= 20. No install needed.
+
+> Linked from somewhere? This card is the repo's social preview: the repository's own claims, checked by its own tool — see [docs/social-preview.png](docs/social-preview.png) for the standalone image.
 
 ## How it fits together
 
@@ -483,7 +487,7 @@ The demo ships a genuine trap discovered while building it: `node --test --test-
 ## Test
 
 ```bash
-npm test        # 250 tests across 49 suites (seeded fuzzing, real-git integration, HTTP end-to-end)
+npm test        # 259 tests across 50 suites (seeded fuzzing, real-git integration, HTTP end-to-end)
 npm run bench   # 500-claim scale benchmark (see numbers below)
 ```
 

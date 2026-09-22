@@ -254,42 +254,176 @@ const npm = {
 
 // The `packages:` section lists every package the lock resolves. pnpm 8 and
 // earlier wrote the same list as `/name/version`; those keys are normalized to
-// the modern `name@version` so one parser covers both.
-function pnpmPackages(text) {
-  const out = [];
-  let inPackages = false;
-  let old = false;
-  for (const raw of String(text).split(/\r?\n/)) {
-    if (/^packages:/.test(raw)) {
-      inPackages = true;
-      continue;
-    }
-    if (inPackages && /^\S/.test(raw)) {
-      inPackages = false;
-      continue;
-    }
-    if (!inPackages) continue;
-    const m = /^ {2}'?(.+?)'?:\s*$/.exec(raw);
-    if (!m) continue;
-    const key = m[1];
-    if (key.startsWith('/')) {
-      // `/@scope/name/1.2.3` — the version is the last path segment.
-      const parts = key.slice(1).split('/');
-      const version = parts.pop();
-      out.push({ name: parts.join('/'), version });
-      old = true;
-      continue;
-    }
-    const at = key.lastIndexOf('@');
-    if (at <= 0) continue;
-    out.push({ name: key.slice(0, at), version: key.slice(at + 1) });
-  }
-  return { packages: out, old };
+// the modern `name@version` so one parser covers both. `snapshots:` names the
+// same packages and is where `optional: true` lives, so both sections are read
+// and merged: a package not expected on this machine in either place is skipped
+// everywhere. Found on a real vuejs/core drill: 15 of 660 lockfile entries were
+// `@pnpm/exe.<other-platform>` binaries, which a satisfied install on Windows
+// never materializes — counting them "missing" turned the verifier's yes into
+// permanent noise.
+// A quoted scalar can contain `: ` and `#` — unquote the outer pair, with YAML
+// single-quote doubling (`''` -> `'`) handled.
+function unquoteYamlKey(k) {
+  if (k.length >= 2 && k.startsWith("'") && k.endsWith("'")) return k.slice(1, -1).replace(/''/g, "'");
+  if (k.length >= 2 && k.startsWith('"') && k.endsWith('"')) return k.slice(1, -1).replace(/\\"/g, '"');
+  return k;
 }
 
-// A package's directory in the virtual store: `/` in a scope becomes `+`. The
-// peer-dependency variants get an `_peer@version` suffix, so a package that was
-// resolved with peers still counts as present.
+export function pnpmPackages(text) {
+  const packages = [];
+  const snapFlags = new Map(); // snapshots: key -> flags, merged into packages below
+  const snapKeys = []; // every snapshots: key, in order — the dir-name source
+  let section = null;
+  let old = false;
+  let last = null; // entry (packages) or key string (snapshots) a flag line applies to
+  const put = (e, flag, rest) => {
+    if (flag === 'optional') {
+      if (/\btrue\b/.test(rest)) e.skip = true;
+      return;
+    }
+    const arr = /^\s*\[(.*)\]\s*$/.exec(rest);
+    if (arr) {
+      e[flag] = arr[1]
+        .split(',')
+        .map((s) => s.trim().replace(/^['"]|['"]$/g, ''))
+        .filter(Boolean);
+    }
+  };
+  for (const raw of String(text).split(/\r?\n/)) {
+    if (/^\S/.test(raw)) {
+      // Section headers end with `:` and can be quoted (`'packages:'` on pnpm
+      // 12), so match on the unquoted word rather than a bare `^packages:`.
+      const head = raw.trim().replace(/:$/, '').replace(/^'|'$/g, '');
+      section = head === 'packages' ? 'packages' : head === 'snapshots' ? 'snapshots' : null;
+      continue;
+    }
+    if (!section) continue;
+    const flag = /^ {4}(optional|os|cpu|libc):(.*)$/.exec(raw);
+    if (flag && last) {
+      if (section === 'packages') {
+        put(last, flag[1], flag[2]);
+      } else {
+        // snapshots: `last` is a key string; park its flags until the merge below.
+        let sf = snapFlags.get(last);
+        if (!sf) {
+          sf = {};
+          snapFlags.set(last, sf);
+        }
+        put(sf, flag[1], flag[2]);
+      }
+      continue;
+    }
+    // Exactly two spaces: a nested four-space key (`dependencies:` inside a
+    // snapshot entry) must not be mistaken for a section key — it used to
+    // reset `last`, so the `optional: true` that followed landed on a junk key
+    // and the package stayed "expected". Found on a real vuejs/core lock.
+    const key = /^ {2}([^ ].*?):\s*$/.exec(raw);
+    if (!key) continue;
+    const k = unquoteYamlKey(key[1]);
+    if (section === 'packages') {
+      const entry = { name: '', version: '', skip: false };
+      if (k.startsWith('/')) {
+        // `/@scope/name/1.2.3` — the version is the last path segment.
+        const parts = k.slice(1).split('/');
+        entry.version = parts.pop();
+        entry.name = parts.join('/');
+        old = true;
+      } else {
+        const at = k.lastIndexOf('@');
+        if (at <= 0) { last = null; continue; }
+        entry.name = k.slice(0, at);
+        entry.version = k.slice(at + 1);
+      }
+      packages.push(entry);
+      last = entry;
+    } else {
+      last = k; // snapshots keys are read for their flags and dir spelling
+      snapKeys.push(k);
+    }
+  }
+  // The snapshots section is where a package's real install identity lives:
+  // its key spells the peer set as `(peer@ver)(peer2@ver2)`, which is exactly
+  // what pnpm names the store directory after (plus `optional: true` and the
+  // platform flags, which a packages-section entry may lack). Collect both:
+  // flags merge into the packages entry, keys record the peer-resolved forms.
+  const snaps = new Map(); // base `name@version` -> array of snapshot keys
+  for (const key of snapKeys) {
+    const base = key.replace(/\([^)]*\)/g, '');
+    if (!snaps.has(base)) snaps.set(base, []);
+    if (!snaps.get(base).includes(key)) snaps.get(base).push(key);
+  }
+  for (const p of packages) {
+    const base = `${p.name}@${p.version}`;
+    const keys = snaps.get(base);
+    const sf = snapFlags.get(base);
+    if (sf) {
+      if (sf.skip) p.skip = true;
+      for (const f of ['os', 'cpu', 'libc']) if (sf[f] && !p[f]) p[f] = sf[f];
+    }
+    if (keys?.length) p.snaps = keys;
+  }
+  return { packages, old };
+}
+
+// vuejs/core pins `packageManager: pnpm@12.4.2`, and pnpm records that pin as
+// a lockfile entry — but the package manager itself never materializes into
+// the project's virtual store; it lives in pnpm's own home. A lockfile entry
+// matching the packageManager pin is self-referential, not missing. Found on
+// the same vuejs/core drill as the platform skip above.
+function pnpmSelfRef(root) {
+  const pkg = read(path.join(root, 'package.json')) || '';
+  const m = /"packageManager"\s*:\s*"[^"]*pnpm@([^"]+)"/.exec(pkg);
+  return m ? `pnpm@${m[1]}` : null;
+}
+
+// A package whose lockfile entry constrains it to another platform is not
+// missing from this tree — it was never supposed to be here. `libc` is always
+// skipped: this tool does not detect glibc vs musl, and being wrong in either
+// direction is worse than reporting.
+function pnpmPlatformSkip(entry) {
+  const here = (v) =>
+    v === process.platform || v === process.arch;
+  for (const field of ['os', 'cpu', 'libc']) {
+    const list = entry[field];
+    if (!Array.isArray(list) || !list.length) continue;
+    if (field === 'libc') return true;
+    // pnpm allows negation: `os: [!win32]` means "everything but win32".
+    if (list.some((v) => typeof v === 'string' && v.startsWith('!') && here(v.slice(1)))) return true;
+    if (!list.includes(process.platform) && !list.includes(process.arch)) return true;
+  }
+  return false;
+}
+
+// Same package set, ignoring order and duplicates — for comparing two
+// serializations of one lockfile (see the copy check in the pnpm verifier).
+function setEquals(a, b) {
+  if (a.length !== b.length) return false;
+  const key = (p) => `${p.name}@${p.version}`;
+  const bs = new Set(b.map(key));
+  return a.every((p) => bs.has(key(p)));
+}
+
+// The virtual store's directory names, from a lockfile entry's own spelling.
+// pnpm 11 named each dir `name@version`; pnpm 12 names them after the
+// *snapshot* key — the peer-resolved form — with the peer set joined by `_`:
+// `vite@8.3.0_@types+node@24.1_7c905f…`. Scoped `/` becomes `+`. When that key
+// exceeds 60 characters, pnpm truncates it to the first 27 and appends `_` +
+// sha256(key)[:32] — both rules proven against a real vuejs/core store
+// (19/19 hash dirs matched, 0 store dirs uncovered after the change).
+const pnpmDirKeys = (entry) => {
+  const base = `${entry.name.replace(/\//g, '+')}@${entry.version}`;
+  const forms = new Set([base]);
+  for (const snap of entry.snaps || []) {
+    const peers = [...snap.matchAll(/\(([^)]*)\)/g)].map((m) => m[1].replace(/\//g, '+')).join('_');
+    const full = base + (peers ? `_${peers}` : '');
+    forms.add(full);
+    if (full.length > 60) forms.add(full.slice(0, 27) + '_' + sha256(full).slice(0, 32));
+  }
+  return forms;
+};
+
+// A store dir counts as its base form when it carries a peer suffix, so a
+// package installed once in any peer variant is present.
 const pnpmStoreKeys = (names) => {
   const out = new Set();
   for (const n of names || []) {
@@ -316,24 +450,66 @@ const pnpm = {
     const storeNames = list(storeDir);
     const { packages, old } = pnpmPackages(read(lockPath) || '');
     const dirFor = (p) => `${p.name.replace(/\//g, '+')}@${p.version}`;
-    const notInStore = (names) => (old || !names ? [] : packages.filter((p) => !pnpmStoreKeys(names).has(dirFor(p))));
+    const selfRef = pnpmSelfRef(root);
+    const selfCount = selfRef ? packages.filter((p) => dirFor(p) === selfRef).length : 0;
+    // A package constrained to another platform (or marked optional) is not
+    // missing from this tree — it was never expected here. The packageManager
+    // self-reference is excluded for the same reason. Both counted separately
+    // so the report can say how much was skipped and why.
+    const expected = packages.filter((p) => !p.skip && !pnpmPlatformSkip(p) && (!selfRef || dirFor(p) !== selfRef));
+    const skipped = packages.length - expected.length - selfCount;
+    const notInStore = (names) =>
+      old || !names
+        ? []
+        : expected.filter((p) => {
+            const forms = pnpmDirKeys(p);
+            // pnpm 11: dir `name@ver` or `name@ver_peer…` — base-alias covers it.
+            // pnpm 12: dir is a snapshot-derived form, possibly hash-truncated.
+            return ![...forms].some((f) => pnpmStoreKeys(names).has(f));
+          });
     const copy = path.join(storeDir, 'lock.yaml');
-    const copyMatches = exists(copy) && sha256(read(lockPath) || '') === sha256(read(copy) || '');
+    // pnpm records the lockfile it installed from as node_modules/.pnpm/lock.yaml.
+    // On pnpm 11 the copy is byte-identical; on pnpm 12 it is a re-serialization
+    // (no `---` header, settings interleaved) of the same package set, so byte
+    // equality would misjudge every healthy pnpm-12 tree. The packages are what
+    // was installed from, so that set is what is compared.
+    const copyPackages = exists(copy) ? pnpmPackages(read(copy) || '') : null;
+    // pnpm 11 writes the copy verbatim; pnpm 12 re-serializes it filtered to
+    // packages plausibly relevant to this machine (measured on vuejs/core: 645
+    // of 660 — exactly the other-OS binaries dropped). Neither equality holds
+    // on pnpm 12, so the check is subset in both directions: every copied
+    // package must be in the lockfile (a foreign resolve adds packages), and
+    // every package this machine must have must be in the copy (a copy from
+    // another machine lacks them).
+    const fullSet = new Set(packages.map((p) => `${p.name}@${p.version}`));
+    const copySet = copyPackages ? new Set(copyPackages.packages.map((p) => `${p.name}@${p.version}`)) : null;
+    const copyMatches = copyPackages
+      ? !copyPackages.old &&
+        copyPackages.packages.every((p) => fullSet.has(`${p.name}@${p.version}`)) &&
+        expected.every((p) => copySet.has(`${p.name}@${p.version}`))
+      : false;
     const ms = Date.now() - t0;
 
     if (!packages.length) return { ok: null, ms, note: `${lockName} lists no packages to compare against` };
     const missing = notInStore(storeNames);
     if (storeNames && copyMatches && !missing.length && !old) {
-      return { ok: true, ms, note: `${packages.length} package(s) present in node_modules/.pnpm, matching ${lockName}` };
+      return {
+        ok: true,
+        ms,
+        note: `${expected.length} package(s) present in node_modules/.pnpm, matching ${lockName}` + (skipped || selfCount ? ` (${[skipped ? `${skipped} platform-specific or optional skipped` : '', selfCount ? `${selfCount} packageManager self-reference skipped` : ''].filter(Boolean).join(', ')})` : ''),
+      };
     }
 
     const seen = [];
     if (!storeNames) seen.push('node_modules/.pnpm is not there, so nothing here was installed by pnpm');
     else if (old) seen.push(`${lockName} uses the pre-pnpm-8 \`/name/version\` key layout, which does not map to store directory names`);
-    else if (missing.length) seen.push(`${missing.length}/${packages.length} package(s) the lockfile lists are not in node_modules/.pnpm, e.g. ${dirFor(missing[0])}`);
-    seen.push(copyMatches
-      ? `node_modules/.pnpm/lock.yaml matches ${lockName}`
-      : `node_modules/.pnpm/lock.yaml ${exists(copy) ? 'differs from' : 'is missing, so there is no record of'} ${lockName}`);
+    else if (missing.length) seen.push(`${missing.length}/${expected.length} package(s) the lockfile lists are not in node_modules/.pnpm, e.g. ${dirFor(missing[0])}`);
+    if (skipped) seen.push(`${skipped} platform-specific or optional package(s) skipped`);
+    seen.push(copyPackages
+      ? copyMatches
+        ? `node_modules/.pnpm/lock.yaml records installing from this ${lockName}`
+        : `node_modules/.pnpm/lock.yaml records installing from a different resolve of the same ${lockName}`
+      : `node_modules/.pnpm/lock.yaml is missing, so there is no record of ${lockName}`);
     return {
       ok: null,
       ms,

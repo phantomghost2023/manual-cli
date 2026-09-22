@@ -231,10 +231,12 @@ describe('verifiers: pnpm', () => {
     installStore(root, '@sindresorhus+is@7.0.0', 'is-number@6.0.0', 'is-odd@3.0.1');
     const s = spec({ builtin: 'pnpm' });
 
-    write(root, 'node_modules/.pnpm/lock.yaml', `${LOCK}\n  extra@1.0.0: {}\n`);
+    // Drift in the real shape: the copy says the tree was installed from a
+    // different resolve of the same dependency (is-odd 3.0.2, not 3.0.1).
+    write(root, 'node_modules/.pnpm/lock.yaml', LOCK.replace('is-odd@3.0.1', 'is-odd@3.0.2'));
     const foreign = runBuiltinVerifier(root, s);
     assert.equal(foreign.ok, null);
-    assert.match(foreign.note, /node_modules\/\.pnpm\/lock\.yaml differs from pnpm-lock\.yaml/);
+    assert.match(foreign.note, /records installing from a different resolve/);
 
     fs.rmSync(path.join(root, 'node_modules/.pnpm/lock.yaml'));
     const absent = runBuiltinVerifier(root, s);
@@ -259,10 +261,100 @@ describe('verifiers: pnpm', () => {
     // names the same way, so it is reported rather than guessed at.
     const old = tmp('manual-pnpm-');
     write(old, 'pnpm-lock.yaml', "lockfileVersion: 5.4\n\npackages:\n\n  /is-odd/3.0.1:\n    resolution: {integrity: sha512-CQpn}\n");
-    installStore(old, 'is-odd@3.0.1');
-    const v = runBuiltinVerifier(old, s);
+    installStore(old, 'is-odd@3.0.1');    const v = runBuiltinVerifier(old, s);
     assert.equal(v.ok, null);
     assert.match(v.note, /pre-pnpm-8 `\/name\/version` key layout/);
+  });
+
+  test('a package built for another platform is skipped, never counted missing', () => {
+    // Measured on a real vuejs/core drill (Windows): 15 of 660 lockfile entries
+    // were `@pnpm/exe.<other-platform>` binaries that a satisfied install never
+    // materializes off their platform. Counting them missing turned the yes
+    // verdict into permanent cannot-tell noise.
+    const root = tmp('manual-pnpm-');
+    write(root, 'pnpm-lock.yaml', `${LOCK}\n  '@pnpm/exe.darwin-arm64@12.4.2':\n    resolution: {integrity: sha512-Wu1V}\n    cpu: [arm64]\n    os: [darwin]\n`);
+    installStore(root, '@sindresorhus+is@7.0.0', 'is-number@6.0.0', 'is-odd@3.0.1');
+    write(root, 'node_modules/.pnpm/lock.yaml', `${LOCK}\n  '@pnpm/exe.darwin-arm64@12.4.2':\n    resolution: {integrity: sha512-Wu1V}\n    cpu: [arm64]\n    os: [darwin]\n`);
+    const v = runBuiltinVerifier(root, spec({ builtin: 'pnpm' }));
+    assert.equal(v.ok, true);
+    assert.match(v.note, /3 package\(s\) present/);
+    assert.match(v.note, /1 platform-specific or optional skipped/);
+  });
+
+  test('the same platform-constrained package IS missing when this is its platform', () => {
+    // Platform-neutral by construction: the fixture constrains to whatever
+    // platform the test runs on, so it is expected here — and its absence is
+    // exactly the damage report the verifier exists to give.
+    const root = tmp('manual-pnpm-');
+    const entry = `  left-pad@1.3.0:\n    resolution: {integrity: sha512-Wu1V}\n    cpu: [${process.arch}]\n    os: [${process.platform}]\n`;
+    write(root, 'pnpm-lock.yaml', LOCK + entry);
+    installStore(root, '@sindresorhus+is@7.0.0', 'is-number@6.0.0', 'is-odd@3.0.1');
+    write(root, 'node_modules/.pnpm/lock.yaml', LOCK + entry);
+    const v = runBuiltinVerifier(root, spec({ builtin: 'pnpm' }));
+    assert.equal(v.ok, null);
+    assert.match(v.note, /1\/4 package\(s\) the lockfile lists are not in node_modules\/\.pnpm, e\.g\. left-pad@1\.3\.0/);
+  });
+
+  test('the packageManager self-reference is skipped, never counted missing', () => {
+    // vuejs/core pins `packageManager: pnpm@12.4.2` and its lockfile records
+    // pnpm itself as an entry — but the package manager never materializes in
+    // the project's virtual store, so counting it missing made every healthy
+    // pnpm-12 tree look drifted.
+    const entry = '  pnpm@12.4.2:\n    resolution: {integrity: sha512-CK3GYTGAJ1x8}\n    hasBin: true\n';
+    const root = tmp('manual-pnpm-');
+    write(root, 'package.json', JSON.stringify({ name: 'x', packageManager: 'pnpm@12.4.2' }));
+    write(root, 'pnpm-lock.yaml', LOCK + entry);
+    installStore(root, '@sindresorhus+is@7.0.0', 'is-number@6.0.0', 'is-odd@3.0.1');
+    write(root, 'node_modules/.pnpm/lock.yaml', LOCK + entry);
+    const v = runBuiltinVerifier(root, spec({ builtin: 'pnpm' }));
+    assert.equal(v.ok, true);
+    assert.match(v.note, /3 package\(s\) present/);
+    assert.match(v.note, /1 packageManager self-reference skipped/);
+  });
+
+  test('a pnpm-12 hash-truncated store dir matches its snapshot form', () => {
+    // pnpm 12 names peer-resolved dirs after the snapshot key, and past 60
+    // characters stores `first 27 chars + '_' + sha256(key)[:32]`. Measured on
+    // a real vuejs/core store: 19/19 hash dirs matched. The dir below is the
+    // real pnpm-12 truncation of the fixture's 80-char peer form, not a
+    // reimplementation of the recipe.
+    const SNAPS =
+      '\nsnapshots:\n\n  is-odd@3.0.1(conventional-commits-filter@6.0.1)(conventional-commits-parser@7.1.2):\n    resolution: {integrity: sha512-CQpn}\n';
+    const root = tmp('manual-pnpm-');
+    write(root, 'pnpm-lock.yaml', LOCK + SNAPS);
+    installStore(root, '@sindresorhus+is@7.0.0', 'is-number@6.0.0', 'is-odd@3.0.1_conventional-c_8c5ae320b035e1e6d9773a7286fef0bd');
+    write(root, 'node_modules/.pnpm/lock.yaml', LOCK + SNAPS);
+    const v = runBuiltinVerifier(root, spec({ builtin: 'pnpm' }));
+    assert.equal(v.ok, true, v.note);
+    assert.match(v.note, /3 package\(s\) present/);
+  });
+
+  test('optional: true nested under a snapshot entry is honored', () => {
+    // A snapshot block indents `optional: true` past a `dependencies:` map; a
+    // parser that let four-space keys reset the current entry lost the flag
+    // and counted the package missing. Real shape from the vuejs/core lock.
+    const SNAPS = '\nsnapshots:\n\n  is-odd@3.0.1:\n    dependencies:\n      is-number: 6.0.0\n    optional: true\n';
+    const root = tmp('manual-pnpm-');
+    write(root, 'pnpm-lock.yaml', LOCK + SNAPS);
+    installStore(root, '@sindresorhus+is@7.0.0', 'is-number@6.0.0');
+    write(root, 'node_modules/.pnpm/lock.yaml', LOCK + SNAPS);
+    const v = runBuiltinVerifier(root, spec({ builtin: 'pnpm' }));
+    assert.equal(v.ok, true, v.note);
+    assert.match(v.note, /1 platform-specific or optional skipped/);
+  });
+
+  test('a pnpm-12 copy (re-serialized, machine-filtered) still matches', () => {
+    // pnpm 12 rewrites the copy without the `---` header and filtered to what
+    // this machine expects; pnpm 11 wrote the lockfile verbatim. Both mean "the
+    // lockfile this tree was installed from".
+    const root = tmp('manual-pnpm-');
+    write(root, 'pnpm-lock.yaml', `${LOCK}\n  '@pnpm/exe.darwin-arm64@12.4.2':\n    resolution: {integrity: sha512-Wu1V}\n    cpu: [arm64]\n    os: [darwin]\n`);
+    installStore(root, '@sindresorhus+is@7.0.0', 'is-number@6.0.0', 'is-odd@3.0.1');
+    // No header, and only the packages this machine expects:
+    write(root, 'node_modules/.pnpm/lock.yaml', `settings:\n  autoInstallPeers: true\n\npackages:\n\n  '@sindresorhus/is@7.0.0':\n    resolution: {integrity: sha512-Wu1V}\n\n  is-number@6.0.0:\n    resolution: {integrity: sha512-Wu1V}\n\n  is-odd@3.0.1:\n    resolution: {integrity: sha512-CQpn}\n`);
+    const v = runBuiltinVerifier(root, spec({ builtin: 'pnpm' }));
+    assert.equal(v.ok, true);
+    assert.match(v.note, /matching pnpm-lock\.yaml/);
   });
 });
 

@@ -1,0 +1,32 @@
+name: manual
+
+# The repo's own manual runs here, against the repo, on every push and PR —
+# the same verify a contributor gets from the pre-commit gate, executed by CI
+# where nobody's laptop is involved.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # claim provenance and `brief --at` read real history
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Test suite
+        run: npm test
+      - name: The manual verifies the repo
+        run: node bin/manual.js verify --force
+      - name: The manual is itself healthy
+        run: node bin/manual.js doctor

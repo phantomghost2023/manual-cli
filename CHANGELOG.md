@@ -2,6 +2,28 @@
 
 All notable changes to manual-cli are documented here. Format: Keep a Changelog; versioning: SemVer.
 
+## [0.11.2] - 2026-09-22
+
+### Fixed
+
+- **The pnpm builtin reported up to 165 false "missing" packages on a freshly synced pnpm-12 tree.** Measured end to end on vuejs/core (660 lockfile entries, `pnpm install --frozen-lockfile` exit 0 immediately before the check). Four independent causes, each found on the wild repo and each fixed against it:
+  1. **Peer-suffix directory names.** pnpm 11 named store dirs `name@version`; pnpm 12 names them after the lockfile's *snapshot* key — the peer-resolved form, peers joined by `_` — and past 60 characters stores `first 27 chars + '_' + sha256(key)[:32]`. The recipe was proven before use (19/19 hash directories matched, zero store directories uncovered) and matching is exact again, derived from the lockfile's own spelling rather than a heuristic.
+  2. **A nested YAML key hijacked the parser.** `snapshots:` entries indent `dependencies:` maps; the section-key regex let four-space lines match, so the current entry flipped to a junk key and the `optional: true` that followed landed nowhere — `@emnapi/*` counted missing though its snapshot marks it optional. Regexes that count spaces now count them exactly.
+  3. **The package manager records itself.** `packageManager: pnpm@12.4.2` produces a lockfile entry for pnpm that never materializes in the project's virtual store. Same rule as platform binaries: a package not supposed to be here is not missing.
+  4. **pnpm 12 filters the recorded lockfile copy.** `node_modules/.pnpm/lock.yaml` holds 645 of 660 entries — exactly the other-OS binaries dropped — so neither full nor machine-expected set equality holds. The check is now subset in both directions: every copied package must be in the lockfile (a foreign resolve adds packages), and every package this machine must have must be in the copy (a copy from another machine lacks them).
+  After the fixes the wild verdict is `ok: true — 489 package(s) present, matching pnpm-lock.yaml (152 platform-specific or optional skipped, 1 packageManager self-reference skipped)` in 17 ms, with damage detection re-proven both ways (deleted `vite@8.3.0` → flagged; `pnpm install --frozen-lockfile` → restored → `ok: true`).
+- **A check stopped by its time bound stamped `broken exit ?`.** Broken means the check ran and said no; a killed run never ran to a verdict. It is `blocked — untested, not false`, with a note naming the bound and suggesting `max_ms`. Found on the same wild repo, whose suite needs ~5 minutes against the 120 s default. (The bare `exit null` note was made legible as `no exit within Ns` earlier in the same pass.)
+- **`init` discovered nothing on a `pnpm-workspace.yaml` monorepo.** The earlier workspaces fix read `package.json`'s `workspaces` key; vuejs/core declares its packages in pnpm's own workspace file, so the same zero-candidates breakdown recurred on the very ecosystem this drill targets. `pnpm-workspace.yaml` now counts as evidence that packages with code exist.
+- **Sandbox teardown could crash a verify that already had its results.** On Windows, an `EBUSY` while removing the temp worktree killed the run *after* the check but *before* `state.save()` — stamp lost, worktree leaked, observed live on the wild repo. Teardown is best-effort: retries briefly, then warns and moves on, so a verify's verdict survives a dirty teardown.
+
+### Added
+
+- The repo's own manual runs in GitHub Actions on every push and PR (`.github/workflows/manual.yml`), with the badge in the README — the same verify a contributor gets from the pre-commit gate, executed where nobody's laptop is involved.
+- `CONTRIBUTING.md` documents regenerating the hero and social-preview images and keeping the two cards in sync.
+- Regression tests for every fix above: the hash-truncated pnpm-12 directory (fixture uses the real pnpm-computed hash, not a reimplementation), the nested `optional: true`, the `packageManager` self-reference, the timeout-blocked stamp, and the EBUSY-tolerant teardown (platform-aware: a live process parked in the worktree on Windows, clean removal on POSIX).
+
+See `docs/FIELD-NOTES.md`, "Eighth pass", for the full drill narrative.
+
 ## [0.11.1] - 2026-09-22
 
 ### Fixed

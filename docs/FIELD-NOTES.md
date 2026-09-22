@@ -684,3 +684,65 @@ laundered tree before the fix, and a self-healing one after it.
   debugging hour went to the implementation before the note
   (`verify: bash: -c: line 1: syntax error`) pointed at the test. The
   assertions that print `note:` now exist because of it.
+
+## Eighth pass: a wild pnpm-12 monorepo, where every naming rule was wrong
+
+vuejs/core is the heaviest pnpm checkout in the ecosystem — `pnpm-workspace.yaml`,
+`packageManager: pnpm@12.4.2`, 660 lockfile entries, a suite that takes five
+minutes. Every previous verifier assumption was tuned on pnpm 11 fixtures. The
+drill found four false-positive classes, one parser bug, and one dishonest
+stamp, in that order of discovery.
+
+### What held up
+
+- **report-not-judge itself.** The verifier never once said `no` falsely. Every
+  wrong count came out as `not a verdict` with the evidence spelled out, which
+  is why the tree stayed untrusted-but-unpunished while the bugs were found.
+- **The blocked doctrine.** A probe killed at the 120s cap, an install whose
+  registry flaked, a check that could not finish — all came out `blocked: the
+  claim is untested, not false`, never `broken`.
+- **The pnpm-11 measurements were real.** "A satisfied install re-imports only
+  when the lockfile changes" reproduced exactly; the copy check just needed to
+  understand what pnpm 12 writes into that copy.
+
+### What broke, and the rule each fix teaches
+
+1. **Peer suffixes defeat exact matching.** pnpm 11 named dirs
+   `name@version`; pnpm 12 names them after the *snapshot* key —
+   `vite@8.3.0_@types+node@24.1_7c905f…` — and truncates past 60 chars to
+   `first27 + '_' + sha256(key)[:32]`. Proven before use: the recipe matched
+   19/19 hash dirs and left zero store dirs uncovered on the real tree. The
+   matching is exact again, derived from the lockfile's own spelling.
+2. **A nested YAML key can hijack the parser.** `snapshots:` blocks indent
+   `dependencies:` maps inside each entry; the key regex let four-space lines
+   match, so `last` flipped to junk and the *next* flag line — the
+   `optional: true` — landed on a key no package owned. `@emnapi/*` then looked
+   missing on a freshly synced tree. Regexes that count spaces need to count
+   them exactly.
+3. **The package manager records itself.** `packageManager: pnpm@12.4.2`
+   produces a lockfile entry for pnpm that never materializes in the project's
+   store — it lives in pnpm's own home. Same family as platform binaries: a
+   package that is not supposed to be here is not missing.
+4. **pnpm 12 filters the recorded copy.** 645 of 660 entries — exactly the
+   other-OS binaries dropped. Equality held on pnpm 11 (byte-for-byte) and
+   fails on pnpm 12; the honest check is subset in both directions: every
+   copied package must exist in the lockfile, and every package this machine
+   must have must exist in the copy.
+
+### The stamp bug that survived until the end
+
+The suite claim stamped `broken exit ?` after a timeout. `exit null` was
+already made legible by an earlier pass, but the *state* still judged: broken
+means the check ran and said no. A check stopped by its bound never ran to a
+verdict — it is `blocked`, with a note that names the bound and suggests
+raising it. After the fix the wild repo's whole story reads honestly:
+
+```
+🚫 tests.suite   blocked  no exit within 120s — untested, not false;
+                          raise max_ms if this check needs longer
+```
+
+and the built-in pnpm verdict went from `ok: null, 36/518 missing` on a freshly
+synced tree to `ok: true, 489 present, 17ms`, with damage detection re-proven
+after the fix (deleted `vite@8.3.0` → flagged; `pnpm install --frozen-lockfile`
+→ restored, 16ms, `ok: true`).

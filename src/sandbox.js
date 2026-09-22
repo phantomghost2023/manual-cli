@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { c } from './color.js';
 
 // Sandbox for `check.run` commands. Preferred mode: throwaway git worktree of
 // HEAD + overlay of the current diff, so mutating checks can't dirty the user's
@@ -207,7 +208,20 @@ export class Sandbox {
       });
       // Belt and braces: anything the worktree still contains is now real
       // files, so a recursive delete cannot reach outside it.
-      fs.rmSync(this.wt, { recursive: true, force: true });
+      //
+      // Teardown is best-effort, never fatal. Found on a real vuejs/core
+      // drill: on Windows the check's node.exe can still hold handles when
+      // the recursive delete runs, rmSync dies with EBUSY, and — because
+      // exit() ran after the checks but before state.save() — the whole
+      // verify crashed and lost the stamps it had just computed. Worst case
+      // here is a leftover manual-wt-* directory and a stale worktree
+      // registration; that must be a warning, not a lost verify. maxRetries
+      // rides out the handles that close on their own milliseconds later.
+      try {
+        fs.rmSync(this.wt, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      } catch (e) {
+        console.error(c.yellow(`  ⚠ could not fully remove sandbox worktree ${this.wt} (${e.code || e.message}); remove it and run git worktree prune`));
+      }
       this.linked = [];
       this.wt = null;
       this.mode = 'inplace';
