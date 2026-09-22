@@ -106,3 +106,27 @@ describe('sandbox: teardown is best-effort', () => {
     fs.rmSync(repo, { recursive: true, force: true });
   });
 });
+
+describe("sandbox: the repo's own virtualenv reaches PATH", () => {
+  // A check written `python -m pytest` must mean the *project's* interpreter.
+  // The bin list only knew `.venv/bin` — the POSIX layout — so on Windows the
+  // system interpreter answered every `python`, `pytest` and `pip` a check ran,
+  // and the fresh venv the prerequisite had just built sat unused. Found by the
+  // wild canary on encode/httpx: a 64s install succeeded and the check still
+  // died on a missing dependency, because pytest imported against the wrong tree.
+  test('both venv layouts are put on PATH, whichever exists', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'manual-sbx-'));
+    fs.mkdirSync(path.join(dir, '.venv', 'Scripts'), { recursive: true });
+    fs.mkdirSync(path.join(dir, '.venv', 'bin'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.venv', 'Scripts', 'python.exe'), '');
+    fs.writeFileSync(path.join(dir, '.venv', 'bin', 'pytest'), '');
+    try {
+      const sb = new Sandbox(dir); // inplace mode: cwd is root, wt is null
+      const bins = sb.localBins();
+      assert.ok(bins.some((p) => p.endsWith(path.join('.venv', 'Scripts'))), `Scripts missing from ${bins.join(', ')}`);
+      assert.ok(bins.some((p) => p.endsWith(path.join('.venv', 'bin'))), `bin missing from ${bins.join(', ')}`);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

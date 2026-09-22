@@ -55,6 +55,17 @@ The manual/v1 schema is load-bearing for every repo using it. New fields must be
 - Sandbox tests create real git repos in temp dirs; they skip nothing and clean up after themselves.
 - Windows is a first-class platform (the project was built on it); use `path.join` and forward-slash normalization in glob land.
 
+## Wild-repo canaries
+
+Fixtures are tuned to the version that was current when they were written; wild repos are tuned to nothing. Every false-positive class the verifiers have fixed was invisible in fixtures and obvious in the wild, so changes to `src/verifiers.js`, `src/init.js` or `src/sandbox.js` deserve a drill: clone a real repo (see `docs/WILD-REPOS.md` for the matrix), install with the ecosystem's own tooling, then:
+
+```bash
+node test/wild.mjs builtin   --root <clone> --name <builtin> --expect ok|none
+node test/wild.mjs lifecycle --root <clone>
+```
+
+`--expect none` pins a *correctly withheld* verdict (uv.lock, Cargo.lock); anything else must be `ok` on a healthy tree. The same matrix runs in CI (`.github/workflows/wild.yml`) on release and monthly — a red cell there means a false "no" landed, or upstream moved and the row needs its ref bumped.
+
 ## Brand images (hero + social preview)
 
 Both cards derive from one design and must stay in sync with each other:
@@ -76,4 +87,4 @@ Uploading the social card is UI-only: open the repo's **Settings → General →
 
 1. Bump version in `package.json`, move `[Unreleased]` → `## [x.y.z] - date` in CHANGELOG.
 2. `npm test` green; `node bin/manual.js verify --force` green; `doctor` clean.
-3. Tag `vx.y.z`. (`npm publish` requires setting the `repository` field and npm auth — see issue tracker.)
+3. Tag `vx.y.z`. Publishing the release also fires the wild-repo canaries — watch the `wild` workflow run before trusting the release. (`npm publish` requires setting the `repository` field and npm auth — see issue tracker.)

@@ -820,3 +820,104 @@ passing slow fixture the same probe writes the real number and accept+verify
 run inside it. What the window costs: a genuinely hanging check stalls init
 600s instead of 120s — one honest cost paid once, against a lifetime of
 blocked stamps.
+
+## Tenth pass: two non-Node ecosystems, one missing manifest, and the
+## measurement that outlives its probe
+
+Three prompts, one theme: the tool's honesty has been about *verdicts* —
+report, don't judge — but its claims were still about *yesterday*. A bound
+calibrated once at init is a snapshot; the suite it describes keeps moving.
+
+### observe stops describing and starts recalibrating
+
+`observe` could propose tighten (median far under the bound) and relax (a break
+the bound caused). Both are after-the-fact: relax fires only once a legitimate
+run has already been filed broken. The suite that grew from 2s to 24s under a
+30s bound was invisible until the day a busy machine pushed it to 31s — and the
+first honest signal anyone got was a false alarm. `raise` closes that gap: same
+formula the tool already trusted (`3x p50, 1.5x p90, 1.1x worst` — one formula
+for both directions, because two formulas can disagree about one series), and
+it fires when the worst run *meets* the bound or the p90 crowds it (75%).
+Tighten still refuses when the tail doesn't fit; the spiky-series test from the
+sixth pass still passes unchanged.
+
+The second half is the quieter one: **every proposal now rewrites
+`observation.measured_ms` alongside the bound.** The number init wrote the day
+the claim was created was a single probe; the bound is a statement about
+accumulated runs, and the claim was advertising a measurement the tool had
+stopped believing. Patches now carry `check.expect.max_ms`,
+`observation.measured_ms` (the median of the accumulated history),
+`observation.samples`, and `observation.measured_from: "verify history"` —
+provenance that names its own source. The flywheel's accept-then-re-verify
+path exercises the patch for free.
+
+### The gomod drill: a manifest is not a tree
+
+cobra (vendored, 5 packages) and caddy (vendored, 787 packages, 169 modules)
+both answered clean. Then the damage test: delete
+`vendor/github.com/spf13/pflag`, re-probe — **`ok: true`**. The vendor branch
+compared go.mod against `vendor/modules.txt` and never looked at the disk. A
+manifest describes what vendoring *copied*; it outlives the copy. Re-proven at
+caddy's scale (787 packages listed, `prometheus/client_golang/prometheus` and
+its 8 subpackages deleted, still `ok: true`) before fixing: the manifest's
+package lines are now checked as directories, healthy caddy verifies in 379 ms,
+and the deletion is caught naming names. This is yarn-1's integrity-check hole
+from the seventh pass, reopened in another ecosystem — the lesson generalizes:
+**a lockfile or manifest is evidence about an install; only the tree can
+confirm it.**
+
+The cache path held up clean: cobra (4 modules, 2 ms) and caddy (169 modules,
+43 ms) answered exactly, indirect requires read their `.mod`, a bogus appended
+`require` was flagged by name.
+
+### The venv drill: one honest hole, two honest refusals
+
+httpx (requirements.txt, 15 pinned dists + an editable `-e .[extras]`): healthy
+`ok: true` in 4 ms, deleted `ruff` flagged, repair restored. The editable line
+is correctly *unchecked* rather than guessed. flask (uv.lock, 84 packages):
+`uv sync --frozen` exits 0 and the builtin withholds — `ok: null`, 38/84
+"missing" correctly not judged, because uv.lock does not mark which packages a
+dependency *group* needs. The tool answering "cannot tell" where the lock
+format cannot answer is the design working, and the canary now pins that
+behavior (`--expect none`) so nobody "fixes" it into a false no later.
+
+### The canary, and the two bugs only a lifecycle test could catch
+
+`.github/workflows/wild.yml` turns the drills into release canaries: eight
+builtin cells (Node ×4, Python ×2, Go ×2) plus three lifecycle cells running
+the full `init` → probe → accept → verify path. The rule it enforces is the
+one sentence at the top of docs/WILD-REPOS.md.
+
+Its first local run found two things a verifier probe never would have:
+
+1. **Discovery proposed nothing on cobra.** `manual init` on a Go repo printed
+   "0 candidate(s)" — the tool ships verifiers for eight ecosystems and
+   proposed no claim about seven of them, because detection was a package.json
+   reader. `nonNodeSuites()` reads go.mod, `_test.go` globs, vendor/modules.txt,
+   pyproject/requirements/uv.lock and the test dirs; `goInstall()` declares
+   `go mod download` as a repository-level prerequisite (the one shared-write
+   discovery proposes — a module cache is additive and re-derivable, unlike
+   `go install` or a system pip). Evidence bars stay: no `_test.go`, no go
+   claim (`go test ./...` on a testless module exits 0 having tested nothing);
+   no pytest declaration, no runner claim. A mixed Go+Python checkout gets both.
+   The lifecycle canary *fails* on "0 candidates" now — "proposed nothing" and
+   "had nothing to propose" must never look identical again.
+2. **The repo's own venv never reached PATH on Windows.** `localBins()` listed
+   `.venv/bin` only; on httpx the probe built a venv, ran a 64s install, and
+   the check still died — `python -m pytest` was answered by the *system*
+   interpreter, pytest importing against the wrong tree. The canary caught it
+   only because its lifecycle path runs the prerequisite and the check inside
+   one sandbox; a pre-installed CI tree would have masked it forever.
+
+Also discovered and honored: `uv sync --frozen` is the project-local install
+uv.lock repos deserve (the python prerequisite now picks the command from the
+lockfile — uv.lock, poetry.lock, then requirements.txt), and flask's repo got
+exercised with the real uv 0.12.
+
+### The cost accounting
+
+A canary cell that installs caddy's vendored tree costs ~4 minutes; the pnpm
+cell installs vuejs/core. That is why this runs on release, monthly, and on
+demand — never per-push. The drills themselves found real bugs at a rate
+fixtures never have: ten passes, and every false-positive class (six and
+counting across ecosystems) was invisible until a wild repo ran the builtin.

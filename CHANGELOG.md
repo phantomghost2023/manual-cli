@@ -2,6 +2,19 @@
 
 All notable changes to manual-cli are documented here. Format: Keep a Changelog; versioning: SemVer.
 
+## [0.11.3] - 2026-09-22
+
+### Added
+
+- **`observe` recalibrates bounds from accumulated history — and rewrites the recorded measurement with it.** A new `raise` proposal fires while the claim is still fresh: the worst run meets the bound or the 90th percentile crowds it, so a suite that grew from 2s to 24s under a 30s bound gets its bound raised *before* a busy machine turns the drift into a false alarm. Tighten, raise and relax share one bound formula (`3x p50, 1.5x p90, 1.1x worst`) — one series, one answer, two directions. Every proposal also patches `observation.measured_ms` to the median of the accumulated history, with `observation.samples` and `observation.measured_from: "verify history"` as provenance: the claim stops advertising the single number init's probe took the day it was written.
+- **The wild-repo drills are release canaries.** `.github/workflows/wild.yml` runs on release publish, monthly, and on demand: eight builtin cells (pnpm/npm/yarn/bun/venv×2/gomod×2, each against a real repo freshly installed by the ecosystem's own tooling) plus three lifecycle cells running the full `init` → probe → accept → verify path with the install performed by verify's prerequisite machinery. The rule: a healthy tree must never be reported unsatisfied, and `ok: null` — correctly withheld — is a pass. `test/wild.mjs` is the checker; `docs/WILD-REPOS.md` documents every drill, its false-positive rate, and what it changed.
+- **Discovery works without a package.json.** A Go repo now gets `tests.go` (`go test ./...`, only when `_test.go` files exist — `go test ./...` on a testless module exits 0 having tested nothing), a vendored-Go fact, and — when the module cache is empty — a repository-level `go mod download` prerequisite (`goInstall()`). A Python repo with a declared pytest gets `tests.python`, with the install chosen from the lockfile: `uv sync --frozen` for uv.lock, `poetry install` for poetry.lock, venv+pip for requirements.txt. A mixed Go+Python checkout gets both. The lifecycle canary fails on "0 candidates" — "proposed nothing" and "had nothing to propose" must not look identical.
+
+### Fixed
+
+- **A vendored Go tree was trusted on its manifest.** Deleting `vendor/github.com/spf13/pflag` still verified `ok: true`: the vendor branch compared go.mod against `vendor/modules.txt` and never looked at the disk. Re-proven at caddy's scale (787 packages promised, one deleted, still "ok") before fixing — the manifest's package lines are checked as directories now (healthy caddy: 379 ms; damage: named). Same hole yarn-1's integrity check has; the lesson generalizes: a lockfile is evidence about an install, only the tree can confirm it.
+- **A repo's own virtualenv never reached PATH on Windows.** `sandbox.localBins()` listed only `.venv/bin`; on encode/httpx a fresh venv was built, a 64s install succeeded, and `python -m pytest` was still answered by the *system* interpreter — pytest imported against the wrong tree. Both venv layouts (`.venv/bin`, `.venv/Scripts`) are on PATH now. Found by the lifecycle canary, which runs prerequisite and check inside one sandbox — a pre-installed CI tree would have masked it forever.
+
 ## [0.11.2] - 2026-09-22
 
 ### Fixed

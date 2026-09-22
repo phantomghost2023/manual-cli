@@ -186,6 +186,64 @@ describe('observe (flywheel)', () => {
     assert.equal(relax.proposed, 83000);
     cleanup(dir);
   });
+
+  // A suite that grew slowly never fires the relax path: nothing broke. If the
+  // bound only ever moves after a false alarm, the first honest signal anyone
+  // gets is a claim that flaps — and a claim that flaps gets ignored.
+  const drift = [2000, 2100, 4000, 9000, 12000, 18000, 24000];
+
+  test('raises the bound on a suite that grew slower without ever breaking it', () => {
+    const dir = tmp('manual-obs-raise-');
+    const state = new State(dir);
+    state.set('tests.demo', { state: 'fresh', note: 'ok' });
+    for (const ms of drift) state.pushHistory({ id: 'tests.demo', state: 'fresh', at: nowIso(), ms });
+    const st = seriesStats(state, 'tests.demo');
+    const raise = planProposals(dir, state).find((p) => p.id === 'tests.demo' && p.kind === 'raise');
+    assert.ok(raise, 'expected a raise proposal while the claim is still fresh');
+    assert.equal(st.p50, 9000);
+    assert.equal(st.p90, 24000);
+    assert.equal(raise.bound, 30000, 'the default bound is what it outgrew');
+    assert.equal(raise.proposed, 36000);
+    assert.ok(raise.proposed > raise.bound, 'a raise must actually raise');
+    assert.ok(raise.diagnosis.some((d) => d.kind === 'trend-up'), 'and say the runs are trending slower');
+    const written = writeProposals(dir, state, { quiet: true });
+    assert.equal(written.length, 1);
+    const text = fs.readFileSync(path.join(dir, '.manual', 'inbox', written[0].file), 'utf8');
+    assert.match(text, /p50 9000ms, p90 24000ms, worst 24000ms over 7 samples/);
+    assert.match(text, /before a legitimate run fails/);
+    cleanup(dir);
+  });
+
+  test('no raise while the tail still fits comfortably under the bound', () => {
+    const dir = tmp('manual-obs-raise-refuse-');
+    const state = new State(dir);
+    state.set('tests.demo', { state: 'fresh', note: 'ok' });
+    for (let i = 0; i < 6; i++) state.pushHistory({ id: 'tests.demo', state: 'fresh', at: nowIso(), ms: 900 + i * 20 });
+    assert.deepEqual(planProposals(dir, state).filter((p) => p.kind === 'raise'), []);
+    cleanup(dir);
+  });
+
+  test('a proposal rewrites the recorded measurement from history, not from the init probe', () => {
+    const dir = tmp('manual-obs-measured-');
+    // The single number init took when the claim was written: 2.0s for a suite
+    // that now costs 9s at the median and 24s at the tail.
+    const claim = path.join(dir, '.manual', 'claims', 'tests.demo.md');
+    fs.writeFileSync(claim, fs.readFileSync(claim, 'utf8').replace(/^lifecycle:/m, 'observation:\n  at: 2026-01-01T00:00:00Z\n  measured_ms: 2000\nlifecycle:'));
+    const state = new State(dir);
+    state.set('tests.demo', { state: 'fresh', note: 'ok' });
+    for (const ms of drift) state.pushHistory({ id: 'tests.demo', state: 'fresh', at: nowIso(), ms });
+    const written = writeProposals(dir, state, { quiet: true });
+    acceptInbox(dir, written[0].file, { quiet: true });
+    const after = loadManual(dir).claims.find((cl) => cl.fm.id === 'tests.demo');
+    assert.equal(after.fm.check.expect.max_ms, 36000, 'the bound follows the history');
+    assert.equal(after.fm.observation.measured_ms, 9000, 'and so does the published measurement');
+    assert.equal(after.fm.observation.samples, 7);
+    assert.equal(after.fm.observation.measured_from, 'verify history');
+    // The rest of the frontmatter survives the patch.
+    assert.equal(after.fm.observation.at, '2026-01-01T00:00:00Z');
+    assert.equal(after.fm.provenance.author, 'mira');
+    cleanup(dir);
+  });
 });
 
 describe('doctor', () => {

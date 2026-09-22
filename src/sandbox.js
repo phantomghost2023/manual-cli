@@ -153,9 +153,18 @@ export class Sandbox {
   // failure looked like a broken test suite instead of a missing PATH entry.
   localBins() {
     const dirs = [];
+    // A virtualenv keeps its executables in `bin` everywhere except Windows,
+    // where they are in `Scripts` (Python's own layout, not ours). Listing only
+    // `bin` meant that on Windows a repo's own interpreter was never on PATH and
+    // a check written as `python -m pytest` silently ran whatever pytest the
+    // *machine* had — the exact substitution discovery's note promises does not
+    // happen. Found by the wild canary on encode/httpx: a fresh venv was built, a
+    // 64s install succeeded, and the check still died on a missing dependency
+    // because the system interpreter answered instead of the venv's.
+    // Both spellings are listed; only the directories that exist are added.
     for (const cwd of [this.cwd, this.wt]) {
       if (!cwd) continue;
-      for (const rel of ['node_modules/.bin', '.venv/bin', 'venv/bin', 'vendor/bundle/bin', 'vendor/bin']) {
+      for (const rel of ['node_modules/.bin', '.venv/bin', '.venv/Scripts', 'venv/bin', 'venv/Scripts', 'vendor/bundle/bin', 'vendor/bin']) {
         const p = path.join(cwd, rel);
         if (fs.existsSync(p) && !dirs.includes(p)) dirs.push(p);
       }

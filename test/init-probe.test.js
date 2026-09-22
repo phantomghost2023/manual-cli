@@ -1,9 +1,9 @@
-import { test } from 'node:test';
+import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { init, probeCandidates, calibratedMaxMs } from '../src/init.js';
+import { init, probeCandidates, calibratedMaxMs, detect, nonNodeSuites, goInstall } from '../src/init.js';
 import { parseYaml } from '../src/yaml.js';
 import { splitFrontmatter } from '../src/md.js';
 
@@ -265,4 +265,141 @@ test('a probe stopped at its declared bound is blocked, never broken', async () 
       }
     }
   }
+});
+
+// ---------------------------------------------------------------------------
+
+// Discovery used to be a package.json reader with a side door for Makefiles,
+// migrations and CODEOWNERS. A Go or Python checkout has none of those keys,
+// so the tool that ships verifiers for eight ecosystems proposed not one claim
+// about seven of them — found by running the wild canary against spf13/cobra,
+// where `manual init` printed "0 candidate(s)" on a repo with a test suite.
+describe('discovery beyond package.json', () => {
+  const mkdirp = (dir, rel) => fs.mkdirSync(path.join(dir, rel), { recursive: true });
+
+  test('a Go repo with tests gets a go test claim, and a vendored one gets no install', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'manual-go-'));
+    mkdirp(dir, 'internal/x');
+    fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/demo\n\ngo 1.23\n\nrequire github.com/BurntSushi/toml v1.5.0\n');
+    fs.writeFileSync(path.join(dir, 'go.sum'), '');
+    fs.writeFileSync(path.join(dir, 'internal/x/x_test.go'), 'package x\n');
+    try {
+      // Vendored: the tree is the install, so no prerequisite exists to wire.
+      fs.mkdirSync(path.join(dir, 'vendor/github.com/x'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'vendor/modules.txt'), '');
+      const d = detect(dir);
+      const ids = d.findings.map((f) => f.id);
+      assert.ok(ids.includes('tests.go'), `expected tests.go, got ${ids.join(', ')}`);
+      assert.ok(ids.includes('tooling.vendored-go'));
+      const goClaim = d.findings.find((f) => f.id === 'tests.go');
+      assert.equal(goClaim.check.run, 'go test ./...');
+      assert.equal(goClaim.requires, null, 'a vendored checkout needs no prerequisite');
+      assert.deepEqual(Object.keys(d.prereqs), [], 'a vendored checkout declares no go install');
+
+      // Unvendored: discovery names `go mod download` as the prerequisite.
+      const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'manual-go-'));
+      mkdirp(bare, 'internal/x');
+      fs.writeFileSync(path.join(bare, 'go.mod'), 'module example.com/demo\n\ngo 1.23\n\nrequire github.com/BurntSushi/toml v1.5.0\n');
+      fs.writeFileSync(path.join(bare, 'go.sum'), '');
+      fs.writeFileSync(path.join(bare, 'internal/x/x_test.go'), 'package x\n');
+      try {
+        const d2 = detect(bare);
+        const goClaim2 = d2.findings.find((f) => f.id === 'tests.go');
+        assert.equal(goClaim2.requires, 'go', 'the module cache is empty here, so the claim references the prerequisite');
+        assert.deepEqual(Object.keys(d2.prereqs), ['go']);
+        assert.equal(d2.prereqs.go.run, 'go mod download');
+        assert.equal(d2.prereqs.go.verify.builtin, 'gomod');
+        // goInstall is the exported half: the plan and the claims must agree.
+        assert.deepEqual(goInstall(bare), d2.prereqs.go);
+        assert.equal(goInstall(dir), null, 'a vendored checkout needs nothing installed');
+      } finally {
+        fs.rmSync(bare, { recursive: true, force: true });
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a Go module with no test files proposes no go test claim', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'manual-go-'));
+    fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/demo\n\ngo 1.23\n');
+    try {
+      // `go test ./...` exits 0 having tested nothing — a claim that cannot be
+      // false says nothing. The glob is the evidence bar.
+      assert.deepEqual(nonNodeSuites(dir, {}).map((f) => f.id), []);
+      fs.writeFileSync(path.join(dir, 'main.go'), 'package main\n');
+      // Still nothing: main.go is not a test file.
+      assert.deepEqual(nonNodeSuites(dir, {}).map((f) => f.id), []);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a pytest repo gets a python claim, and the lockfile picks the install', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'manual-py-'));
+    mkdirp(dir, 'tests');
+    fs.writeFileSync(path.join(dir, 'pyproject.toml'), '[project]\nname = "demo"\ndependencies = ["pytest>=8"]\n');
+    fs.writeFileSync(path.join(dir, 'uv.lock'), 'version = 1\n');
+    fs.writeFileSync(path.join(dir, 'tests/test_a.py'), 'def test_ok(): pass\n');
+    try {
+      const d = detect(dir);
+      const py = d.findings.find((f) => f.id === 'tests.python');
+      assert.ok(py, `expected tests.python, got ${d.findings.map((f) => f.id).join(', ')}`);
+      assert.equal(py.check.run, 'python -m pytest');
+      assert.equal(py.requires, 'python', 'the venv is the install the check must run inside');
+      assert.equal(d.prereqs.python.run, 'uv sync --frozen', 'the lockfile decides the command, most exact first');
+      assert.equal(d.prereqs.python.verify.builtin, 'venv');
+      // The check must run the venv's interpreter, not the machine's: the PATH
+      // fix in sandbox.localBins is what makes `python -m pytest` mean the venv.
+      assert.ok(py.note.includes('virtualenv'), 'the note says what the prerequisite does for the check');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a requirements.txt repo installs into a venv with the platform-correct layout', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'manual-py-'));
+    mkdirp(dir, 'tests');
+    fs.writeFileSync(path.join(dir, 'requirements.txt'), 'pytest==8.4.1\n');
+    fs.writeFileSync(path.join(dir, 'tests/test_a.py'), 'def test_ok(): pass\n');
+    try {
+      const d = detect(dir);
+      const run = d.prereqs.python.run;
+      assert.match(run, /-m venv \.venv/);
+      if (process.platform === 'win32') assert.match(run, /\.venv\/Scripts\/pip install/);
+      else assert.match(run, /\.venv\/bin\/pip install/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a repo with tests but no pytest declaration proposes no python runner', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'manual-py-'));
+    mkdirp(dir, 'tests');
+    fs.writeFileSync(path.join(dir, 'pyproject.toml'), '[project]\nname = "demo"\n');
+    fs.writeFileSync(path.join(dir, 'tests/test_a.py'), 'def test_ok(): pass\n');
+    try {
+      // `python -m pytest` on a repo that never names pytest is a claim whose
+      // runner is absent — false about the checkout, not the code.
+      assert.deepEqual(nonNodeSuites(dir, {}).map((f) => f.id), []);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a mixed checkout gets claims from both ecosystems', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'manual-mix-'));
+    mkdirp(dir, 'tests');
+    fs.writeFileSync(path.join(dir, 'go.mod'), 'module example.com/demo\n\ngo 1.23\n');
+    fs.writeFileSync(path.join(dir, 'main.go'), 'package main\n');
+    fs.writeFileSync(path.join(dir, 'util_test.go'), 'package main\n');
+    fs.writeFileSync(path.join(dir, 'requirements.txt'), 'pytest==8.4.1\n');
+    fs.writeFileSync(path.join(dir, 'tests/test_a.py'), 'def test_ok(): pass\n');
+    try {
+      const ids = detect(dir).findings.map((f) => f.id);
+      assert.ok(ids.includes('tests.go') && ids.includes('tests.python'), `expected both, got ${ids.join(', ')}`);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

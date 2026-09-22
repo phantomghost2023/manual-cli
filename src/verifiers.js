@@ -913,9 +913,13 @@ const gomod = {
     const vendorFile = path.join(root, 'vendor', 'modules.txt');
     if (exists(vendorFile)) {
       const vendored = new Set();
+      // Package import paths, one per line after a `# module version` header;
+      // each names a directory vendoring was supposed to create.
+      const listed = [];
       for (const raw of String(read(vendorFile) || '').split(/\r?\n/)) {
         const m = /^# ([^\s]+) ([^\s]+)$/.exec(raw.trim());
         if (m) vendored.add(`${m[1]}@${m[2]}`);
+        else if (raw.trim() && !raw.trim().startsWith('#')) listed.push(raw.trim());
       }
       const missing = requires.filter((r) => !replaces.has(r.path) && !vendored.has(`${r.path}@${r.version}`));
       if (missing.length) {
@@ -926,7 +930,25 @@ const gomod = {
           missing: missing.slice(0, 5).map((r) => `${r.path}@${r.version}`),
         };
       }
-      return { ok: true, ms: 0, note: `${requires.length} module(s) present, matching vendor/modules.txt` };
+      // modules.txt is a *manifest of what vendoring copied*, and a manifest
+      // outlives the thing it describes. Trusting it alone reported a tree whose
+      // `vendor/github.com/prometheus/client_golang/prometheus` had been deleted
+      // as satisfied — 787 packages claimed, one of them gone, `ok: true`. That
+      // is the same hole yarn-1's integrity check has, and this one is cheap to
+      // close: the packages vendoring promised must be on disk, because the
+      // build reads them and not the manifest.
+      const t0 = Date.now();
+      const gone = listed.filter((pkg) => !exists(path.join(root, 'vendor', ...pkg.split('/'))));
+      const ms = Date.now() - t0;
+      if (gone.length) {
+        return {
+          ok: false,
+          ms,
+          note: `${gone.length}/${listed.length} package(s) vendor/modules.txt lists are not in the vendor tree, e.g. ${gone[0]}`,
+          missing: gone.slice(0, 5),
+        };
+      }
+      return { ok: true, ms, note: `${requires.length} module(s) present, matching vendor/modules.txt (${listed.length} package dirs checked)` };
     }
 
     const cache = goModCache(spec);

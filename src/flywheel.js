@@ -8,7 +8,8 @@ import { appendEntry, findEntry, restoreFromEntry, entryDrift } from './journal.
 // The flywheel's missing half.
 //
 // A proposal is an *observation*: "runs take 210ms, the bound says 30s, tighten
-// to 10s". Accepting it used to mean trusting the observation. Now the accepted
+// to 10s" — or "the suite grew to 24s, raise it before it trips". Accepting it
+// used to mean trusting the observation. Now the accepted
 // claim is immediately re-verified — with force, because a proposal that only
 // edits the claim's own frontmatter may not move the claim's evidence digest at
 // all. If the proposal turns out to be false, the claim goes broken and an undo

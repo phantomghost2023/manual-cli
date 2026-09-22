@@ -82,7 +82,29 @@ export function installCommand(root, pkg = null) {
     return { run: 'npm ci', evidence: ['package.json', 'package-lock.json'], ...js, verify: npmVerify };
   }
   if (depCount(p) > 0) return { run: 'npm install', evidence: ['package.json'], ...js };
-  return null;
+  return goInstall(root);
+}
+
+// Go: a vendored checkout needs nothing at all — that is the point of
+// vendoring — and a module-cache checkout needs `go mod download`.
+//
+// This is the one shared-location write discovery is willing to propose, and the
+// distinction is the whole reason: a module cache is *additive and re-derivable*.
+// It cannot take a package away from another checkout, another project, or an
+// interactive shell, and `go mod download` is exactly the question the gomod
+// verifier exists to answer for this repo. `go install` changes what the machine
+// can run; a system-wide `pip install` changes what every Python on the machine
+// imports. Those stay out — a discovery command has no business deciding them.
+export function goInstall(root) {
+  const has = (f) => fs.existsSync(path.join(root, f));
+  if (!has('go.mod')) return null;
+  if (has(path.join('vendor', 'modules.txt'))) return null; // the tree is the install
+  return {
+    run: 'go mod download',
+    evidence: ['go.mod', 'go.sum'],
+    cache: [],
+    verify: { builtin: 'gomod' },
+  };
 }
 
 // The prerequisite each detected ecosystem needs, named so that claims can
@@ -105,26 +127,129 @@ export function ecosystemPrereqs(root, pkg = null) {
   // state and is still not proposed.
   const win = process.platform === 'win32';
   const venv = has('.venv') ? '.venv' : has('venv') ? 'venv' : '.venv';
-  if (has('requirements.txt') || (has('pyproject.toml') && has('poetry.lock'))) {
-    out.python = has('pyproject.toml') && has('poetry.lock')
-      ? { run: 'poetry install', evidence: ['pyproject.toml', 'poetry.lock'], cache: [venv], verify: { builtin: 'venv' } }
-      : {
+  if (has('uv.lock') || has('requirements.txt') || (has('pyproject.toml') && has('poetry.lock'))) {
+    // The lockfile decides the command, most exact first: uv.lock and poetry.lock
+    // are full resolutions, requirements.txt may be a list of unpinned tools. A
+    // `uv sync` is project-local by construction (it writes `.venv`), which is the
+    // bar every prerequisite here has to clear.
+    out.python = has('uv.lock')
+      ? { run: 'uv sync --frozen', evidence: ['pyproject.toml', 'uv.lock'], cache: [venv], verify: { builtin: 'venv' } }
+      : has('pyproject.toml') && has('poetry.lock')
+        ? { run: 'poetry install', evidence: ['pyproject.toml', 'poetry.lock'], cache: [venv], verify: { builtin: 'venv' } }
+        : {
         // The interpreter and the script directory differ per platform
         // (`Scripts` on Windows, `bin` elsewhere), and a prerequisite that only
         // works on the machine that discovered it is a prerequisite that fails
         // on the next one.
-        run: `${win ? 'python' : 'python3'} -m venv ${venv} && ${venv}/${win ? 'Scripts' : 'bin'}/pip install -r requirements.txt`,
-        evidence: ['requirements.txt'],
-        cache: [venv],
-        verify: { builtin: 'venv' },
-      };
+          run: `${win ? 'python' : 'python3'} -m venv ${venv} && ${venv}/${win ? 'Scripts' : 'bin'}/pip install -r requirements.txt`,
+          evidence: ['requirements.txt'],
+          cache: [venv],
+          verify: { builtin: 'venv' },
+        };
   }
   // A Makefile that declares a dependency target is the repo telling us its own
   // install story; `cache` is empty because the target decides where it lands.
   if (has('Makefile') && /^deps:/m.test(safeRead(path.join(root, 'Makefile')))) {
     out.make = { run: 'make deps', evidence: ['Makefile'], cache: [] };
   }
+  const go = goInstall(root);
+  if (go) out.go = go;
   return out;
+}
+
+// Which ecosystems a checkout is, without reading package.json — the question a
+// repo with no Node in it never got asked.
+export function nonNodeSuites(root, prereqs = {}) {
+  const has = (f) => fs.existsSync(path.join(root, f));
+  const out = [];
+
+  if (has('go.mod')) {
+    // `go test ./...` on a module with no test files exits 0 having tested
+    // nothing, which is a claim that cannot be false and therefore says nothing.
+    // The glob is evidence in its own right, so it is required.
+    if (anyFile(root, (f) => f.endsWith('_test.go'))) {
+      out.push({
+        kind: 'command',
+        id: 'tests.go',
+        statement: 'The Go test suite runs with `go test ./...`.',
+        priority: 'high',
+        applies_to: ['**/*.go'],
+        evidence: { files: ['go.mod', '**/*_test.go'] },
+        check: { run: 'go test ./...', expect: { exit: 0 } },
+        requires: prereqs.go ? 'go' : null,
+        note: [
+          'Discovered from go.mod plus _test.go files in this checkout.',
+          prereqs.go
+            ? `The modules go.mod requires are not in the module cache here, so the candidate requires the \`go\` prerequisite declared in .manual/manual.yaml (${prereqs.go.run}); its verdict comes from the gomod builtin, which answers whether that cache satisfies this go.mod.`
+            : 'This checkout vendors its dependencies, so the check runs offline against vendor/ — no install step is declared.',
+        ].join(' '),
+      });
+    }
+    if (has(path.join('vendor', 'modules.txt'))) {
+      out.push({
+        kind: 'fact',
+        id: 'tooling.vendored-go',
+        statement: 'This repo vendors its Go dependencies; builds read vendor/, not the module cache.',
+        priority: 'normal',
+        applies_to: ['**'],
+        evidence: { files: ['go.mod', 'vendor/modules.txt'] },
+        check: { expr: 'exists("vendor/modules.txt")' },
+        note: 'Edit vendor/modules.txt only by re-running `go mod vendor` — the gomod builtin checks the tree against the manifest.',
+      });
+    }
+  }
+
+  // Python: the entry point a repo declares for itself, in order of how much it
+  // says. A `make test` target is the repo's own answer; pytest is the de-facto
+  // runner and is only proposed when the checkout actually asks for it, because
+  // a claim whose runner is absent is false about the checkout rather than the
+  // code.
+  const pytest = [has('requirements.txt') && safeRead(path.join(root, 'requirements.txt')), has('pyproject.toml') && safeRead(path.join(root, 'pyproject.toml')), has('tox.ini') && safeRead(path.join(root, 'tox.ini'))]
+    .filter(Boolean)
+    .some((t) => /(^|[^\w-])pytest([^\w-]|$)/m.test(t));
+  const pyTests = ['tests', 'test'].find((d) => has(d));
+  if (pyTests && pytest) {
+    out.push({
+      kind: 'command',
+      id: 'tests.python',
+      statement: 'The Python test suite runs with `python -m pytest` from the project root.',
+      priority: 'high',
+      applies_to: [`${pyTests}/**`, '**/*.py'],
+      evidence: { files: [`${pyTests}/**`, 'pyproject.toml'] },
+      check: { run: 'python -m pytest', expect: { exit: 0 } },
+      requires: prereqs.python ? 'python' : null,
+      note: [
+        `Discovered from the ${pyTests}/ directory and a pytest declaration in this checkout.`,
+        prereqs.python
+          ? `The candidate requires the \`python\` prerequisite declared in .manual/manual.yaml (${prereqs.python.run}), which puts the virtualenv on PATH before the check runs — so it exercises the repo's own tree, not whatever pytest the machine happens to have.`
+          : 'No project-local virtualenv was found, so no prerequisite is declared; the check runs against the interpreter this machine provides, and the venv builtin will have nothing to compare.',
+      ].join(' '),
+    });
+  }
+
+  return out;
+}
+
+// Does any file under root match, within a bounded walk? Vendored trees and
+// node_modules are skipped: a test file inside a dependency is not this repo's
+// test suite, and walking one costs more than the answer is worth.
+const WALK_SKIP = new Set(['.git', 'node_modules', 'vendor', '.venv', 'venv', 'target', 'dist', 'build', '.next']);
+function anyFile(root, match, dir = root, depth = 0) {
+  if (depth > 4) return false;
+  let entries = [];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  for (const e of entries) {
+    if (e.isFile() && match(e.name)) return true;
+  }
+  for (const e of entries) {
+    if (!e.isDirectory() || WALK_SKIP.has(e.name)) continue;
+    if (anyFile(root, match, path.join(dir, e.name), depth + 1)) return true;
+  }
+  return false;
 }
 
 function safeRead(p) {
@@ -347,7 +472,15 @@ export function detect(root) {
     });
   }
 
-  return { pkg, findings, prereqs: ecosystemPrereqs(root, pkg) };
+  // Everything above is driven by package.json (plus migrations and CODEOWNERS),
+  // so a checkout with no Node in it produced *zero* candidates: this tool ships
+  // verifiers for eight ecosystems and proposed not one claim about seven of
+  // them. Found by running the wild canary against spf13/cobra — `manual init`
+  // printed "0 candidate(s)" on a repo with a test suite and a vendored tree.
+  const prereqs = ecosystemPrereqs(root, pkg);
+  findings.push(...nonNodeSuites(root, prereqs));
+
+  return { pkg, findings, prereqs };
 }
 
 // The check block, including the prerequisite when one was discovered.

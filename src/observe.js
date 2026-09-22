@@ -8,8 +8,17 @@ import { readInbox } from './inbox.js';
 // state.json, and write inbox candidates when reality diverges from claims.
 //
 //  - Tighten: the claim's max_ms bound is far above what runs actually cost.
+//  - Raise:   a once-fast suite grew slower and the bound is about to be wrong,
+//             before a legitimate run trips it and gets filed as a regression.
 //  - Relax:   the claim broke on its own max_ms bound; propose headroom.
 //
+// Every proposal also rewrites the claim's recorded measurement. `max_ms` came
+// from a single probe at init; a bound is a statement about accumulated runs, so
+// the number a human reads next to it must come from the same history that
+// justified the bound — otherwise the claim keeps advertising a measurement the
+// tool stopped believing. Tighten, raise and relax differ only in direction:
+// all three patch `check.expect.max_ms` and `observation.measured_ms` together.
+
 // Proposed bounds respect the TAIL, not just the median. An earlier version
 // proposed 3x p50, which for a spiky series (p50 9s, p90 25s, worst 47s)
 // produced a bound below the 90th percentile — a claim that is guaranteed to
@@ -174,11 +183,27 @@ export function diagnoseSeries(events) {
   return out;
 }
 
-// Tighten: a bound that keeps headroom over the median AND the tail AND the
-// worst run actually observed on this machine. A dominant test argues against
-// tightening at all: the bound would be measuring one test's mood.
+// The bound a series' tail actually supports: 3x the median, 1.5x the 90th
+// percentile, and 1.1x the worst run seen on this machine. One formula, two
+// directions — a tighten is this number landing *below* the declared bound, a
+// raise is it landing above. Separate formulas for the two directions would let
+// the tool's two answers disagree about the same series.
+//
+// A dominant test argues against tightening at all: the bound would be
+// measuring one test's mood.
 export function proposeBound({ p50, p90, max }) {
   return roundBound(Math.max((p50 || 0) * 3, (p90 || 0) * 1.5, (max || 0) * 1.1));
+}
+
+// When a bound is *about* to be wrong rather than already wrong. A suite that
+// drifted from 2s to 25s under a 30s bound has not broken anything yet, but it
+// is one busy machine away from flapping — and a bound that only ever moves
+// after a false alarm teaches everyone to ignore the alarm. Raise when the
+// worst run already meets the bound, or when the 90th percentile is crowding
+// it.
+const RAISE_P90_SHARE = 0.75;
+export function needsRaise({ p90, max }, bound) {
+  return (max || 0) >= bound || (p90 || 0) > bound * RAISE_P90_SHARE;
 }
 
 // Relax: give the run that broke the claim room, and the tail room, but do not
@@ -204,10 +229,12 @@ export function planProposals(root, state) {
     const diagnosis = diagnoseSeries(st.events);
     const bound = cl.fm.check?.expect?.max_ms || null;
 
-    // Tighten needs a stable picture: at least 3 measured runs.
-    if (st.samples >= 3 && bound && st.p50 !== null && st.p50 < bound * 0.5) {
-      const proposed = proposeBound(st);
-      if (proposed < bound) {
+    // Recalibration needs a stable picture: at least 3 measured runs, and a
+    // bound to reason against. `supported` is what the accumulated history
+    // argues for; the direction is a comparison, not a second heuristic.
+    if (st.samples >= 3 && bound && st.p50 !== null) {
+      const supported = proposeBound(st);
+      if (supported < bound && st.p50 < bound * 0.5) {
         proposals.push({
           kind: 'tighten',
           id,
@@ -216,7 +243,22 @@ export function planProposals(root, state) {
           p90: st.p90,
           max: st.max,
           bound,
-          proposed,
+          proposed: supported,
+          samples: st.samples,
+          diagnosis,
+        });
+      } else if (supported > bound && needsRaise(st, bound)) {
+        // The suite grew slower than the bound without ever breaking it. Waiting
+        // for the break means the first honest signal is a false alarm.
+        proposals.push({
+          kind: 'raise',
+          id,
+          measured: st.p50,
+          p50: st.p50,
+          p90: st.p90,
+          max: st.max,
+          bound,
+          proposed: supported,
           samples: st.samples,
           diagnosis,
         });
@@ -294,6 +336,16 @@ export function writeProposals(root, state, { quiet = false } = {}) {
     if (fs.existsSync(file)) continue;
     const cid = `candidate.${p.kind}.${p.id}`.toLowerCase();
     const tail = `p50 ${p.p50}ms, p90 ${p.p90}ms, worst ${p.max}ms over ${p.samples} samples`;
+    // The measurement the claim publishes, taken from the accumulated history
+    // rather than from init's single probe. The tail numbers stay alongside it
+    // so the derivation is auditable after the patch lands.
+    const provenance = {
+      'check.expect.max_ms': p.proposed,
+      'observation.measured_ms': p.p50,
+      'observation.max_ms': p.proposed,
+      'observation.samples': p.samples,
+      'observation.measured_from': 'verify history',
+    };
     const why = (p.diagnosis || []).length
       ? `\nWhy the spread: ${(p.diagnosis || []).map((d) => d.text).join('; ')}.`
       : '';
@@ -303,15 +355,27 @@ export function writeProposals(root, state, { quiet = false } = {}) {
     const dominant = dom
       ? `\nThe runtime is dominated by a single test, so consider fixing or splitting it rather\nthan only adjusting this bound.`
       : '';
+    const recalibrated = `This also rewrites the claim's recorded measurement to ${p.p50}ms — the median of
+${p.samples} runs — replacing the single probe init took the day the claim was written.`;
     const body =
       p.kind === 'tighten'
         ? `Recent runs: ${tail}. The claim allows ${p.bound}ms.${why}
 Propose tightening to ${p.proposed}ms — at least 3x the median, 1.5x the 90th percentile, and
 1.1x the worst run seen here — so a real slowdown fails the claim while ordinary
-variance does not.${dominant}`
-        : `A run measured ${p.measured}ms against a ${p.bound}ms bound and broke the claim.
+variance does not.${dominant}
+${recalibrated}`
+        : p.kind === 'raise'
+          ? `Recent runs: ${tail}. The claim allows ${p.bound}ms and the tail no longer fits under it.
+${p.max >= p.bound ? `The worst run (${p.max}ms) already meets the bound, so this claim is one busy machine
+away from breaking on a run that is not a regression.` : `The 90th percentile (${p.p90}ms) is crowding the bound, so the next slow day trips it.`}${why}
+Propose raising to ${p.proposed}ms now — before a legitimate run fails and has to be triaged as
+one. If the growth is real, the code is the thing to look at; the bound only has to
+stop lying about it in the meantime.${dominant}
+${recalibrated}`
+          : `A run measured ${p.measured}ms against a ${p.bound}ms bound and broke the claim.
 History: ${tail}.${why}
-Propose relaxing to ${p.proposed}ms to stop the flapping while still catching real regressions.${dominant}`;
+Propose relaxing to ${p.proposed}ms to stop the flapping while still catching real regressions.${dominant}
+${recalibrated}`;
     const fm = `---
 schema: manual/v1
 id: ${cid}
@@ -319,7 +383,7 @@ kind: candidate
 proposes:
   update: ${p.id}
   patch:
-    check.expect.max_ms: ${p.proposed}
+${Object.entries(provenance).map(([k, v]) => `    ${k}: ${v}`).join('\n')}
 observation:
   at: ${nowIso()}
   by: agent:manual-cli

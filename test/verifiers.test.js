@@ -1014,6 +1014,29 @@ describe('verifiers: gomod', () => {
     assert.match(missing.note, /not in vendor\/modules\.txt, e\.g\. github\.com\/BurntSushi\/toml@v1\.5\.0/);
   });
 
+  // Found on caddyserver/caddy: 787 packages promised by modules.txt, one of
+  // them deleted, and the builtin answered `ok: true`. A manifest is not a tree.
+  test('a vendored tree is checked on disk, not just against its manifest', () => {
+    const root = tmp('manual-go-vendir-');
+    write(root, 'go.mod', 'module example.com/demo\n\ngo 1.23\n\nrequire github.com/BurntSushi/toml v1.5.0\n');
+    write(
+      root,
+      'vendor/modules.txt',
+      '# github.com/BurntSushi/toml v1.5.0\n## explicit; go 1.18\ngithub.com/BurntSushi/toml\ngithub.com/BurntSushi/toml/internal\n',
+    );
+    mkdir(root, 'vendor/github.com/BurntSushi/toml');
+    mkdir(root, 'vendor/github.com/BurntSushi/toml/internal');
+    const v = runBuiltinVerifier(root, spec({ builtin: 'gomod' }));
+    assert.equal(v.ok, true);
+    assert.match(v.note, /matching vendor\/modules\.txt \(2 package dirs checked\)/);
+
+    fs.rmSync(path.join(root, 'vendor/github.com/BurntSushi/toml/internal'), { recursive: true });
+    const gone = runBuiltinVerifier(root, spec({ builtin: 'gomod' }));
+    assert.equal(gone.ok, false);
+    assert.match(gone.note, /1\/2 package\(s\) vendor\/modules\.txt lists are not in the vendor tree, e\.g\. github\.com\/BurntSushi\/toml\/internal/);
+    assert.deepEqual(gone.missing, ['github.com/BurntSushi/toml/internal']);
+  });
+
   test('the module cache can be declared outright', () => {
     const { root, cache } = makeCacheRepo();
     const nowhere = path.join(root, 'no-such-cache');

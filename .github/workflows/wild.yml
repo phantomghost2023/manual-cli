@@ -1,0 +1,160 @@
+name: wild
+
+# The wild-repo canaries.
+#
+# Every builtin verifier in this repo earned its "yes" on a wild repo, and every
+# bug in them was found there too: pnpm 12's peer-suffixed store dirs (165 false
+# misses on a healthy vuejs/core tree), npm's other-platform binaries (20),
+# bun's peer variants (3), a vendored package that modules.txt still promised
+# after it was deleted, and a checkout that ships a *partial* node_modules in
+# git (npm/cli). Fixtures cannot produce any of those — each fixture is tuned to
+# the version that was current the day it was written. So release day runs the
+# tool against repositories it did not grow up with, where the ecosystem's own
+# installer has just populated the tree.
+#
+# These are canaries, not health checks on upstream. When a cell goes red, read
+# the log: a false "no" on a tree the ecosystem's installer just produced is a
+# bug in this repo; a clone or install failure is upstream drift and the row
+# needs maintenance (bump the ref, or drop the repo).
+#
+# Cost is why this runs on release and monthly rather than on every push: one
+# cell installs vuejs/core's dependency tree, another npm/cli's.
+
+on:
+  release:
+    types: [published]
+  schedule:
+    # 06:17 on the 1st: before the month's first working day, off the hour.
+    - cron: '17 6 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  builtin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The repo that found the pnpm-12 noise. Installing here is the whole
+          # point: the pre-fix verifier called a freshly-synced 660-package tree
+          # 165 packages short.
+          - name: pnpm 12 (vuejs/core)
+            repo: vuejs/core
+            setup: corepack enable && pnpm install --frozen-lockfile
+            builtin: pnpm
+            expect: ok
+          # Ships a partial node_modules in git (no dev deps, no .bin), so a
+          # naive install gate concludes the tree is done. The verifier must
+          # answer "no" here and say why.
+          - name: npm (npm/cli, which commits a partial tree)
+            repo: npm/cli
+            setup: npm ci
+            builtin: npm
+            expect: ok
+            timeout: 30
+          # Classic yarn: `.yarn-integrity` is the lockfile-readable state.
+          - name: yarn 1 (remix-run/react-router)
+            repo: remix-run/react-router
+            setup: npm i -g yarn@1 && yarn install --frozen-lockfile
+            builtin: yarn
+            expect: ok
+          # bun 1.2's store dirs carry a `+<hex>` peer suffix.
+          - name: bun (oven-sh/bun)
+            repo: oven-sh/bun
+            setup: bun install --frozen-lockfile
+            builtin: bun
+            expect: ok
+            tool: bun
+          # requirements.txt + a real venv, on a repo whose top line is an
+          # editable install (`-e .[extras]`) that no manifest check can judge.
+          - name: venv / requirements.txt (encode/httpx)
+            repo: encode/httpx
+            setup: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+            builtin: venv
+            expect: ok
+          # uv.lock does not record which packages a dependency *group* needs, so
+          # a synced tree legitimately lacks the docs group's packages. The
+          # verifier must withhold a verdict here rather than call 38 of 84
+          # packages missing — a false "no" would be the bug.
+          - name: venv / uv.lock (pallets/flask)
+            repo: pallets/flask
+            setup: pip install uv && uv sync --frozen
+            builtin: venv
+            expect: none
+          # go.mod against a populated module cache.
+          - name: gomod / module cache (spf13/cobra)
+            repo: spf13/cobra
+            setup: go mod download
+            builtin: gomod
+            expect: ok
+          # A vendored tree. modules.txt is a manifest of what vendoring copied
+          # and it survives the tree: 787 packages promised, one deleted, and the
+          # builtin answered "ok" until the manifest was checked against the disk.
+          - name: gomod / vendored (caddyserver/caddy)
+            repo: caddyserver/caddy
+            setup: go mod download && go mod vendor
+            builtin: gomod
+            expect: ok
+            timeout: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - uses: oven-sh/setup-bun@v2
+        if: matrix.tool == 'bun'
+      - name: Clone ${{ matrix.repo }}
+        run: git clone --depth 1 "https://github.com/${{ matrix.repo }}" "$RUNNER_TEMP/wild"
+      - name: Install the tree the way the ecosystem does
+        working-directory: ${{ runner.temp }}/wild
+        run: ${{ matrix.setup }}
+        timeout-minutes: ${{ matrix.timeout || 15 }}
+      - name: Canary — a healthy tree must never be reported unsatisfied
+        run: node test/wild.mjs builtin --root "$RUNNER_TEMP/wild" --name "${{ matrix.builtin }}" --expect "${{ matrix.expect }}" --label "${{ matrix.name }}"
+
+  # The lifecycle half: discovery proposes claims on a repo it has never seen,
+  # and verify performs the install discovery declared before running them.
+  # Nothing is pre-installed here on purpose — the prerequisite path is the thing
+  # under test. Discovery is also where "0 candidates on a real repo" hid: a Go
+  # or Python checkout with no package.json yielded nothing at all, and a canary
+  # that treats an empty manual as a pass would never have said so.
+  lifecycle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: init/verify on a Node repo (nodejs/undici)
+            repo: nodejs/undici
+          - name: init/verify on a Go repo (spf13/cobra)
+            repo: spf13/cobra
+          - name: init/verify on a Python repo (encode/httpx)
+            repo: encode/httpx
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+      - name: Clone ${{ matrix.repo }}
+        run: git clone --depth 1 "https://github.com/${{ matrix.repo }}" "$RUNNER_TEMP/wild"
+      - name: Canary — discovery finds something, and nothing it finds is broken
+        run: node test/wild.mjs lifecycle --root "$RUNNER_TEMP/wild" --label "${{ matrix.name }}"
